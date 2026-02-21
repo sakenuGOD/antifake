@@ -19,7 +19,7 @@ def setup_cuda_optimizations():
         return
 
     gpu_name = torch.cuda.get_device_name(0)
-    vram_gb = torch.cuda.get_device_properties(0).total_mem / 1024**3
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
     print(f"GPU: {gpu_name} ({vram_gb:.1f} GB)")
     print(f"CUDA: {torch.version.cuda}")
     print(f"PyTorch: {torch.__version__}")
