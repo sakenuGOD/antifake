@@ -5,6 +5,26 @@ import os
 import sys
 
 
+def format_result(result: dict) -> str:
+    """Форматирование результата проверки для вывода в консоль."""
+    lines = [
+        f"{'=' * 60}",
+        f"УТВЕРЖДЕНИЕ: {result['claim']}",
+        f"{'=' * 60}",
+        f"ДОСТОВЕРНОСТЬ: {result['credibility_score']}/100",
+        f"ВЕРДИКТ: {result['verdict']}",
+        f"УВЕРЕННОСТЬ: {result['confidence']}%",
+        f"",
+        f"ОБОСНОВАНИЕ: {result['reasoning']}",
+        f"",
+        f"ИСТОЧНИКИ: {result['sources_text']}",
+        f"КЛЮЧЕВЫЕ СЛОВА: {', '.join(result['keywords'])}",
+        f"ВРЕМЯ: {result['total_time']} сек.",
+        f"{'=' * 60}",
+    ]
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Fact-Checker: проверка достоверности утверждений",
@@ -67,10 +87,10 @@ def main():
                 break
 
             result = pipeline.check(claim)
-            print(f"\n{result['verdict']}\n")
+            print(f"\n{format_result(result)}\n")
     else:
         result = pipeline.check(args.claim)
-        print(f"\n{result['verdict']}")
+        print(f"\n{format_result(result)}")
 
 
 if __name__ == "__main__":

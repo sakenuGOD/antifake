@@ -1,7 +1,9 @@
 """LangChain LCEL цепочка для проверки фактов."""
 
 import os
-from typing import List
+import re
+import time
+from typing import List, Dict, Any
 
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -78,6 +80,8 @@ class FactCheckPipeline:
             print(f"  Ключевые слова: {keywords}")
             results = self.searcher.search_all_keywords(keywords)
             print(f"  Найдено новостей: {len(results)}")
+            # Сохраняем сырые результаты поиска в состояние
+            state["_raw_search_results"] = results
             return self.searcher.format_results(results)
 
         # Шаг 3: Оценка достоверности
@@ -100,28 +104,101 @@ class FactCheckPipeline:
     @staticmethod
     def _parse_keywords(raw_output: str) -> List[str]:
         """Парсер ключевых слов с fallback для нечистого вывода модели."""
-        # Убираем возможные артефакты вывода
         text = raw_output.strip()
 
-        # Убираем возможные маркеры формата
         for prefix in ["Ключевые слова:", "Keywords:", "ключевые слова:"]:
             if text.lower().startswith(prefix.lower()):
                 text = text[len(prefix):].strip()
 
-        # Разделяем по запятой
         keywords = [kw.strip().strip('"').strip("'") for kw in text.split(",")]
-
-        # Фильтруем пустые и слишком длинные (вероятно, мусор)
         keywords = [kw for kw in keywords if kw and len(kw) < 50]
 
-        # Fallback: если парсинг не дал результатов, разбиваем по пробелам
         if not keywords:
             keywords = [w for w in text.split() if len(w) > 2][:5]
 
         return keywords[:5]
 
-    def check(self, claim: str) -> dict:
-        """Проверка одного утверждения. Возвращает полный словарь состояния."""
-        print(f"\nПроверка: {claim}")
-        result = self.chain.invoke({"claim": claim})
+    @staticmethod
+    def parse_verdict(raw_verdict: str) -> Dict[str, Any]:
+        """Парсинг структурированного вердикта из ответа модели."""
+        result = {
+            "credibility_score": 50,
+            "verdict": "НЕИЗВЕСТНО",
+            "confidence": 50,
+            "reasoning": "",
+            "sources": "",
+            "raw": raw_verdict,
+        }
+
+        patterns = {
+            "credibility_score": r"ДОСТОВЕРНОСТЬ:\s*(\d+)",
+            "verdict": r"ВЕРДИКТ:\s*(.+?)(?:\n|$)",
+            "confidence": r"УВЕРЕННОСТЬ:\s*(\d+)",
+            "reasoning": r"ОБОСНОВАНИЕ:\s*(.+?)(?:\nИСТОЧНИКИ:|$)",
+            "sources": r"ИСТОЧНИКИ:\s*(.+)",
+        }
+
+        for key, pattern in patterns.items():
+            match = re.search(pattern, raw_verdict, re.DOTALL)
+            if match:
+                value = match.group(1).strip()
+                if key in ("credibility_score", "confidence"):
+                    try:
+                        value = int(value)
+                        value = max(0, min(100, value))
+                    except ValueError:
+                        continue
+                result[key] = value
+
         return result
+
+    @staticmethod
+    def extract_sources(raw_search_results: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Извлечение списка источников из результатов поиска."""
+        sources = []
+        for article in raw_search_results:
+            sources.append({
+                "title": article.get("title", ""),
+                "source": article.get("source", ""),
+                "link": article.get("link", ""),
+                "date": article.get("date", ""),
+            })
+        return sources
+
+    def check(self, claim: str) -> Dict[str, Any]:
+        """Проверка одного утверждения. Возвращает структурированный результат."""
+        print(f"\nПроверка: {claim}")
+        timings = {}
+
+        # Шаг 1: Ключевые слова
+        t0 = time.time()
+        state = {"claim": claim}
+
+        # Запускаем полную цепочку
+        total_start = time.time()
+        raw_result = self.chain.invoke(state)
+        total_time = time.time() - total_start
+
+        # Парсинг вердикта
+        parsed = self.parse_verdict(raw_result.get("verdict", ""))
+
+        # Извлечение источников из результатов поиска
+        raw_search = raw_result.get("_raw_search_results", [])
+        sources = self.extract_sources(raw_search) if raw_search else []
+
+        # Ключевые слова
+        keywords = self._parse_keywords(raw_result.get("keywords_raw", ""))
+
+        return {
+            "claim": claim,
+            "credibility_score": parsed["credibility_score"],
+            "verdict": parsed["verdict"],
+            "confidence": parsed["confidence"],
+            "reasoning": parsed["reasoning"],
+            "sources": sources,
+            "sources_text": parsed["sources"],
+            "keywords": keywords,
+            "search_results_formatted": raw_result.get("search_results", ""),
+            "raw_verdict": parsed["raw"],
+            "total_time": round(total_time, 2),
+        }
