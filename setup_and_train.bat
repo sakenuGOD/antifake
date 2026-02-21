@@ -2,51 +2,102 @@
 chcp 65001 >nul
 echo ============================================
 echo  Fact-Checker: Установка и запуск тренировки
-echo  Требуется: Python 3.10+, NVIDIA GPU (CUDA)
+echo  RTX 5070 (12GB, Blackwell, bf16, CUDA 12.8)
+echo  Требуется: Python 3.10-3.12
 echo ============================================
 echo.
 
-:: Проверка Python
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo ОШИБКА: Python не найден. Установите Python 3.10+ с python.org
-    pause
-    exit /b 1
+:: Поиск подходящей версии Python (3.12 > 3.11 > 3.10)
+set PYTHON_CMD=
+where py >nul 2>&1
+if not errorlevel 1 (
+    py -3.12 --version >nul 2>&1
+    if not errorlevel 1 (
+        set PYTHON_CMD=py -3.12
+        goto :found
+    )
+    py -3.11 --version >nul 2>&1
+    if not errorlevel 1 (
+        set PYTHON_CMD=py -3.11
+        goto :found
+    )
+    py -3.10 --version >nul 2>&1
+    if not errorlevel 1 (
+        set PYTHON_CMD=py -3.10
+        goto :found
+    )
 )
 
-:: Проверка CUDA
-python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'" 2>nul
-if errorlevel 1 (
-    echo [INFO] PyTorch с CUDA не найден, будет установлен...
+:: Fallback: проверяем python напрямую
+python --version 2>nul | findstr /R "3\.1[0-2]\." >nul 2>&1
+if not errorlevel 1 (
+    set PYTHON_CMD=python
+    goto :found
+)
+
+echo ОШИБКА: Python 3.10-3.12 не найден!
+echo Python 3.13/3.14 слишком новые для PyTorch/Unsloth.
+echo.
+echo Установите Python 3.11:
+echo   https://www.python.org/downloads/release/python-31110/
+echo   (Обязательно отметьте "Add Python to PATH")
+echo.
+pause
+exit /b 1
+
+:found
+echo Используется: %PYTHON_CMD%
+%PYTHON_CMD% --version
+echo.
+
+:: Удаляем старый venv если был создан с неправильным Python
+if exist "venv" (
+    echo Удаление старого venv...
+    rmdir /s /q venv
 )
 
 :: Создание venv
-if not exist "venv" (
-    echo [1/4] Создание виртуального окружения...
-    python -m venv venv
-)
+echo [1/5] Создание виртуального окружения...
+%PYTHON_CMD% -m venv venv
 
 :: Активация venv
 call venv\Scripts\activate.bat
 
-:: Установка PyTorch с CUDA
-echo [2/4] Установка PyTorch с CUDA...
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+:: Установка PyTorch с CUDA 12.8 (Blackwell sm_120)
+echo [2/5] Установка PyTorch с CUDA 12.8 (для RTX 5070)...
+pip install --upgrade pip
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+:: Проверка CUDA
+echo.
+echo === Проверка GPU ===
+python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'); print('BF16:', torch.cuda.is_bf16_supported() if torch.cuda.is_available() else 'N/A'); print('VRAM:', round(torch.cuda.get_device_properties(0).total_mem/1024**3, 1), 'GB') if torch.cuda.is_available() else None"
+echo.
 
 :: Установка Unsloth и зависимостей
-echo [3/4] Установка Unsloth и зависимостей...
+echo [3/5] Установка Unsloth (QLoRA + Flash Attention)...
 pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 pip install --no-deps trl peft accelerate bitsandbytes
+
+echo [4/5] Установка остальных зависимостей...
 pip install transformers datasets sentencepiece protobuf xformers
 
+:: Скачивание датасета если не скачан
+if not exist "data\train.jsonl" (
+    echo.
+    echo [DATASET] Датасет не найден, скачиваю 500к примеров...
+    python download_dataset.py --limit 500000
+)
+
 :: Запуск тренировки
-echo [4/4] Запуск тренировки...
 echo.
+echo [5/5] Запуск тренировки (bf16, batch=8, LoRA r=32)...
+echo ============================================
 python train.py --dataset data/train.jsonl
 
 echo.
 echo ============================================
 echo  Тренировка завершена!
-echo  Адаптеры сохранены в: adapters/fact_checker_lora
+echo  Адаптеры сохранены в: adapters\fact_checker_lora
 echo ============================================
 pause

@@ -1,112 +1,57 @@
-"""Fine-tuning скрипт (Unsloth + QLoRA)."""
+"""
+Fine-tuning скрипт (Unsloth + QLoRA).
+
+Оптимизировано под RTX 5070 (12GB GDDR7, Blackwell, bf16, TF32).
+"""
 
 import argparse
 import json
 import os
+import torch
 
 from config import ModelConfig, LoraConfig, TrainingConfig
 
 
-TEMPLATE_DATA = [
-    {
-        "conversations": [
-            {
-                "from": "human",
-                "value": (
-                    "Проверь достоверность утверждения.\n\n"
-                    "Утверждение: Россия запустила новую космическую станцию в 2024 году.\n\n"
-                    "Найденные новости:\n"
-                    "1. Роскосмос объявил о планах создания новой орбитальной станции\n"
-                    "   Источник: ТАСС\n"
-                    "   Дата: 15 марта 2024\n"
-                    "   Проект Российской орбитальной станции находится на этапе проектирования."
-                ),
-            },
-            {
-                "from": "gpt",
-                "value": (
-                    "Вердикт: частично достоверно\n"
-                    "Обоснование: Россия действительно разрабатывает новую орбитальную станцию "
-                    "(РОС), однако по данным ТАСС проект находится на этапе проектирования, "
-                    "а не запуска. Утверждение о запуске преждевременно."
-                ),
-            },
-        ]
-    },
-    {
-        "conversations": [
-            {
-                "from": "human",
-                "value": (
-                    "Проверь достоверность утверждения.\n\n"
-                    "Утверждение: Уровень безработицы в России снизился до 2.9% в 2024 году.\n\n"
-                    "Найденные новости:\n"
-                    "1. Росстат: безработица в России обновила исторический минимум\n"
-                    "   Источник: РБК\n"
-                    "   Дата: 20 февраля 2024\n"
-                    "   Уровень безработицы в январе 2024 года составил 2.9%."
-                ),
-            },
-            {
-                "from": "gpt",
-                "value": (
-                    "Вердикт: достоверно\n"
-                    "Обоснование: По данным Росстата, опубликованным РБК, уровень безработицы "
-                    "в России действительно составил 2.9% в январе 2024 года, что является "
-                    "историческим минимумом. Утверждение подтверждается официальной статистикой."
-                ),
-            },
-        ]
-    },
-    {
-        "conversations": [
-            {
-                "from": "human",
-                "value": (
-                    "Проверь достоверность утверждения.\n\n"
-                    "Утверждение: Apple полностью прекратила продажи в России.\n\n"
-                    "Найденные новости:\n"
-                    "1. Apple приостановила продажи продукции в России\n"
-                    "   Источник: Коммерсантъ\n"
-                    "   Дата: 2 марта 2022\n"
-                    "   Apple приостановила продажи через официальный магазин, "
-                    "но продукция доступна через реселлеров."
-                ),
-            },
-            {
-                "from": "gpt",
-                "value": (
-                    "Вердикт: недостоверно\n"
-                    "Обоснование: Apple приостановила официальные продажи в России в 2022 году, "
-                    "но не прекратила их полностью. Продукция Apple по-прежнему доступна "
-                    "через авторизованных реселлеров и параллельный импорт."
-                ),
-            },
-        ]
-    },
-]
+def setup_cuda_optimizations():
+    """Включение CUDA-оптимизаций для Blackwell/Ampere+."""
+    if not torch.cuda.is_available():
+        print("CUDA недоступна!")
+        return
 
+    gpu_name = torch.cuda.get_device_name(0)
+    vram_gb = torch.cuda.get_device_properties(0).total_mem / 1024**3
+    print(f"GPU: {gpu_name} ({vram_gb:.1f} GB)")
+    print(f"CUDA: {torch.version.cuda}")
+    print(f"PyTorch: {torch.__version__}")
 
-def generate_template(output_path: str):
-    """Генерация шаблона обучающих данных."""
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        for item in TEMPLATE_DATA:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-    print(f"Шаблон обучающих данных сохранён в {output_path}")
-    print(f"Количество примеров: {len(TEMPLATE_DATA)}")
+    # TF32 — ускоряет matmul на Ampere+ (включая Blackwell)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # cuDNN benchmark — автоподбор оптимальных алгоритмов свёртки
+    torch.backends.cudnn.benchmark = True
+
+    # Оптимизация аллокации CUDA-памяти
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    print("CUDA-оптимизации включены: TF32, cuDNN benchmark, expandable segments")
 
 
 def load_dataset_from_jsonl(path: str):
     """Загрузка датасета из JSONL файла."""
     from datasets import Dataset
 
+    print(f"Чтение {path}...")
     data = []
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for i, line in enumerate(f):
             line = line.strip()
             if line:
                 data.append(json.loads(line))
+            if (i + 1) % 100_000 == 0:
+                print(f"  Загружено: {i + 1:,} строк")
+
+    print(f"  Всего: {len(data):,} примеров")
     return Dataset.from_list(data)
 
 
@@ -123,13 +68,16 @@ def train(
     if training_config is None:
         training_config = TrainingConfig()
 
+    # CUDA-оптимизации
+    setup_cuda_optimizations()
+
     from unsloth import FastLanguageModel
     from unsloth.chat_templates import get_chat_template, train_on_responses_only
     from trl import SFTTrainer
     from transformers import TrainingArguments
 
-    # 1. Загрузка модели
-    print("Загрузка модели...")
+    # 1. Загрузка модели (4-bit NF4 квантизация)
+    print("\n[1/7] Загрузка модели...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_config.base_model_name,
         max_seq_length=model_config.max_seq_length,
@@ -138,10 +86,11 @@ def train(
     )
 
     # 2. Настройка chat template
+    print("[2/7] Настройка chat template...")
     tokenizer = get_chat_template(tokenizer, chat_template="mistral")
 
-    # 3. Добавление LoRA адаптеров
-    print("Добавление LoRA адаптеров...")
+    # 3. Добавление LoRA адаптеров (r=32, alpha=64)
+    print(f"[3/7] Добавление LoRA адаптеров (r={lora_config.r}, alpha={lora_config.lora_alpha})...")
     model = FastLanguageModel.get_peft_model(
         model,
         r=lora_config.r,
@@ -153,8 +102,13 @@ def train(
         random_state=lora_config.random_state,
     )
 
+    # Вывод количества обучаемых параметров
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"  Обучаемых параметров: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
+
     # 4. Загрузка данных
-    print(f"Загрузка данных из {training_config.dataset_path}...")
+    print(f"\n[4/7] Загрузка данных из {training_config.dataset_path}...")
     dataset = load_dataset_from_jsonl(training_config.dataset_path)
 
     def formatting_func(examples):
@@ -167,17 +121,25 @@ def train(
             texts.append(text)
         return {"text": texts}
 
-    dataset = dataset.map(formatting_func, batched=True)
+    dataset = dataset.map(formatting_func, batched=True, num_proc=4)
 
     # 5. Настройка тренера
-    print("Настройка тренера...")
+    print(f"\n[5/7] Настройка тренера...")
+    print(f"  Batch size: {training_config.per_device_train_batch_size}")
+    print(f"  Gradient accumulation: {training_config.gradient_accumulation_steps}")
+    print(f"  Effective batch: {training_config.per_device_train_batch_size * training_config.gradient_accumulation_steps}")
+    print(f"  Epochs: {training_config.num_train_epochs}")
+    print(f"  LR: {training_config.learning_rate}")
+    print(f"  BF16: {training_config.bf16}")
+    print(f"  TF32: {training_config.tf32}")
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
         dataset_text_field="text",
         max_seq_length=model_config.max_seq_length,
-        dataset_num_proc=2,
+        dataset_num_proc=4,
         packing=False,
         args=TrainingArguments(
             output_dir=training_config.output_dir,
@@ -186,18 +148,25 @@ def train(
             gradient_accumulation_steps=training_config.gradient_accumulation_steps,
             learning_rate=training_config.learning_rate,
             weight_decay=training_config.weight_decay,
-            warmup_steps=training_config.warmup_steps,
+            warmup_ratio=training_config.warmup_ratio,
             lr_scheduler_type=training_config.lr_scheduler_type,
             optim=training_config.optim,
             fp16=training_config.fp16,
             bf16=training_config.bf16,
+            tf32=training_config.tf32,
             logging_steps=training_config.logging_steps,
             save_strategy=training_config.save_strategy,
+            save_steps=training_config.save_steps,
+            save_total_limit=training_config.save_total_limit,
             seed=training_config.seed,
+            dataloader_num_workers=training_config.dataloader_num_workers,
+            dataloader_pin_memory=training_config.dataloader_pin_memory,
+            report_to="none",
         ),
     )
 
     # 6. Loss только на ответах модели
+    print("[6/7] Настройка train_on_responses_only...")
     trainer = train_on_responses_only(
         trainer,
         instruction_part="[INST]",
@@ -205,13 +174,18 @@ def train(
     )
 
     # 7. Запуск обучения
-    print("Запуск обучения...")
+    print("\n[7/7] Запуск обучения...")
+    print("=" * 60)
     stats = trainer.train()
-    print(f"Обучение завершено. Результаты: {stats}")
+    print("=" * 60)
+    print(f"Обучение завершено!")
+    print(f"  Train loss: {stats.training_loss:.4f}")
+    print(f"  Время: {stats.metrics.get('train_runtime', 0):.0f} сек.")
+    print(f"  Samples/sec: {stats.metrics.get('train_samples_per_second', 0):.1f}")
 
     # 8. Сохранение адаптеров
     save_path = os.path.join(training_config.output_dir, "fact_checker_lora")
-    print(f"Сохранение LoRA адаптеров в {save_path}...")
+    print(f"\nСохранение LoRA адаптеров в {save_path}...")
     model.save_pretrained(save_path)
     tokenizer.save_pretrained(save_path)
     print("Готово!")
@@ -220,12 +194,7 @@ def train(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tuning Mistral для проверки фактов")
-    parser.add_argument(
-        "--generate-template",
-        action="store_true",
-        help="Сгенерировать шаблон обучающих данных",
-    )
+    parser = argparse.ArgumentParser(description="Fine-tuning Mistral для проверки фактов (RTX 5070)")
     parser.add_argument(
         "--dataset", type=str, default=None,
         help="Путь к файлу обучающих данных (JSONL)",
@@ -242,13 +211,13 @@ def main():
         "--lr", type=float, default=None,
         help="Learning rate",
     )
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="Batch size per device (по умолчанию: 8)",
+    )
     args = parser.parse_args()
 
     training_config = TrainingConfig()
-
-    if args.generate_template:
-        generate_template(training_config.dataset_path)
-        return
 
     if args.dataset:
         training_config.dataset_path = args.dataset
@@ -258,10 +227,12 @@ def main():
         training_config.num_train_epochs = args.epochs
     if args.lr:
         training_config.learning_rate = args.lr
+    if args.batch_size:
+        training_config.per_device_train_batch_size = args.batch_size
 
     if not os.path.exists(training_config.dataset_path):
         print(f"Файл данных не найден: {training_config.dataset_path}")
-        print("Используйте --generate-template для создания шаблона.")
+        print("Сначала скачайте датасет: python download_dataset.py")
         return
 
     train(training_config=training_config)
