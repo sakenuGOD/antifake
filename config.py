@@ -11,7 +11,7 @@ import os
 @dataclass
 class ModelConfig:
     base_model_name: str = "unsloth/mistral-7b-instruct-v0.3-bnb-4bit"
-    max_seq_length: int = 2048
+    max_seq_length: int = 4096
     dtype: str = None  # auto-detect (bf16 на Blackwell)
     load_in_4bit: bool = True
 

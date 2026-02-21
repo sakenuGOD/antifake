@@ -80,6 +80,11 @@ class FactCheckPipeline:
             print(f"  Ключевые слова: {keywords}")
             results = self.searcher.search_all_keywords(keywords)
             print(f"  Найдено новостей: {len(results)}")
+            # Ранжирование по косинусному сходству (Раздел 2.4)
+            claim = state.get("claim", "")
+            results = self.searcher.rank_by_relevance(claim, results)
+            confirming = [r for r in results if r.get("is_confirming")]
+            print(f"  Подтверждающих (similarity >= 0.85): {len(confirming)}")
             # Сохраняем сырые результаты поиска в состояние
             state["_raw_search_results"] = results
             return self.searcher.format_results(results)
