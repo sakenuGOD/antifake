@@ -1,5 +1,8 @@
 """Загрузка модели (base / fine-tuned) через Unsloth."""
 
+import os
+os.environ["XFORMERS_DISABLED"] = "1"
+
 import torch
 from transformers import pipeline as hf_pipeline
 from langchain_huggingface import HuggingFacePipeline
@@ -27,6 +30,11 @@ def load_finetuned_model(adapter_path: str, config: ModelConfig = None):
     """Загрузка fine-tuned модели (base + LoRA адаптеры) для inference."""
     if config is None:
         config = ModelConfig()
+
+    # Blackwell sm_120: отключаем Triton-based flash SDP, используем math SDP
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)
 
     from unsloth import FastLanguageModel
 
