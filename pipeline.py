@@ -6,6 +6,7 @@ v3: умное извлечение ключевых слов + post-verdict sel
 import logging
 import os
 import re
+import threading
 import time
 from typing import List, Dict, Any
 
@@ -21,6 +22,7 @@ from prompts import (
 )
 from model import load_unsloth_model, load_finetuned_model, build_langchain_llm
 from search import FactCheckSearcher
+from claim_parser import classify_claim, format_verification_hints
 
 logger = logging.getLogger("fact_checker")
 
@@ -75,10 +77,10 @@ class FactCheckPipeline:
         self.pipeline_config = pipeline_config
         self.searcher = FactCheckSearcher(search_config)
 
-        # Промежуточное хранилище (RunnablePassthrough.assign создаёт новый dict,
-        # поэтому мутации state внутри функций НЕ пробрасываются в следующие шаги)
-        self._last_search_hint = ""
-        self._last_raw_results = []
+        # Thread-local хранилище для промежуточных данных
+        # (RunnablePassthrough.assign создаёт новый dict, мутации state не пробрасываются)
+        # Используем threading.local() для thread-safety в multi-user сценариях (Streamlit)
+        self._local = threading.local()
 
         # Загрузка модели один раз
         if adapter_path and os.path.exists(adapter_path):
@@ -127,7 +129,7 @@ class FactCheckPipeline:
         )
         verdict_prompt = PromptTemplate(
             template=CREDIBILITY_ASSESSMENT_TEMPLATE,
-            input_variables=["claim", "search_results", "search_hint"],
+            input_variables=["claim", "search_results", "search_hint", "verification_hints"],
         )
 
         # Шаг 1: Извлечение ключевых слов
@@ -161,15 +163,26 @@ class FactCheckPipeline:
                     f"описывать ТОЧНО ТО ЖЕ событие, что и утверждение."
                 )
 
-            # Сохраняем на self (не через мутацию state!)
-            self._last_search_hint = hint
-            self._last_raw_results = results
+            # Сохраняем в thread-local (safe для multi-user)
+            self._local.search_hint = hint
+            self._local.raw_results = results
 
             return self.searcher.format_results(results)
 
-        # Шаг 2.5: Извлечение search_hint из self (отдельный assign)
+        # Шаг 2.5: Извлечение search_hint из thread-local (отдельный assign)
         def get_search_hint(state: dict) -> str:
-            return self._last_search_hint
+            return getattr(self._local, "search_hint", "")
+
+        # Шаг 2.6: Классификация утверждения и генерация подсказок для проверки
+        def get_verification_hints(state: dict) -> str:
+            claim = state.get("claim", "")
+            claim_info = classify_claim(claim)
+            self._local.claim_info = claim_info
+            hints = format_verification_hints(claim_info)
+            if hints:
+                print(f"  Тип утверждения: {claim_info['type']}, "
+                      f"чисел: {len(claim_info['numbers'])}, дат: {len(claim_info['dates'])}")
+            return hints
 
         # Шаг 3: Оценка достоверности (Quote-Then-Judge + Triple Self-Check)
         verdict_chain = verdict_prompt | self.verdict_llm | StrOutputParser()
@@ -184,6 +197,7 @@ class FactCheckPipeline:
             )
             | RunnablePassthrough.assign(
                 search_hint=RunnableLambda(get_search_hint),
+                verification_hints=RunnableLambda(get_verification_hints),
             )
             | RunnablePassthrough.assign(
                 verdict=verdict_chain,
@@ -423,11 +437,12 @@ class FactCheckPipeline:
             )
 
         # Rule 2: Вердикт ПРАВДА но score низкий → несоответствие
-        elif verdict == "ПРАВДА" and score < 60:
+        # Единые пороги: ПРАВДА=70+, ЛОЖЬ=0-29, НЕ ПОДТВЕРЖДЕНО=30-69
+        elif verdict == "ПРАВДА" and score < 70:
             parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
 
         # Rule 3: Вердикт ЛОЖЬ но score высокий → несоответствие
-        elif verdict == "ЛОЖЬ" and score > 40:
+        elif verdict == "ЛОЖЬ" and score > 29:
             parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
 
         return parsed
@@ -437,9 +452,9 @@ class FactCheckPipeline:
         logger.info(f"Проверка: {claim[:120]}")
         print(f"\nПроверка: {claim}")
 
-        # Сброс промежуточного состояния
-        self._last_search_hint = ""
-        self._last_raw_results = []
+        # Сброс промежуточного состояния (thread-local)
+        self._local.search_hint = ""
+        self._local.raw_results = []
 
         state = {"claim": claim}
 
@@ -466,8 +481,9 @@ class FactCheckPipeline:
             }
 
         # Парсинг вердикта + smart safety net
+        raw_results = getattr(self._local, "raw_results", [])
         parsed = self.parse_verdict(raw_result.get("verdict", ""))
-        parsed = self._apply_safety_net(parsed, self._last_raw_results)
+        parsed = self._apply_safety_net(parsed, raw_results)
 
         # Post-verdict self-critique
         critique_info = {}
@@ -481,8 +497,8 @@ class FactCheckPipeline:
             )
             print(f"  Self-critique: коррекция={'да' if critique_info.get('needs_correction') else 'нет'}")
 
-        # Извлечение источников из self (не из chain output)
-        raw_search = self._last_raw_results
+        # Извлечение источников из thread-local
+        raw_search = getattr(self._local, "raw_results", [])
         sources = self.extract_sources(raw_search) if raw_search else []
 
         # Ключевые слова

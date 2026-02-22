@@ -166,7 +166,7 @@ def train(
     dataset = dataset.map(formatting_func, batched=True, num_proc=1)
 
     # 5. Настройка тренера
-    print(f"\n[5/6] Настройка тренера...")
+    print(f"\n[5/7] Настройка тренера...")
     print(f"  Packing: True (упаковка коротких примеров)")
     print(f"  Batch size: {training_config.per_device_train_batch_size}")
     print(f"  Gradient accumulation: {training_config.gradient_accumulation_steps}")
@@ -176,10 +176,17 @@ def train(
     print(f"  BF16: {training_config.bf16}")
     print(f"  TF32: {training_config.tf32}")
 
+    # Validation split (10% для мониторинга переобучения)
+    split = dataset.train_test_split(test_size=0.1, seed=training_config.seed)
+    train_dataset = split["train"]
+    eval_dataset = split["test"]
+    print(f"  Train: {len(train_dataset)}, Eval: {len(eval_dataset)}")
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         args=SFTConfig(
             output_dir=training_config.output_dir,
             num_train_epochs=training_config.num_train_epochs,
@@ -201,6 +208,12 @@ def train(
             dataloader_num_workers=training_config.dataloader_num_workers,
             dataloader_pin_memory=training_config.dataloader_pin_memory,
             report_to="none",
+            # Validation
+            eval_strategy="steps",
+            eval_steps=50,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
             # Packing параметры (в новом TRL — через SFTConfig)
             packing=True,
             dataset_text_field="text",
@@ -209,8 +222,17 @@ def train(
         ),
     )
 
-    # 6. Запуск обучения
-    print("\n[6/6] Запуск обучения...")
+    # 6. train_on_responses_only — маскируем промпт, обучаем ТОЛЬКО на ответах
+    print("[6/7] Применение train_on_responses_only...")
+    from unsloth.chat_templates import train_on_responses_only
+    trainer = train_on_responses_only(
+        trainer,
+        instruction_part="[INST]",
+        response_part="[/INST]",
+    )
+
+    # 7. Запуск обучения
+    print("\n[7/7] Запуск обучения...")
     print("=" * 60)
     stats = trainer.train()
     print("=" * 60)
@@ -219,7 +241,7 @@ def train(
     print(f"  Время: {stats.metrics.get('train_runtime', 0):.0f} сек.")
     print(f"  Samples/sec: {stats.metrics.get('train_samples_per_second', 0):.1f}")
 
-    # 7. Сохранение адаптеров
+    # 8. Сохранение адаптеров
     save_path = os.path.join(training_config.output_dir, "fact_checker_lora")
     print(f"\nСохранение LoRA адаптеров в {save_path}...")
     model.save_pretrained(save_path)
@@ -255,6 +277,10 @@ def main():
         "--resume", type=str, default=None,
         help="Путь к существующим адаптерам для дообучения (например: adapters/fact_checker_lora)",
     )
+    parser.add_argument(
+        "--no-resume", action="store_true",
+        help="Обучение с нуля (игнорировать существующие адаптеры)",
+    )
     args = parser.parse_args()
 
     training_config = TrainingConfig()
@@ -275,7 +301,18 @@ def main():
         print("Сначала скачайте датасет: python download_dataset.py")
         return
 
-    train(training_config=training_config, resume_from=args.resume)
+    # Авто-обнаружение существующих адаптеров для дообучения
+    resume_from = args.resume
+    if args.no_resume:
+        resume_from = None
+    elif resume_from is None:
+        default_adapter_path = os.path.join(training_config.output_dir, "fact_checker_lora")
+        if os.path.exists(default_adapter_path):
+            print(f"Обнаружены существующие адаптеры: {default_adapter_path}")
+            print("Продолжаю обучение (--resume auto). Используйте --no-resume для обучения с нуля.")
+            resume_from = default_adapter_path
+
+    train(training_config=training_config, resume_from=resume_from)
 
 
 if __name__ == "__main__":

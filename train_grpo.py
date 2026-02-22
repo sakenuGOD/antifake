@@ -8,12 +8,13 @@ GRPO (Group Relative Policy Optimization) — обучение модели ра
   1. SFT на reasoning данных (train.py --resume)
   2. GRPO поверх SFT (этот скрипт)
 
-Reward-функции (5 штук):
+Reward-функции (6 штук):
   1. format_reward — правильный XML формат
   2. reasoning_quality_reward — глубина и качество рассуждений
   3. verdict_consistency_reward — согласованность вердикта и score
   4. correctness_reward — правильный вердикт (если известен ground truth)
   5. devils_advocate_reward — наличие "адвоката дьявола" в рассуждениях
+  6. numerical_accuracy_reward — точная работа с числами, датами, процентами
 
 Требования: ~12GB VRAM (RTX 5070), Unsloth + TRL >= 0.7.4.
 
@@ -28,6 +29,7 @@ import os
 import re
 import torch
 
+from claim_parser import extract_numbers, extract_dates
 from config import ModelConfig, LoraConfig, PROJECT_ROOT
 
 
@@ -57,6 +59,26 @@ SYSTEM_PROMPT = """\
 """
 
 
+# ===== ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ =====
+
+def _extract_contents(completions: list) -> list:
+    """Извлечение текста из completions.
+
+    TRL GRPOTrainer передаёт completions в conversational формате:
+    list[list[dict]] — каждый completion = [{"role": "assistant", "content": "..."}]
+    Эта функция извлекает content из каждого completion.
+    """
+    contents = []
+    for completion in completions:
+        if isinstance(completion, str):
+            contents.append(completion)
+        elif isinstance(completion, list) and len(completion) > 0:
+            contents.append(completion[0].get("content", ""))
+        else:
+            contents.append("")
+    return contents
+
+
 # ===== REWARD-ФУНКЦИИ =====
 
 def format_reward(completions: list, **kwargs) -> list:
@@ -65,25 +87,27 @@ def format_reward(completions: list, **kwargs) -> list:
     +1.0 за <reasoning>...</reasoning>
     +1.0 за <answer>...</answer>
     -0.5 за дублирующиеся теги (галлюцинация)
+    Нормализовано к [-1, +1]
     """
+    contents = _extract_contents(completions)
     scores = []
-    for completion in completions:
+    for text in contents:
         score = 0.0
 
-        has_r_open = "<reasoning>" in completion
-        has_r_close = "</reasoning>" in completion
-        has_a_open = "<answer>" in completion
-        has_a_close = "</answer>" in completion
+        has_r_open = "<reasoning>" in text
+        has_r_close = "</reasoning>" in text
+        has_a_open = "<answer>" in text
+        has_a_close = "</answer>" in text
 
         if has_r_open and has_r_close:
-            score += 1.0
+            score += 0.5
         if has_a_open and has_a_close:
-            score += 1.0
+            score += 0.5
 
         # Штраф за множественные теги
-        if completion.count("<reasoning>") > 1:
+        if text.count("<reasoning>") > 1:
             score -= 0.5
-        if completion.count("<answer>") > 1:
+        if text.count("<answer>") > 1:
             score -= 0.5
 
         scores.append(score)
@@ -95,13 +119,15 @@ def reasoning_quality_reward(completions: list, **kwargs) -> list:
 
     Оценивает: длину, наличие шагов, ссылки на источники, адвокат дьявола.
     Штрафует: шаблонные фразы из синтетических данных.
+    Нормализовано к [-1, +1]
     """
+    contents = _extract_contents(completions)
     scores = []
-    for completion in completions:
+    for text in contents:
         score = 0.0
 
         reasoning_match = re.search(
-            r"<reasoning>(.*?)</reasoning>", completion, re.DOTALL
+            r"<reasoning>(.*?)</reasoning>", text, re.DOTALL
         )
         if not reasoning_match:
             scores.append(-1.0)
@@ -168,7 +194,8 @@ def reasoning_quality_reward(completions: list, **kwargs) -> list:
             if phrase in reasoning.lower():
                 score -= 0.3
 
-        scores.append(score)
+        # Нормализация к [-1, +1]
+        scores.append(max(-1.0, min(1.0, score)))
     return scores
 
 
@@ -179,12 +206,13 @@ def verdict_consistency_reward(completions: list, **kwargs) -> list:
     ЛОЖЬ → score 0-29
     НЕ ПОДТВЕРЖДЕНО → score 30-69
     """
+    contents = _extract_contents(completions)
     scores = []
-    for completion in completions:
+    for text in contents:
         score = 0.0
 
         answer_match = re.search(
-            r"<answer>(.*?)</answer>", completion, re.DOTALL
+            r"<answer>(.*?)</answer>", text, re.DOTALL
         )
         if not answer_match:
             scores.append(-1.0)
@@ -225,18 +253,34 @@ def verdict_consistency_reward(completions: list, **kwargs) -> list:
 def correctness_reward(completions: list, **kwargs) -> list:
     """Reward за правильный вердикт (если known ground truth).
 
-    +2.0 за точное совпадение вердикта
-    -1.5 за неверный вердикт
+    +1.0 за точное совпадение вердикта
+    -1.0 за неверный вердикт
     -0.2 за НЕ ПОДТВЕРЖДЕНО когда ответ известен (мягкий штраф)
+    Нормализовано к [-1, +1]
+
+    ВАЖНО: GRPOTrainer генерирует num_generations completions на КАЖДЫЙ промпт,
+    но expected_verdict — одно значение на промпт. Реплицируем expected_verdict.
     """
     expected_verdicts = kwargs.get("expected_verdict", [])
     if not expected_verdicts:
         return [0.0] * len(completions)
 
+    contents = _extract_contents(completions)
+
+    # GRPOTrainer: len(completions) = batch_size * num_generations
+    # expected_verdicts: len = batch_size
+    # Нужно реплицировать каждый expected_verdict на num_generations
+    if len(expected_verdicts) > 0 and len(contents) > len(expected_verdicts):
+        num_gen = len(contents) // len(expected_verdicts)
+        expanded_verdicts = []
+        for v in expected_verdicts:
+            expanded_verdicts.extend([v] * num_gen)
+        expected_verdicts = expanded_verdicts
+
     scores = []
-    for completion, expected in zip(completions, expected_verdicts):
+    for text, expected in zip(contents, expected_verdicts):
         answer_match = re.search(
-            r"<answer>(.*?)</answer>", completion, re.DOTALL
+            r"<answer>(.*?)</answer>", text, re.DOTALL
         )
         if not answer_match:
             scores.append(-1.0)
@@ -253,11 +297,11 @@ def correctness_reward(completions: list, **kwargs) -> list:
         expected_upper = expected.upper().strip()
 
         if predicted == expected_upper:
-            scores.append(2.0)
+            scores.append(1.0)
         elif "НЕ ПОДТВЕРЖДЕНО" in predicted:
-            scores.append(-0.2)  # Мягкий штраф за осторожность
+            scores.append(-0.2)
         else:
-            scores.append(-1.5)
+            scores.append(-1.0)
 
     return scores
 
@@ -267,14 +311,16 @@ def devils_advocate_reward(completions: list, **kwargs) -> list:
 
     Учим модель не просто давать ответ, а критически анализировать собственные выводы.
 
-    +1.0 за наличие контраргументов в reasoning
+    +0.5 за наличие контраргументов в reasoning
     +0.5 за явное отклонение контраргументов с обоснованием
     -0.5 за reasoning без самокритики
+    Нормализовано к [-1, +1]
     """
+    contents = _extract_contents(completions)
     scores = []
-    for completion in completions:
+    for text in contents:
         reasoning_match = re.search(
-            r"<reasoning>(.*?)</reasoning>", completion, re.DOTALL
+            r"<reasoning>(.*?)</reasoning>", text, re.DOTALL
         )
         if not reasoning_match:
             scores.append(-0.5)
@@ -294,9 +340,9 @@ def devils_advocate_reward(completions: list, **kwargs) -> list:
         has_contra = sum(1 for kw in contra_keywords if kw in reasoning)
 
         if has_contra >= 2:
-            score += 1.0
-        elif has_contra == 1:
             score += 0.5
+        elif has_contra == 1:
+            score += 0.25
 
         # Отклонение контраргументов с обоснованием
         rejection_keywords = [
@@ -312,7 +358,129 @@ def devils_advocate_reward(completions: list, **kwargs) -> list:
         if has_contra == 0:
             score -= 0.5
 
-        scores.append(score)
+        scores.append(max(-1.0, min(1.0, score)))
+    return scores
+
+
+def numerical_accuracy_reward(completions: list, **kwargs) -> list:
+    """Reward за точную работу с числами, датами и процентами.
+
+    Извлекает числа/даты из промпта (утверждение), затем проверяет,
+    что модель явно упоминает и сравнивает их в reasoning.
+
+    +0.4 за каждое число из утверждения, упомянутое в reasoning (max +0.8)
+    +0.3 за явное сравнение чисел ("совпадает"/"не совпадает"/"расходится")
+    +0.3 за упоминание дат из утверждения в reasoning
+    -0.5 если в утверждении есть числа, но reasoning их игнорирует
+    -0.3 если в утверждении есть даты, но reasoning их игнорирует
+    Нормализовано к [-1, +1]
+    """
+    contents = _extract_contents(completions)
+
+    # Извлекаем промпты для получения чисел/дат из утверждений
+    prompts = kwargs.get("prompts", [])
+
+    # Реплицируем промпты на num_generations (как в correctness_reward)
+    if len(prompts) > 0 and len(contents) > len(prompts):
+        num_gen = len(contents) // len(prompts)
+        expanded_prompts = []
+        for p in prompts:
+            expanded_prompts.extend([p] * num_gen)
+        prompts = expanded_prompts
+
+    # Если промпты недоступны — нейтральный reward
+    if not prompts:
+        return [0.0] * len(contents)
+
+    scores = []
+    for text, prompt in zip(contents, prompts):
+        score = 0.0
+
+        # Извлекаем текст промпта
+        if isinstance(prompt, list):
+            prompt_text = " ".join(
+                msg.get("content", "") for msg in prompt if isinstance(msg, dict)
+            )
+        else:
+            prompt_text = str(prompt)
+
+        # Извлекаем числа и даты из утверждения
+        claim_numbers = extract_numbers(prompt_text)
+        claim_dates = extract_dates(prompt_text)
+
+        # Если нет чисел и дат — нейтральный reward
+        if not claim_numbers and not claim_dates:
+            scores.append(0.0)
+            continue
+
+        # Извлекаем reasoning
+        reasoning_match = re.search(
+            r"<reasoning>(.*?)</reasoning>", text, re.DOTALL
+        )
+        if not reasoning_match:
+            # Нет reasoning при наличии чисел/дат = штраф
+            scores.append(-0.5)
+            continue
+
+        reasoning = reasoning_match.group(1)
+        reasoning_lower = reasoning.lower()
+
+        # --- Проверка чисел ---
+        if claim_numbers:
+            mentioned_count = 0
+            for num in claim_numbers:
+                # Проверяем упоминание числа в reasoning (raw или value)
+                raw = num["raw"]
+                if raw in reasoning or str(int(num["value"])) in reasoning:
+                    mentioned_count += 1
+
+            if mentioned_count > 0:
+                score += min(mentioned_count * 0.4, 0.8)
+            else:
+                score -= 0.5  # Числа есть, но reasoning их игнорирует
+
+            # Бонус за явное сравнение чисел
+            comparison_patterns = [
+                r"совпада\w*", r"не совпада\w*", r"расходи\w*",
+                r"отличает\w*", r"соответств\w*", r"не соответств\w*",
+                r"подтвержда\w*.*\d", r"\d.*процент\w*",
+                r"больше|меньше|выше|ниже|превышает",
+            ]
+            has_comparison = any(
+                re.search(pat, reasoning_lower) for pat in comparison_patterns
+            )
+            if has_comparison:
+                score += 0.3
+
+        # --- Проверка дат ---
+        if claim_dates:
+            date_mentioned = False
+            for date in claim_dates:
+                raw = date["raw"]
+                year = str(date.get("year", ""))
+                if raw in reasoning or (year and year in reasoning):
+                    date_mentioned = True
+                    break
+
+            if date_mentioned:
+                score += 0.3
+            else:
+                score -= 0.3  # Даты есть, но reasoning их игнорирует
+
+            # Бонус за сравнение дат
+            date_comparison = [
+                r"в \d{4}.*а не в \d{4}",
+                r"год[уае]?\s+(?:совпада|не совпада|расходи)",
+                r"дат[аы]?\s+(?:совпада|не совпада|расходи|другая|верн|неверн)",
+                r"(?:январ|феврал|март|апрел|ма[яй]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*.*(?:а не|вместо|на самом деле)",
+            ]
+            has_date_comparison = any(
+                re.search(pat, reasoning_lower) for pat in date_comparison
+            )
+            if has_date_comparison:
+                score += 0.2
+
+        scores.append(max(-1.0, min(1.0, score)))
     return scores
 
 
@@ -480,6 +648,7 @@ def train_grpo(
             verdict_consistency_reward,
             correctness_reward,
             devils_advocate_reward,
+            numerical_accuracy_reward,
         ],
         args=training_args,
         train_dataset=dataset,

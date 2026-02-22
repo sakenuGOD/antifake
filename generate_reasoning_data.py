@@ -21,6 +21,7 @@ import re
 from typing import List, Dict, Optional
 
 from config import PROJECT_ROOT
+from claim_parser import classify_claim, extract_numbers, extract_dates
 
 
 # === Шаблоны reasoning для ПРАВДА (глубокие, с адвокатом дьявола) ===
@@ -186,6 +187,90 @@ UNVERIFIED_REASONING_TEMPLATES = [
     ),
 ]
 
+# === Специализированные шаблоны для ЧИСЛОВЫХ утверждений ===
+TRUE_NUMERICAL_TEMPLATES = [
+    (
+        "Шаг 1 — Идентификация события:\n"
+        "Утверждение содержит числовые данные: {claim_summary}.\n"
+        "Источник {source}: «{title}» — описывает то же событие.\n\n"
+        "Шаг 2 — Сравнение фактов:\n"
+        "{source} сообщает: «{snippet_short}».\n"
+        "Факты совпадают: {detail}.\n\n"
+        "Шаг 3 — Числовая проверка (КРИТИЧНО):\n"
+        "Числа в утверждении: {claim_numbers}.\n"
+        "Числа в источнике: совпадают. Расхождение менее 10%.\n"
+        "Единицы измерения корректны, масштаб верный.\n\n"
+        "Шаг 4 — Самопроверка + адвокат дьявола:\n"
+        "А) Источник описывает ТО ЖЕ событие с ТЕМИ ЖЕ цифрами.\n"
+        "Б) Числа проверены — расхождений нет.\n"
+        "В) Адвокат дьявола: могли ли данные измениться? "
+        "Источник актуален, данные свежие.\n"
+        "Г) ПРАВДА — числа подтверждены."
+    ),
+]
+
+FALSE_NUMERICAL_TEMPLATES = [
+    (
+        "Шаг 1 — Идентификация события:\n"
+        "Утверждение содержит числовые данные: {claim_summary}.\n"
+        "Источники описывают похожую тему, но с ДРУГИМИ цифрами.\n\n"
+        "Шаг 2 — Сравнение фактов:\n"
+        "{contradiction}.\n"
+        "Числовые данные в утверждении не подтверждаются.\n\n"
+        "Шаг 3 — Числовая проверка (КРИТИЧНО):\n"
+        "Числа в утверждении: {claim_numbers}.\n"
+        "Числа в источниках: {num_issue}.\n"
+        "Расхождение СУЩЕСТВЕННОЕ — более 10%, или порядок величины другой.\n\n"
+        "Шаг 4 — Самопроверка + адвокат дьявола:\n"
+        "А) Расхождение в числах конкретное и верифицируемое.\n"
+        "Б) Не перепутаны ли единицы? Нет — сравниваю одно и то же.\n"
+        "В) Адвокат дьявола: может быть, данные обновились? "
+        "Нет — несколько актуальных источников дают другие цифры.\n"
+        "Г) ЛОЖЬ — числа не сходятся."
+    ),
+]
+
+# === Специализированные шаблоны для ДАТОВЫХ утверждений ===
+TRUE_DATE_TEMPLATES = [
+    (
+        "Шаг 1 — Идентификация события:\n"
+        "Утверждение содержит дату/период: {claim_summary}.\n"
+        "Источник {source}: «{title}» — подтверждает хронологию.\n\n"
+        "Шаг 2 — Сравнение фактов:\n"
+        "{source} сообщает: «{snippet_short}».\n"
+        "Дата и место события совпадают.\n\n"
+        "Шаг 3 — Проверка дат (КРИТИЧНО):\n"
+        "Дата в утверждении: {claim_dates}.\n"
+        "Дата в источнике: совпадает. Год, месяц и место верны.\n\n"
+        "Шаг 4 — Самопроверка + адвокат дьявола:\n"
+        "А) Не путаю ли я разные мероприятия разных лет? Нет — год совпадает.\n"
+        "Б) Место проведения проверено отдельно.\n"
+        "В) Адвокат дьявола: может ли быть ошибка в годе? Проверил — нет.\n"
+        "Г) ПРАВДА — дата подтверждена."
+    ),
+]
+
+FALSE_DATE_TEMPLATES = [
+    (
+        "Шаг 1 — Идентификация события:\n"
+        "Утверждение содержит дату/период: {claim_summary}.\n"
+        "Источники указывают ДРУГУЮ дату или место.\n\n"
+        "Шаг 2 — Сравнение фактов:\n"
+        "{contradiction}.\n"
+        "Хронология в утверждении не совпадает с реальной.\n\n"
+        "Шаг 3 — Проверка дат (КРИТИЧНО):\n"
+        "Дата в утверждении: {claim_dates}.\n"
+        "Реальная дата: ДРУГАЯ. {num_issue}.\n"
+        "Разница не в днях — в годах или месте проведения.\n\n"
+        "Шаг 4 — Самопроверка + адвокат дьявола:\n"
+        "А) Не перепутал ли я сам даты? Проверил дважды — нет.\n"
+        "Б) Это не «приблизительная дата» — это принципиально другой период.\n"
+        "В) Адвокат дьявола: могло ли событие повториться? "
+        "Нет — это конкретное уникальное событие.\n"
+        "Г) ЛОЖЬ — дата/место неверны."
+    ),
+]
+
 # Шаблоны для self-critique
 SELF_CRITIQUE_TEMPLATES = {
     "no_errors": [
@@ -216,6 +301,11 @@ CONTRADICTIONS = [
     "официальные данные расходятся с заявленными",
     "хронология событий не совпадает с утверждением",
     "ключевые цифры в утверждении не подтверждены",
+    "источник описывает ДРУГОЕ событие, не совпадающее с утверждением",
+    "цитаты в утверждении вырваны из контекста или искажены",
+    "независимые эксперты прямо опровергают заявленное",
+    "дата события в утверждении не совпадает с реальной",
+    "действующие лица и участники описаны неверно",
 ]
 
 NUM_ISSUES = [
@@ -224,6 +314,9 @@ NUM_ISSUES = [
     "не подтверждаются ни одним источником",
     "противоречат физически возможным значениям",
     "расходятся с данными профильных ведомств",
+    "отличаются от опубликованных на порядок",
+    "перепутаны единицы измерения или масштаб",
+    "взяты из устаревших отчётов, актуальные данные другие",
 ]
 
 IMPOSSIBILITIES = [
@@ -231,6 +324,8 @@ IMPOSSIBILITIES = [
     "противоречит общеизвестным фактам",
     "содержит признаки типичной дезинформации",
     "является физически/логически невозможным",
+    "опровергается множеством независимых источников",
+    "хронологически невозможно — описанное ещё не произошло",
 ]
 
 
@@ -305,32 +400,55 @@ def extract_info_from_conversation(conversation: dict) -> dict:
 
 
 def generate_reasoning(info: dict) -> str:
-    """Генерация reasoning на основе извлечённой информации."""
+    """Генерация reasoning на основе извлечённой информации.
+
+    Классифицирует утверждение по типу (числовое, датовое, общее)
+    и выбирает специализированный шаблон reasoning.
+    """
     verdict = info["verdict"]
     source = info.get("source", "News Agency")
     title = info.get("title", "")[:80]
     snippet_short = info.get("snippet", "")[:100]
     detail = title[:50] if title else "основные данные"
     claim_summary = info.get("claim_summary", "событие")
+    claim = info.get("claim", "")
+
+    # Классификация утверждения
+    claim_info = classify_claim(claim) if claim else {"type": "general", "numbers": [], "dates": []}
+    claim_type = claim_info["type"]
+    claim_numbers = ", ".join(n["raw"] for n in claim_info["numbers"][:3]) or "нет"
+    claim_dates = ", ".join(d["raw"] for d in claim_info["dates"][:2]) or "нет"
+
+    format_kwargs = dict(
+        source=source, title=title,
+        snippet_short=snippet_short if snippet_short else title[:80],
+        detail=detail, claim_summary=claim_summary,
+        claim_numbers=claim_numbers, claim_dates=claim_dates,
+        contradiction=random.choice(CONTRADICTIONS),
+        num_issue=random.choice(NUM_ISSUES),
+        impossibility=random.choice(IMPOSSIBILITIES),
+    )
 
     if verdict == "ПРАВДА":
-        template = random.choice(TRUE_REASONING_TEMPLATES)
-        return template.format(
-            source=source,
-            title=title,
-            snippet_short=snippet_short,
-            detail=detail,
-            claim_summary=claim_summary,
-        )
+        # Выбираем шаблон по типу утверждения
+        if claim_type == "numerical" and claim_info["numbers"]:
+            templates = TRUE_NUMERICAL_TEMPLATES + TRUE_REASONING_TEMPLATES
+        elif claim_type == "date" and claim_info["dates"]:
+            templates = TRUE_DATE_TEMPLATES + TRUE_REASONING_TEMPLATES
+        else:
+            templates = TRUE_REASONING_TEMPLATES
+        template = random.choice(templates)
+        return template.format(**format_kwargs)
 
     elif verdict == "ЛОЖЬ":
-        template = random.choice(FALSE_REASONING_TEMPLATES)
-        return template.format(
-            contradiction=random.choice(CONTRADICTIONS),
-            num_issue=random.choice(NUM_ISSUES),
-            impossibility=random.choice(IMPOSSIBILITIES),
-            claim_summary=claim_summary,
-        )
+        if claim_type == "numerical" and claim_info["numbers"]:
+            templates = FALSE_NUMERICAL_TEMPLATES + FALSE_REASONING_TEMPLATES
+        elif claim_type == "date" and claim_info["dates"]:
+            templates = FALSE_DATE_TEMPLATES + FALSE_REASONING_TEMPLATES
+        else:
+            templates = FALSE_REASONING_TEMPLATES
+        template = random.choice(templates)
+        return template.format(**format_kwargs)
 
     else:  # НЕ ПОДТВЕРЖДЕНО
         template = random.choice(UNVERIFIED_REASONING_TEMPLATES)

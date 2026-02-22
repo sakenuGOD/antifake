@@ -3,8 +3,8 @@
 
 Методика:
   - 50 информационных сообщений (25 true + 25 fake)
-  - Два этапа: Baseline (без поиска) vs RAG (с поиском)
-  - Метрики: Accuracy, Precision, Recall, F1-Score, Latency
+  - Включая 5 "тонких" фейков — неверные цифры, устаревшие данные, подмена контекста
+  - Метрики: Accuracy, Precision, Recall, F1-Score, Latency, per-class метрики
 """
 
 import json
@@ -13,73 +13,85 @@ import time
 from typing import List, Dict
 
 # Синтетический датасет (Synthetic Adversarial Dataset)
-# 25 достоверных + 25 недостоверных сообщений
+# 25 достоверных + 25 недостоверных = 50
+# Каждый кейс помечен типом для анализа по категориям
 TEST_DATASET = [
-    # === Class 1 — True (достоверные) ===
-    {"claim": "Уровень безработицы в России составил 2.3% в 2025 году по данным Росстата", "label": 1},
-    {"claim": "SpaceX успешно запустила ракету Falcon 9 с мыса Канаверал", "label": 1},
-    {"claim": "Москва является столицей Российской Федерации", "label": 1},
-    {"claim": "Олимпийские игры 2024 года прошли в Париже", "label": 1},
-    {"claim": "Apple представила новый iPhone на ежегодной презентации", "label": 1},
-    {"claim": "Население Земли превысило 8 миллиардов человек", "label": 1},
-    {"claim": "Центральный банк России регулирует ключевую ставку", "label": 1},
-    {"claim": "Telegram является одним из популярных мессенджеров в России", "label": 1},
-    {"claim": "Международная космическая станция находится на орбите Земли", "label": 1},
-    {"claim": "Python является одним из самых популярных языков программирования", "label": 1},
-    {"claim": "ВОЗ является специализированным учреждением ООН по вопросам здравоохранения", "label": 1},
-    {"claim": "Газпром является крупнейшей газовой компанией в мире", "label": 1},
-    {"claim": "Нобелевская премия вручается ежегодно в Стокгольме", "label": 1},
-    {"claim": "Байкал является самым глубоким озером в мире", "label": 1},
-    {"claim": "Рубль является официальной валютой Российской Федерации", "label": 1},
-    {"claim": "NVIDIA производит графические процессоры для AI", "label": 1},
-    {"claim": "Курс доллара определяется на валютном рынке", "label": 1},
-    {"claim": "Сбербанк является крупнейшим банком России", "label": 1},
-    {"claim": "Google разработала поисковую систему и Android", "label": 1},
-    {"claim": "Чемпионат мира по футболу проводится раз в 4 года", "label": 1},
-    {"claim": "Россия является самой большой страной по площади", "label": 1},
-    {"claim": "Эйфелева башня находится в Париже", "label": 1},
-    {"claim": "Яндекс является российской технологической компанией", "label": 1},
-    {"claim": "Арктика подвергается последствиям изменения климата", "label": 1},
-    {"claim": "ТАСС является государственным информационным агентством России", "label": 1},
+    # === Class 1 — True: ЧИСЛОВЫЕ (конкретные цифры, проценты, суммы) ===
+    {"claim": "Уровень безработицы в России составил 2.3% в 2025 году по данным Росстата", "label": 1, "type": "numerical"},
+    {"claim": "Население Земли превысило 8 миллиардов человек", "label": 1, "type": "numerical"},
+    {"claim": "Россия является самой большой страной по площади — 17.1 млн км²", "label": 1, "type": "numerical"},
+    {"claim": "Глубина озера Байкал составляет 1642 метра", "label": 1, "type": "numerical"},
+    {"claim": "Население России составляет около 146 миллионов человек", "label": 1, "type": "numerical"},
 
-    # === Class 0 — False (недостоверные) ===
-    {"claim": "ЦБ РФ экстренно поднял ключевую ставку до 50% сегодня утром", "label": 0},
-    {"claim": "Россия вышла из ООН и разорвала все дипломатические отношения", "label": 0},
-    {"claim": "Apple полностью прекратила производство iPhone навсегда", "label": 0},
-    {"claim": "Учёные доказали что Земля на самом деле плоская", "label": 0},
-    {"claim": "Москву переименовали в Новоград по указу президента", "label": 0},
-    {"claim": "Bitcoin стал официальной валютой Евросоюза", "label": 0},
-    {"claim": "NASA подтвердило обнаружение инопланетной цивилизации на Марсе", "label": 0},
-    {"claim": "Интернет будет полностью отключён в России с 1 января", "label": 0},
-    {"claim": "Все школы России перейдут на шестидневную учебную неделю навсегда", "label": 0},
-    {"claim": "Telegram заблокирован и удалён из всех магазинов приложений мира", "label": 0},
-    {"claim": "Бензин в России станет бесплатным по новому закону", "label": 0},
-    {"claim": "Антарктида полностью растаяла за последний месяц", "label": 0},
-    {"claim": "Китай присоединил Луну к своей территории", "label": 0},
-    {"claim": "ВОЗ объявила что витамин C лечит все виды рака", "label": 0},
-    {"claim": "Газпром бесплатно раздаёт газ всем странам Европы", "label": 0},
-    {"claim": "Рубль заменён на криптовалюту по решению правительства", "label": 0},
-    {"claim": "Google закрывается и прекращает работу всех сервисов", "label": 0},
-    {"claim": "Землетрясение магнитудой 15 баллов произошло в центре Москвы", "label": 0},
-    {"claim": "Все университеты России отменили вступительные экзамены навсегда", "label": 0},
-    {"claim": "Илон Маск купил Россию за 1 триллион долларов", "label": 0},
-    {"claim": "Нобелевскую премию отменили навсегда", "label": 0},
-    {"claim": "Озеро Байкал полностью высохло", "label": 0},
-    {"claim": "Сбербанк раздаёт по миллиону рублей каждому клиенту", "label": 0},
-    {"claim": "Правительство запретило использование искусственного интеллекта", "label": 0},
-    {"claim": "МКС упала на Землю и разрушила целый город", "label": 0},
+    # === Class 1 — True: ДАТЫ (конкретные даты, события во времени) ===
+    {"claim": "Олимпийские игры 2024 года прошли в Париже", "label": 1, "type": "date"},
+    {"claim": "Великобритания вышла из Евросоюза 31 января 2020 года", "label": 1, "type": "date"},
+    {"claim": "ВОЗ объявила пандемию COVID-19 11 марта 2020 года", "label": 1, "type": "date"},
+    {"claim": "Чемпионат мира по футболу 2022 года прошёл в Катаре", "label": 1, "type": "date"},
+    {"claim": "МКС находится на орбите с ноября 1998 года", "label": 1, "type": "date"},
 
-    # === Edge cases — частично правдивые / устаревшие / преувеличенные ===
-    {"claim": "ЦБ РФ поднял ставку до 25%", "label": 1},  # Было в реальности (зависит от даты)
-    {"claim": "Tesla является самой дорогой автомобильной компанией в мире", "label": 1},
-    {"claim": "Население России составляет 146 миллионов человек", "label": 1},
-    {"claim": "Великобритания вышла из Евросоюза", "label": 1},
-    {"claim": "ВОЗ объявила пандемию COVID-19", "label": 1},
+    # === Class 1 — True: ПЕРСОНЫ (действия конкретных людей) ===
+    {"claim": "Илон Маск является генеральным директором Tesla и SpaceX", "label": 1, "type": "person"},
+    {"claim": "Apple представила новый iPhone на ежегодной презентации", "label": 1, "type": "person"},
+    {"claim": "Google разработала поисковую систему и Android", "label": 1, "type": "person"},
+
+    # === Class 1 — True: ИНСТИТУЦИОНАЛЬНЫЕ (организации, решения) ===
+    {"claim": "Центральный банк России регулирует ключевую ставку", "label": 1, "type": "institutional"},
+    {"claim": "ВОЗ является специализированным учреждением ООН по вопросам здравоохранения", "label": 1, "type": "institutional"},
+    {"claim": "ТАСС является государственным информационным агентством России", "label": 1, "type": "institutional"},
+    {"claim": "Газпром является крупнейшей газовой компанией в мире", "label": 1, "type": "institutional"},
+    {"claim": "Сбербанк является крупнейшим банком России", "label": 1, "type": "institutional"},
+
+    # === Class 1 — True: СОБЫТИЯ (запуски, открытия, факты) ===
+    {"claim": "SpaceX успешно запустила ракету Falcon 9 с мыса Канаверал", "label": 1, "type": "event"},
+    {"claim": "Москва является столицей Российской Федерации", "label": 1, "type": "general"},
+    {"claim": "Эйфелева башня находится в Париже", "label": 1, "type": "general"},
+    {"claim": "Python является одним из самых популярных языков программирования", "label": 1, "type": "general"},
+    {"claim": "NVIDIA производит графические процессоры для AI", "label": 1, "type": "general"},
+    {"claim": "Telegram является одним из популярных мессенджеров в России", "label": 1, "type": "general"},
+    {"claim": "Арктика подвергается последствиям изменения климата", "label": 1, "type": "general"},
+
+    # === Class 0 — False: ТОНКИЕ ЧИСЛОВЫЕ ФЕЙКИ (неверные цифры) ===
+    {"claim": "ЦБ РФ экстренно поднял ключевую ставку до 50% в феврале 2025", "label": 0, "type": "numerical"},
+    {"claim": "Уровень безработицы в России достиг 12% в 2025 году по данным Росстата", "label": 0, "type": "numerical"},
+    {"claim": "Население России превысило 200 миллионов человек по переписи 2025 года", "label": 0, "type": "numerical"},
+    {"claim": "Глубина Байкала составляет всего 400 метров", "label": 0, "type": "numerical"},
+    {"claim": "Площадь России составляет 5 млн км²", "label": 0, "type": "numerical"},
+
+    # === Class 0 — False: ТОНКИЕ ФЕЙКИ С ДАТАМИ (неверные даты/периоды) ===
+    {"claim": "Олимпийские игры 2024 года прошли в Токио", "label": 0, "type": "date"},
+    {"claim": "Великобритания вышла из Евросоюза в 2016 году", "label": 0, "type": "date"},
+    {"claim": "SpaceX запустила первый пилотируемый полёт на Марс в январе 2025", "label": 0, "type": "date"},
+    {"claim": "Чемпионат мира по футболу 2022 года прошёл в Японии", "label": 0, "type": "date"},
+    {"claim": "МКС была запущена на орбиту в 2010 году", "label": 0, "type": "date"},
+
+    # === Class 0 — False: ПОДМЕНА ПЕРСОН/КОНТЕКСТА ===
+    {"claim": "Марк Цукерберг является генеральным директором Tesla", "label": 0, "type": "person"},
+    {"claim": "Samsung разработала операционную систему Android", "label": 0, "type": "person"},
+    {"claim": "Россия стала второй по площади страной мира после передачи территорий", "label": 0, "type": "person"},
+
+    # === Class 0 — False: ИНСТИТУЦИОНАЛЬНЫЕ ФЕЙКИ ===
+    {"claim": "Bitcoin стал официальной валютой Евросоюза", "label": 0, "type": "institutional"},
+    {"claim": "Рубль заменён на криптовалюту по решению правительства", "label": 0, "type": "institutional"},
+    {"claim": "ВОЗ объявила что витамин C лечит все виды рака", "label": 0, "type": "institutional"},
+    {"claim": "Правительство запретило использование искусственного интеллекта", "label": 0, "type": "institutional"},
+
+    # === Class 0 — False: АБСУРДНЫЕ СОБЫТИЯ ===
+    {"claim": "NASA подтвердило обнаружение инопланетной цивилизации на Марсе", "label": 0, "type": "event"},
+    {"claim": "Землетрясение магнитудой 15 баллов произошло в центре Москвы", "label": 0, "type": "event"},
+    {"claim": "МКС упала на Землю и разрушила целый город", "label": 0, "type": "event"},
+    {"claim": "Антарктида полностью растаяла за последний месяц", "label": 0, "type": "event"},
+    {"claim": "Москву переименовали в Новоград по указу президента", "label": 0, "type": "event"},
+    {"claim": "Интернет будет полностью отключён в России с 1 января", "label": 0, "type": "event"},
+    {"claim": "Apple полностью прекратила производство iPhone навсегда", "label": 0, "type": "event"},
 ]
 
 
 def compute_metrics(predictions: List[int], labels: List[int]) -> Dict[str, float]:
-    """Вычисление Accuracy, Precision, Recall, F1-Score."""
+    """Вычисление Accuracy, Precision, Recall, F1-Score + per-class метрики.
+
+    Positive class = 0 (fake) — мы ищем фейки.
+    """
     assert len(predictions) == len(labels)
 
     tp = sum(1 for p, l in zip(predictions, labels) if p == 0 and l == 0)  # True fake detected
@@ -88,15 +100,24 @@ def compute_metrics(predictions: List[int], labels: List[int]) -> Dict[str, floa
     tn = sum(1 for p, l in zip(predictions, labels) if p == 1 and l == 1)  # True real detected
 
     accuracy = (tp + tn) / len(labels) if labels else 0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    # Fake detection metrics (positive = fake)
+    precision_fake = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall_fake = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1_fake = 2 * precision_fake * recall_fake / (precision_fake + recall_fake) if (precision_fake + recall_fake) > 0 else 0
+    # Real detection metrics (positive = real)
+    precision_real = tn / (tn + fn) if (tn + fn) > 0 else 0
+    recall_real = tn / (tn + fp) if (tn + fp) > 0 else 0
+    f1_real = 2 * precision_real * recall_real / (precision_real + recall_real) if (precision_real + recall_real) > 0 else 0
 
     return {
-        "accuracy": round(accuracy, 2),
-        "precision": round(precision, 2),
-        "recall": round(recall, 2),
-        "f1_score": round(f1, 2),
+        "accuracy": round(accuracy, 3),
+        "precision_fake": round(precision_fake, 3),
+        "recall_fake": round(recall_fake, 3),
+        "f1_fake": round(f1_fake, 3),
+        "precision_real": round(precision_real, 3),
+        "recall_real": round(recall_real, 3),
+        "f1_real": round(f1_real, 3),
+        "f1_macro": round((f1_fake + f1_real) / 2, 3),
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
     }
 
@@ -127,8 +148,9 @@ def evaluate_rag(pipeline) -> Dict:
         elif verdict in ("ПРАВДА", "TRUE") or score >= 70:
             predicted = 1  # real
         else:
-            # НЕ ПОДТВЕРЖДЕНО (30-69): используем score для решения
-            predicted = 1 if score >= 50 else 0
+            # НЕ ПОДТВЕРЖДЕНО (30-69): консервативный подход для fact-checker —
+            # при неопределённости НЕ подтверждаем (предполагаем fake)
+            predicted = 0
 
         predictions.append(predicted)
         labels.append(true_label)
@@ -138,6 +160,24 @@ def evaluate_rag(pipeline) -> Dict:
 
     metrics = compute_metrics(predictions, labels)
     metrics["avg_latency"] = round(sum(latencies) / len(latencies), 2)
+
+    # Per-type breakdown
+    type_results = {}
+    for i, sample in enumerate(TEST_DATASET):
+        ctype = sample.get("type", "general")
+        if ctype not in type_results:
+            type_results[ctype] = {"preds": [], "labels": []}
+        type_results[ctype]["preds"].append(predictions[i])
+        type_results[ctype]["labels"].append(labels[i])
+
+    metrics["per_type"] = {}
+    for ctype, data in type_results.items():
+        type_metrics = compute_metrics(data["preds"], data["labels"])
+        metrics["per_type"][ctype] = {
+            "accuracy": type_metrics["accuracy"],
+            "f1_macro": type_metrics["f1_macro"],
+            "count": len(data["labels"]),
+        }
 
     return metrics
 
@@ -176,12 +216,27 @@ def main():
     print("\n" + "=" * 60)
     print("РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ")
     print("=" * 60)
-    print(f"Accuracy:  {metrics['accuracy']}")
-    print(f"Precision: {metrics['precision']}")
-    print(f"Recall:    {metrics['recall']}")
-    print(f"F1-Score:  {metrics['f1_score']}")
-    print(f"Avg Latency: {metrics['avg_latency']} сек.")
-    print(f"\nConfusion Matrix: TP={metrics['tp']} FP={metrics['fp']} FN={metrics['fn']} TN={metrics['tn']}")
+    print(f"Accuracy:     {metrics['accuracy']}")
+    print(f"F1 (macro):   {metrics['f1_macro']}")
+    print(f"Avg Latency:  {metrics['avg_latency']} сек.")
+    print(f"\n--- Fake detection (positive = fake) ---")
+    print(f"Precision:    {metrics['precision_fake']}")
+    print(f"Recall:       {metrics['recall_fake']}")
+    print(f"F1-Score:     {metrics['f1_fake']}")
+    print(f"\n--- Real detection (positive = real) ---")
+    print(f"Precision:    {metrics['precision_real']}")
+    print(f"Recall:       {metrics['recall_real']}")
+    print(f"F1-Score:     {metrics['f1_real']}")
+    print(f"\nConfusion Matrix:")
+    print(f"              Predicted FAKE  Predicted REAL")
+    print(f"  Actual FAKE    TP={metrics['tp']:3d}          FN={metrics['fn']:3d}")
+    print(f"  Actual REAL    FP={metrics['fp']:3d}          TN={metrics['tn']:3d}")
+
+    # Per-type breakdown
+    if "per_type" in metrics:
+        print(f"\n--- Per-type accuracy ---")
+        for ctype, tm in sorted(metrics["per_type"].items()):
+            print(f"  {ctype:15s}  acc={tm['accuracy']:.3f}  f1={tm['f1_macro']:.3f}  (n={tm['count']})")
     print("=" * 60)
 
     # Сохранение
