@@ -119,11 +119,20 @@ class FactCheckSearcher:
     def format_results(results: List[Dict[str, str]]) -> str:
         """Форматирование результатов в нумерованный текстовый блок для LLM."""
         if not results:
-            return "Новости по данному запросу не найдены."
+            return "Новости по данному запросу не найдены. Ни один источник не подтверждает утверждение."
 
-        lines = []
-        for i, article in enumerate(results, 1):
-            parts = [f"{i}. {article['title']}"]
+        confirming = [r for r in results if r.get("is_confirming")]
+        total = len(results)
+
+        lines = [f"СТАТИСТИКА ПОИСКА: найдено {total} источников, подтверждающих: {len(confirming)}."]
+        if not confirming:
+            lines.append("НИ ОДИН источник не подтверждает данное утверждение.")
+        lines.append("")
+
+        for i, article in enumerate(results[:10], 1):
+            score = article.get("relevance_score", 0)
+            status = "ПОДТВЕРЖДАЕТ" if article.get("is_confirming") else "НЕ ПОДТВЕРЖДАЕТ"
+            parts = [f"{i}. [{status}, релевантность: {score}] {article['title']}"]
             if article.get("source"):
                 parts.append(f"   Источник: {article['source']}")
             if article.get("date"):
