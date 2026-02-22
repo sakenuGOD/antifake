@@ -194,7 +194,9 @@ def train(
             output_dir=training_config.output_dir,
             num_train_epochs=training_config.num_train_epochs,
             per_device_train_batch_size=training_config.per_device_train_batch_size,
+            per_device_eval_batch_size=training_config.per_device_eval_batch_size,
             gradient_accumulation_steps=training_config.gradient_accumulation_steps,
+            eval_accumulation_steps=training_config.eval_accumulation_steps,
             learning_rate=training_config.learning_rate,
             weight_decay=training_config.weight_decay,
             warmup_steps=training_config.warmup_steps,
@@ -232,6 +234,16 @@ def train(
         instruction_part="[INST]",
         response_part="[/INST]",
     )
+
+    # Callback: очистка CUDA-кэша перед eval (предотвращает OOM от фрагментации)
+    from transformers import TrainerCallback
+
+    class ClearCacheCallback(TrainerCallback):
+        def on_evaluate(self, args, state, control, **kwargs):
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    trainer.add_callback(ClearCacheCallback())
 
     # 7. Запуск обучения
     print("\n[7/7] Запуск обучения...")
