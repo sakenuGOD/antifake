@@ -155,8 +155,12 @@ def evaluate_rag(pipeline) -> Dict:
         predictions.append(predicted)
         labels.append(true_label)
 
+        # Трекинг НЕ ПОДТВЕРЖДЕНО отдельно
+        is_unverified = "НЕ ПОДТВЕРЖДЕНО" in verdict or (30 <= score < 70 and verdict not in ("ПРАВДА", "TRUE", "ЛОЖЬ", "FALSE"))
+
         status = "OK" if predicted == true_label else "MISS"
-        print(f"  -> {verdict} (score={score}) | predicted={predicted}, true={true_label} [{status}]")
+        uv_tag = " [UV]" if is_unverified else ""
+        print(f"  -> {verdict} (score={score}) | predicted={predicted}, true={true_label} [{status}]{uv_tag}")
 
     metrics = compute_metrics(predictions, labels)
     metrics["avg_latency"] = round(sum(latencies) / len(latencies), 2)
@@ -196,10 +200,14 @@ def main():
 
     from pipeline import FactCheckPipeline
     from config import SearchConfig
+    from model import find_best_adapter
 
     search_config = SearchConfig(api_key=os.environ["SERPAPI_API_KEY"])
-    adapter_path = "adapters/fact_checker_lora"
-    adapter_path = adapter_path if os.path.exists(adapter_path) else None
+    adapter_path = find_best_adapter()
+    if adapter_path:
+        print(f"Используются адаптеры: {adapter_path}")
+    else:
+        print("Адаптеры не найдены — используется base модель")
 
     print("=" * 60)
     print("Загрузка модели для тестирования...")

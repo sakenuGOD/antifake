@@ -20,7 +20,7 @@ Reward-функции (6 штук):
 
 Использование:
     python train_grpo.py
-    python train_grpo.py --dataset data/train_reasoning.jsonl --steps 500 --generations 4
+    python train_grpo.py --dataset data/train_russian.jsonl --steps 300 --generations 2
 """
 
 import argparse
@@ -555,13 +555,13 @@ def train_grpo(
     """Запуск GRPO обучения для reasoning.
 
     Args:
-        dataset_path: Путь к данным с reasoning (train_reasoning.jsonl)
+        dataset_path: Путь к данным с reasoning (train_russian.jsonl)
         output_dir: Директория для сохранения адаптеров
         max_steps: Количество шагов обучения
         num_generations: Сколько вариантов генерировать на пример (4 для 12GB VRAM)
     """
     if dataset_path is None:
-        dataset_path = os.path.join(PROJECT_ROOT, "data", "train_reasoning.jsonl")
+        dataset_path = os.path.join(PROJECT_ROOT, "data", "train_russian.jsonl")
     if output_dir is None:
         output_dir = os.path.join(PROJECT_ROOT, "adapters", "fact_checker_grpo")
 
@@ -673,7 +673,7 @@ def main():
     )
     parser.add_argument(
         "--dataset", type=str, default=None,
-        help="Путь к данным с reasoning (по умолчанию: data/train_reasoning.jsonl)",
+        help="Путь к данным с reasoning (по умолчанию: data/train_russian.jsonl)",
     )
     parser.add_argument(
         "--output-dir", type=str, default=None,

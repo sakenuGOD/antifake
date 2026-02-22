@@ -162,11 +162,35 @@ def _build_source_aware_reason_fake(title: str, snippet: str, source: str) -> st
     return random.choice(templates)
 
 
+def _build_unverified_reason(title: str, snippet: str, source: str) -> str:
+    """Генерация обоснования НЕ ПОДТВЕРЖДЕНО — источник не о том."""
+    snippet_short = snippet[:120].strip()
+    title_short = title[:80].strip()
+    templates = [
+        (
+            f"Источник ({source}) сообщает: «{snippet_short}». "
+            f"Тема похожа, но утверждение «{title_short}» напрямую не подтверждается и не опровергается. "
+            f"Данных недостаточно для вердикта."
+        ),
+        (
+            f"По данным {source}: «{snippet_short}». "
+            f"Источник тематически связан с утверждением, но конкретные детали не совпадают. "
+            f"Нельзя ни подтвердить, ни опровергнуть."
+        ),
+        (
+            f"Найден источник ({source}): «{snippet_short}». "
+            f"Он описывает похожую тему, но не содержит данных для проверки утверждения «{title_short}». "
+            f"Требуются дополнительные источники."
+        ),
+    ]
+    return random.choice(templates)
+
+
 def make_conversation(title: str, text: str, label: int, source: str = "News Agency") -> dict:
     """
     Конвертация одного примера в формат conversations для обучения.
 
-    label: 0 = real (достоверно), 1 = fake (недостоверно)
+    label: 0 = real (достоверно), 1 = fake (недостоверно), 2 = unverified
 
     Обоснование генерируется на основе КОНКРЕТНОГО текста и заголовка,
     а не из фиксированных шаблонов — это учит модель анализировать источники.
@@ -194,7 +218,7 @@ def make_conversation(title: str, text: str, label: int, source: str = "News Age
             f"ОБОСНОВАНИЕ: {reason}\n"
             f"ИСТОЧНИКИ: {source}"
         )
-    else:
+    elif label == 1:
         reason = _build_source_aware_reason_fake(title, snippet, source)
         verdict = (
             f"ДОСТОВЕРНОСТЬ: {random.randint(2, 25)}\n"
@@ -202,6 +226,15 @@ def make_conversation(title: str, text: str, label: int, source: str = "News Age
             f"УВЕРЕННОСТЬ: {random.randint(80, 99)}\n"
             f"ОБОСНОВАНИЕ: {reason}\n"
             f"ИСТОЧНИКИ: Подтверждающие источники не найдены"
+        )
+    else:  # label == 2: unverified
+        reason = _build_unverified_reason(title, snippet, source)
+        verdict = (
+            f"ДОСТОВЕРНОСТЬ: {random.randint(35, 65)}\n"
+            f"ВЕРДИКТ: НЕ ПОДТВЕРЖДЕНО\n"
+            f"УВЕРЕННОСТЬ: {random.randint(45, 75)}\n"
+            f"ОБОСНОВАНИЕ: {reason}\n"
+            f"ИСТОЧНИКИ: Данных недостаточно"
         )
 
     return {
@@ -305,8 +338,23 @@ def download_and_convert(
 
         print(f"Итого: real={len(real_examples):,}, fake={len(fake_examples):,}")
 
+    # === Генерация НЕ ПОДТВЕРЖДЕНО (20% от total) ===
+    unverified_count = limit // 5
+    unverified_examples = []
+    # Берём real title + НЕсвязанный text → источник "не о том"
+    shuffled_real = list(real_examples)
+    random.shuffle(shuffled_real)
+    for i in range(min(unverified_count, len(shuffled_real))):
+        title_i = shuffled_real[i][0]
+        # Берём текст от другого примера (смещение)
+        other_idx = (i + len(shuffled_real) // 2) % len(shuffled_real)
+        text_i = shuffled_real[other_idx][1]
+        source_i = shuffled_real[i][3]
+        unverified_examples.append((title_i, text_i, 2, source_i))  # label=2 = unverified
+    print(f"НЕ ПОДТВЕРЖДЕНО: {len(unverified_examples):,}")
+
     # Объединяем и перемешиваем
-    examples = real_examples + fake_examples
+    examples = real_examples + fake_examples + unverified_examples
     random.shuffle(examples)
 
     total = len(examples)

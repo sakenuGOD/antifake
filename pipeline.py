@@ -18,9 +18,10 @@ from config import ModelConfig, PipelineConfig, SearchConfig
 from prompts import (
     KEYWORD_EXTRACTION_TEMPLATE,
     CREDIBILITY_ASSESSMENT_TEMPLATE,
+    CREDIBILITY_ASSESSMENT_REASONING_TEMPLATE,
     SELF_CRITIQUE_TEMPLATE,
 )
-from model import load_unsloth_model, load_finetuned_model, build_langchain_llm
+from model import load_unsloth_model, load_finetuned_model, build_langchain_llm, is_grpo_adapter
 from search import FactCheckSearcher
 from claim_parser import classify_claim, format_verification_hints
 
@@ -76,6 +77,7 @@ class FactCheckPipeline:
 
         self.pipeline_config = pipeline_config
         self.searcher = FactCheckSearcher(search_config)
+        self._use_reasoning_template = is_grpo_adapter(adapter_path)
 
         # Thread-local хранилище для промежуточных данных
         # (RunnablePassthrough.assign создаёт новый dict, мутации state не пробрасываются)
@@ -84,7 +86,8 @@ class FactCheckPipeline:
 
         # Загрузка модели один раз
         if adapter_path and os.path.exists(adapter_path):
-            print(f"Загрузка fine-tuned модели из {adapter_path}...")
+            adapter_type = "GRPO" if self._use_reasoning_template else "SFT"
+            print(f"Загрузка {adapter_type} модели из {adapter_path}...")
             model, tokenizer = load_finetuned_model(adapter_path, model_config)
         else:
             print("Загрузка base модели...")
@@ -127,8 +130,14 @@ class FactCheckPipeline:
             template=KEYWORD_EXTRACTION_TEMPLATE,
             input_variables=["claim"],
         )
+        # GRPO модель обучена с <reasoning>/<answer> форматом — используем соответствующий шаблон
+        verdict_template = (
+            CREDIBILITY_ASSESSMENT_REASONING_TEMPLATE
+            if self._use_reasoning_template
+            else CREDIBILITY_ASSESSMENT_TEMPLATE
+        )
         verdict_prompt = PromptTemplate(
-            template=CREDIBILITY_ASSESSMENT_TEMPLATE,
+            template=verdict_template,
             input_variables=["claim", "search_results", "search_hint", "verification_hints"],
         )
 
@@ -289,16 +298,30 @@ class FactCheckPipeline:
 
     @staticmethod
     def parse_verdict(raw_verdict: str) -> Dict[str, Any]:
-        """Парсинг структурированного вердикта из ответа модели."""
+        """Парсинг структурированного вердикта из ответа модели.
+
+        Поддерживает два формата:
+        1. Стандартный: ДОСТОВЕРНОСТЬ: ... ВЕРДИКТ: ... (SFT модель)
+        2. XML: <reasoning>...</reasoning><answer>...</answer> (GRPO модель)
+        """
         result = {
             "credibility_score": 50,
             "verdict": "НЕ ПОДТВЕРЖДЕНО",
             "confidence": 50,
             "reasoning": "",
+            "chain_of_thought": "",
             "sources": "",
             "raw": raw_verdict,
         }
 
+        # Извлечение chain-of-thought из <reasoning> тегов (если есть)
+        cot_match = re.search(
+            r"<reasoning>(.*?)</reasoning>", raw_verdict, re.DOTALL
+        )
+        if cot_match:
+            result["chain_of_thought"] = cot_match.group(1).strip()
+
+        # Парсинг структурированных полей (ищем и в <answer> и в основном тексте)
         patterns = {
             "credibility_score": r"ДОСТОВЕРНОСТЬ:\s*(\d+)",
             "verdict": r"ВЕРДИКТ:\s*(.+?)(?:\n|$)",
@@ -513,6 +536,7 @@ class FactCheckPipeline:
             "verdict": parsed["verdict"],
             "confidence": parsed["confidence"],
             "reasoning": parsed["reasoning"],
+            "chain_of_thought": parsed.get("chain_of_thought", ""),
             "sources": sources,
             "sources_text": parsed["sources"],
             "keywords": keywords,

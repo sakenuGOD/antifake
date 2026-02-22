@@ -66,22 +66,14 @@ st.markdown("""
 def load_pipeline():
     """Загрузка пайплайна один раз при старте приложения."""
     from pipeline import FactCheckPipeline
-    from config import SearchConfig, PROJECT_ROOT
+    from config import SearchConfig
+    from model import find_best_adapter
 
     api_key = os.environ.get("SERPAPI_API_KEY", "")
-
     search_config = SearchConfig(api_key=api_key)
 
-    # Приоритет: GRPO > SFT > base
-    grpo_path = os.path.join(PROJECT_ROOT, "adapters", "fact_checker_grpo")
-    sft_path = os.path.join(PROJECT_ROOT, "adapters", "fact_checker_lora")
-
-    if os.path.exists(grpo_path):
-        adapter_path = grpo_path
-    elif os.path.exists(sft_path):
-        adapter_path = sft_path
-    else:
-        adapter_path = None
+    # Автовыбор: GRPO > SFT > base
+    adapter_path = find_best_adapter()
 
     return FactCheckPipeline(
         adapter_path=adapter_path,
@@ -192,6 +184,12 @@ def main():
             <div>{result['reasoning']}</div>
         </div>
         """, unsafe_allow_html=True)
+
+        # Chain-of-Thought (если GRPO модель)
+        cot = result.get("chain_of_thought", "")
+        if cot:
+            with st.expander("Цепочка рассуждений (Chain-of-Thought)", expanded=False):
+                st.markdown(cot.replace("\n", "  \n"))
 
         # Self-critique (если есть)
         critique_errors = result.get("self_critique_errors", "")
