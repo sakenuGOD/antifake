@@ -87,7 +87,10 @@ def train(
     if resume_from:
         original_lr = training_config.learning_rate
         training_config.learning_rate = min(training_config.learning_rate, 1e-4)
-        print(f"Дообучение: LR снижен {original_lr} → {training_config.learning_rate}")
+        if original_lr != training_config.learning_rate:
+            print(f"Дообучение: LR снижен {original_lr} → {training_config.learning_rate}")
+        else:
+            print(f"Дообучение: LR = {training_config.learning_rate} (уже ниже порога)")
 
     # CUDA-оптимизации
     setup_cuda_optimizations()
@@ -98,7 +101,7 @@ def train(
 
     # 1. Загрузка модели
     if resume_from and os.path.exists(resume_from):
-        print(f"\n[1/6] Загрузка fine-tuned модели из {resume_from} (дообучение)...")
+        print(f"\n[1/7] Загрузка fine-tuned модели из {resume_from} (дообучение)...")
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=resume_from,
             max_seq_length=model_config.max_seq_length,
@@ -106,7 +109,7 @@ def train(
             load_in_4bit=model_config.load_in_4bit,
         )
     else:
-        print("\n[1/6] Загрузка base модели...")
+        print("\n[1/7] Загрузка base модели...")
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_config.base_model_name,
             max_seq_length=model_config.max_seq_length,
@@ -115,14 +118,14 @@ def train(
         )
 
     # 2. Настройка chat template
-    print("[2/6] Настройка chat template...")
+    print("[2/7] Настройка chat template...")
     tokenizer = get_chat_template(tokenizer, chat_template="mistral")
 
     # 3. Добавление LoRA адаптеров (при дообучении адаптеры уже загружены)
     if resume_from and os.path.exists(resume_from):
-        print(f"[3/6] LoRA адаптеры загружены из {resume_from}")
+        print(f"[3/7] LoRA адаптеры загружены из {resume_from}")
     else:
-        print(f"[3/6] Добавление LoRA адаптеров (r={lora_config.r}, alpha={lora_config.lora_alpha})...")
+        print(f"[3/7] Добавление LoRA адаптеров (r={lora_config.r}, alpha={lora_config.lora_alpha})...")
         model = FastLanguageModel.get_peft_model(
             model,
             r=lora_config.r,
@@ -140,7 +143,7 @@ def train(
     print(f"  Обучаемых параметров: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
     # 4. Загрузка данных
-    print(f"\n[4/6] Загрузка данных из {training_config.dataset_path}...")
+    print(f"\n[4/7] Загрузка данных из {training_config.dataset_path}...")
     dataset = load_dataset_from_jsonl(training_config.dataset_path)
 
     def formatting_func(examples):
@@ -208,9 +211,8 @@ def train(
             dataloader_num_workers=training_config.dataloader_num_workers,
             dataloader_pin_memory=training_config.dataloader_pin_memory,
             report_to="none",
-            # Validation
-            eval_strategy="steps",
-            eval_steps=50,
+            # Validation (eval_strategy должна совпадать с save_strategy для load_best_model_at_end)
+            eval_strategy="epoch",
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
@@ -223,7 +225,7 @@ def train(
     )
 
     # 6. train_on_responses_only — маскируем промпт, обучаем ТОЛЬКО на ответах
-    print("[6/7] Применение train_on_responses_only...")
+    print("[6/7] Маскировка промптов (train_on_responses_only)...")
     from unsloth.chat_templates import train_on_responses_only
     trainer = train_on_responses_only(
         trainer,

@@ -42,8 +42,8 @@ def main():
     parser.add_argument(
         "--adapter-path",
         type=str,
-        default="adapters/fact_checker_lora",
-        help="Путь к LoRA адаптерам (по умолчанию: adapters/fact_checker_lora)",
+        default=None,
+        help="Путь к LoRA адаптерам (по умолчанию: автовыбор GRPO > SFT)",
     )
     args = parser.parse_args()
 
@@ -54,13 +54,19 @@ def main():
     # Импортируем здесь, чтобы быстро показать ошибки CLI без загрузки модели
     from pipeline import FactCheckPipeline
     from config import SearchConfig
+    from model import find_best_adapter
 
     api_key = os.environ.get("SERPAPI_API_KEY", "")
     if not api_key:
         print("Внимание: SERPAPI_API_KEY не установлен — используется DuckDuckGo.")
     search_config = SearchConfig(api_key=api_key)
 
-    adapter_path = args.adapter_path if os.path.exists(args.adapter_path) else None
+    # Автовыбор адаптеров: GRPO > SFT > base
+    if args.adapter_path:
+        adapter_path = args.adapter_path if os.path.exists(args.adapter_path) else None
+    else:
+        adapter_path = find_best_adapter()
+
     pipeline = FactCheckPipeline(
         adapter_path=adapter_path,
         search_config=search_config,

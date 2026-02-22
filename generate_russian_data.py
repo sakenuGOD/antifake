@@ -9,7 +9,7 @@
 
 Использование:
     python generate_russian_data.py
-    python generate_russian_data.py --limit 5000 -o data/train_russian.jsonl
+    python generate_russian_data.py --limit 2500 -o data/train_russian.jsonl
 """
 
 import argparse
@@ -936,7 +936,7 @@ def generate_unverified_modified(fact):
     return _make_conversation(modified, snippet, source_name, "НЕ ПОДТВЕРЖДЕНО", score, confidence, reasoning, obosnovanie)
 
 
-def generate_dataset(output_path, limit=5000, seed=42):
+def generate_dataset(output_path, limit=2500, seed=42):
     """Генерация полного русскоязычного датасета."""
     random.seed(seed)
 
