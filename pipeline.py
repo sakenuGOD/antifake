@@ -1,5 +1,6 @@
 """LangChain LCEL цепочка для проверки фактов."""
 
+import logging
 import os
 import re
 import time
@@ -13,6 +14,8 @@ from config import ModelConfig, PipelineConfig, SearchConfig
 from prompts import KEYWORD_EXTRACTION_TEMPLATE, CREDIBILITY_ASSESSMENT_TEMPLATE
 from model import load_unsloth_model, load_finetuned_model, build_langchain_llm
 from search import FactCheckSearcher
+
+logger = logging.getLogger("fact_checker")
 
 # Месяцы и общие слова для программной очистки ключевых слов
 _MONTHS_RU = {
@@ -189,8 +192,9 @@ class FactCheckPipeline:
             if kw_lower in _MONTHS_RU:
                 continue
 
-            # Пропуск чисто числовых или "число + слово" (e.g. "22 год", "33 бойца")
-            if re.match(r'^\d+\s*\S*$', kw_lower):
+            # Пропуск чисто числовых БЕЗ единиц (e.g. "22", "33")
+            # НО оставляем числа с % и единицами — они критичны для фактчекинга
+            if re.match(r'^\d+$', kw_lower):
                 continue
 
             # Пропуск общих слов
@@ -292,6 +296,7 @@ class FactCheckPipeline:
 
     def check(self, claim: str) -> Dict[str, Any]:
         """Проверка одного утверждения. Возвращает структурированный результат."""
+        logger.info(f"Проверка: {claim[:120]}")
         print(f"\nПроверка: {claim}")
 
         # Сброс промежуточного состояния
@@ -300,10 +305,29 @@ class FactCheckPipeline:
 
         state = {"claim": claim}
 
-        # Запускаем полную цепочку
-        total_start = time.time()
-        raw_result = self.chain.invoke(state)
-        total_time = time.time() - total_start
+        try:
+            # Запускаем полную цепочку
+            total_start = time.time()
+            raw_result = self.chain.invoke(state)
+            total_time = time.time() - total_start
+        except Exception as e:
+            logger.error(f"Pipeline error: {e}", exc_info=True)
+            return {
+                "claim": claim,
+                "credibility_score": 50,
+                "verdict": "НЕ ПОДТВЕРЖДЕНО",
+                "confidence": 0,
+                "reasoning": f"Ошибка при анализе: {str(e)}. Попробуйте позже.",
+                "sources": [],
+                "sources_text": "",
+                "keywords": [],
+                "search_results_formatted": "",
+                "raw_verdict": "",
+                "total_time": 0,
+            }
+        finally:
+            # Гарантированная очистка промежуточного состояния
+            pass
 
         # Парсинг вердикта + smart safety net
         parsed = self.parse_verdict(raw_result.get("verdict", ""))
@@ -315,6 +339,9 @@ class FactCheckPipeline:
 
         # Ключевые слова
         keywords = self._parse_keywords(raw_result.get("keywords_raw", ""))
+
+        logger.info(f"Вердикт: {parsed['verdict']} (score={parsed['credibility_score']})")
+        logger.info(f"Источников: {len(sources)}, Ключевые слова: {keywords}")
 
         return {
             "claim": claim,

@@ -1,11 +1,30 @@
-"""Поиск новостей: SerpAPI (основной) → DuckDuckGo (fallback) + ранжирование."""
+"""Поиск новостей: SerpAPI (основной) → DuckDuckGo (fallback) + семантическое ранжирование."""
 
+import time
 from typing import List, Dict
 from config import SearchConfig
+from cache import SearchCache
+from source_credibility import boost_by_credibility
 
-# Пороги для bag-of-words cosine similarity с псевдо-стеммингом.
-RELEVANCE_THRESHOLD = 0.35  # Подтверждающий источник
-RELATED_THRESHOLD = 0.20    # Тематически близкий источник
+
+class RateLimiter:
+    """Ограничение частоты запросов к API."""
+
+    def __init__(self, calls_per_second: float = 0.5):
+        self.interval = 1.0 / calls_per_second
+        self.last_call = 0.0
+
+    def wait(self):
+        now = time.time()
+        elapsed = now - self.last_call
+        if elapsed < self.interval:
+            time.sleep(self.interval - elapsed)
+        self.last_call = time.time()
+
+
+# Пороги для fallback bag-of-words (если sentence-transformers недоступен)
+RELEVANCE_THRESHOLD = 0.35
+RELATED_THRESHOLD = 0.20
 
 
 def _simple_tokenize(text: str) -> Dict[str, int]:
@@ -28,7 +47,10 @@ def _simple_tokenize(text: str) -> Dict[str, int]:
 
 
 def cosine_similarity(text_a: str, text_b: str) -> float:
-    """Косинусное сходство между двумя текстами (bag-of-words + псевдо-стемминг)."""
+    """Косинусное сходство между двумя текстами (bag-of-words + псевдо-стемминг).
+
+    Fallback если sentence-transformers недоступен.
+    """
     vec_a = _simple_tokenize(text_a)
     vec_b = _simple_tokenize(text_b)
 
@@ -48,13 +70,31 @@ def cosine_similarity(text_a: str, text_b: str) -> float:
 
 
 class FactCheckSearcher:
-    """Поиск новостей: SerpAPI (основной) → DuckDuckGo (бесплатный fallback)."""
+    """Поиск новостей: SerpAPI (основной) → DuckDuckGo (бесплатный fallback).
+
+    Улучшения v2:
+    - Семантическое ранжирование (sentence-transformers) вместо bag-of-words
+    - Кэширование результатов (экономия API-квоты)
+    - Rate limiting (защита от блокировки)
+    - Source credibility (надёжность источников)
+    """
 
     def __init__(self, config: SearchConfig = None):
         if config is None:
             config = SearchConfig()
         self.config = config
-        self._serpapi_failed = False  # Если True — все запросы идут через DDG
+        self._serpapi_failed = False
+        self._cache = SearchCache()
+        self._rate_limiter = RateLimiter(calls_per_second=0.5)
+
+        # Попытка загрузить семантический ранкер
+        self._semantic_ranker = None
+        try:
+            from embeddings import get_ranker
+            self._semantic_ranker = get_ranker()
+            print("Семантическое ранжирование: включено (sentence-transformers)")
+        except ImportError:
+            print("Семантическое ранжирование: выключено (pip install sentence-transformers)")
 
     def _search_serpapi(self, keyword: str) -> List[Dict[str, str]]:
         """Поиск через SerpAPI (платный, основной)."""
@@ -104,23 +144,34 @@ class FactCheckSearcher:
         return articles
 
     def search_keyword(self, keyword: str) -> List[Dict[str, str]]:
-        """Поиск новостей с автоматическим fallback: SerpAPI → DuckDuckGo.
+        """Поиск новостей с кэшем, rate limiting и fallback.
 
-        Если SerpAPI падает (ошибка, исчерпан лимит), все последующие
-        запросы в этой сессии автоматически идут через DuckDuckGo.
+        Порядок: кэш → SerpAPI → DuckDuckGo.
         """
-        # 1. SerpAPI (если ключ есть и API не упал)
+        # Кэш
+        cached = self._cache.get(keyword)
+        if cached is not None:
+            return cached
+
+        # Rate limiting
+        self._rate_limiter.wait()
+
+        # SerpAPI (если ключ есть и API не упал)
         if self.config.api_key and not self._serpapi_failed:
             try:
-                return self._search_serpapi(keyword)
+                results = self._search_serpapi(keyword)
+                self._cache.set(keyword, results)
+                return results
             except Exception as e:
                 print(f"  [SerpAPI] Ошибка: {e}")
                 print(f"  [SerpAPI] Переключаюсь на DuckDuckGo для всех запросов")
                 self._serpapi_failed = True
 
-        # 2. DuckDuckGo (fallback)
+        # DuckDuckGo (fallback)
         try:
-            return self._search_ddg(keyword)
+            results = self._search_ddg(keyword)
+            self._cache.set(keyword, results)
+            return results
         except Exception as e:
             print(f"  [DDG] Ошибка при поиске '{keyword}': {e}")
             return []
@@ -164,34 +215,38 @@ class FactCheckSearcher:
 
         return all_results
 
-    @staticmethod
     def rank_by_relevance(
+        self,
         claim: str,
         results: List[Dict[str, str]],
-        threshold: float = RELEVANCE_THRESHOLD,
-        related_threshold: float = RELATED_THRESHOLD,
     ) -> List[Dict[str, str]]:
-        """Ранжирование результатов по косинусному сходству с утверждением."""
-        scored = []
+        """Ранжирование результатов: семантическое (если доступно) или bag-of-words."""
+        if not results:
+            return []
+
+        # Семантическое ранжирование (приоритет)
+        if self._semantic_ranker is not None:
+            results = self._semantic_ranker.rank_results(claim, results, top_k=10)
+            results = boost_by_credibility(results)
+            return results
+
+        # Fallback: bag-of-words cosine similarity
         for article in results:
             text = f"{article.get('title', '')} {article.get('snippet', '')}"
             score = cosine_similarity(claim, text)
             article["relevance_score"] = round(score, 3)
-            article["is_confirming"] = score >= threshold
-            article["is_related"] = score >= related_threshold and score < threshold
-            scored.append(article)
+            article["is_confirming"] = score >= RELEVANCE_THRESHOLD
+            article["is_related"] = RELATED_THRESHOLD <= score < RELEVANCE_THRESHOLD
 
-        scored.sort(key=lambda x: x["relevance_score"], reverse=True)
-        return scored
+        results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+        return results
 
     @staticmethod
     def format_results(results: List[Dict[str, str]]) -> str:
         """Форматирование результатов для LLM — НЕЙТРАЛЬНО, без предрешения.
 
         ВАЖНО: НЕ помечаем источники как "подтверждающие" или "не связанные" —
-        bag-of-words cosine similarity не может отличить "Путин подписал указ
-        о судьях" от "Путин подписал указ о крипте" (совпадают общие слова).
-        Модель сама должна прочитать и определить релевантность.
+        модель сама должна прочитать и определить релевантность.
         """
         if not results:
             return "Новости по данному запросу не найдены."

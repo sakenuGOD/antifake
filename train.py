@@ -67,14 +67,27 @@ def train(
     model_config: ModelConfig = None,
     lora_config: LoraConfig = None,
     training_config: TrainingConfig = None,
+    resume_from: str = None,
 ):
-    """Запуск fine-tuning через Unsloth + QLoRA."""
+    """Запуск fine-tuning через Unsloth + QLoRA.
+
+    Args:
+        resume_from: Путь к существующим LoRA адаптерам для дообучения.
+                     Если указан — загружает адаптеры и продолжает обучение
+                     с пониженным LR (без catastrophic forgetting).
+    """
     if model_config is None:
         model_config = ModelConfig()
     if lora_config is None:
         lora_config = LoraConfig()
     if training_config is None:
         training_config = TrainingConfig()
+
+    # При дообучении — автоматически понижаем LR чтобы не стереть выученное
+    if resume_from:
+        original_lr = training_config.learning_rate
+        training_config.learning_rate = min(training_config.learning_rate, 1e-4)
+        print(f"Дообучение: LR снижен {original_lr} → {training_config.learning_rate}")
 
     # CUDA-оптимизации
     setup_cuda_optimizations()
@@ -83,31 +96,43 @@ def train(
     from unsloth.chat_templates import get_chat_template
     from trl import SFTTrainer, SFTConfig
 
-    # 1. Загрузка модели (4-bit NF4 квантизация)
-    print("\n[1/6] Загрузка модели...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_config.base_model_name,
-        max_seq_length=model_config.max_seq_length,
-        dtype=model_config.dtype,
-        load_in_4bit=model_config.load_in_4bit,
-    )
+    # 1. Загрузка модели
+    if resume_from and os.path.exists(resume_from):
+        print(f"\n[1/6] Загрузка fine-tuned модели из {resume_from} (дообучение)...")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=resume_from,
+            max_seq_length=model_config.max_seq_length,
+            dtype=model_config.dtype,
+            load_in_4bit=model_config.load_in_4bit,
+        )
+    else:
+        print("\n[1/6] Загрузка base модели...")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_config.base_model_name,
+            max_seq_length=model_config.max_seq_length,
+            dtype=model_config.dtype,
+            load_in_4bit=model_config.load_in_4bit,
+        )
 
     # 2. Настройка chat template
     print("[2/6] Настройка chat template...")
     tokenizer = get_chat_template(tokenizer, chat_template="mistral")
 
-    # 3. Добавление LoRA адаптеров
-    print(f"[3/6] Добавление LoRA адаптеров (r={lora_config.r}, alpha={lora_config.lora_alpha})...")
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=lora_config.r,
-        lora_alpha=lora_config.lora_alpha,
-        lora_dropout=lora_config.lora_dropout,
-        target_modules=lora_config.target_modules,
-        bias=lora_config.bias,
-        use_gradient_checkpointing=lora_config.use_gradient_checkpointing,
-        random_state=lora_config.random_state,
-    )
+    # 3. Добавление LoRA адаптеров (при дообучении адаптеры уже загружены)
+    if resume_from and os.path.exists(resume_from):
+        print(f"[3/6] LoRA адаптеры загружены из {resume_from}")
+    else:
+        print(f"[3/6] Добавление LoRA адаптеров (r={lora_config.r}, alpha={lora_config.lora_alpha})...")
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=lora_config.r,
+            lora_alpha=lora_config.lora_alpha,
+            lora_dropout=lora_config.lora_dropout,
+            target_modules=lora_config.target_modules,
+            bias=lora_config.bias,
+            use_gradient_checkpointing=lora_config.use_gradient_checkpointing,
+            random_state=lora_config.random_state,
+        )
 
     # Вывод количества обучаемых параметров
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -224,7 +249,11 @@ def main():
     )
     parser.add_argument(
         "--batch-size", type=int, default=None,
-        help="Batch size per device (по умолчанию: 8)",
+        help="Batch size per device (по умолчанию: 2)",
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Путь к существующим адаптерам для дообучения (например: adapters/fact_checker_lora)",
     )
     args = parser.parse_args()
 
@@ -246,7 +275,7 @@ def main():
         print("Сначала скачайте датасет: python download_dataset.py")
         return
 
-    train(training_config=training_config)
+    train(training_config=training_config, resume_from=args.resume)
 
 
 if __name__ == "__main__":
