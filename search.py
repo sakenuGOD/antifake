@@ -5,8 +5,12 @@ from serpapi import GoogleSearch
 
 from config import SearchConfig
 
-# Порог релевантности (Раздел 2.4 документации: Threshold >= 0.85)
-RELEVANCE_THRESHOLD = 0.85
+# Порог релевантности для bag-of-words cosine similarity.
+# Для точного (embedding-based) сходства порог 0.85 корректен (Раздел 2.4),
+# но bag-of-words без лемматизации даёт низкие скоры из-за морфологии русского языка
+# (например, "снежного" != "снежный"), поэтому пороги снижены.
+RELEVANCE_THRESHOLD = 0.35  # Подтверждающий источник
+RELATED_THRESHOLD = 0.20    # Тематически близкий источник
 
 
 def _simple_tokenize(text: str) -> Dict[str, int]:
@@ -97,10 +101,12 @@ class FactCheckSearcher:
         claim: str,
         results: List[Dict[str, str]],
         threshold: float = RELEVANCE_THRESHOLD,
+        related_threshold: float = RELATED_THRESHOLD,
     ) -> List[Dict[str, str]]:
         """Ранжирование результатов по косинусному сходству с утверждением.
 
         Источники с similarity >= threshold считаются подтверждающими.
+        Источники с similarity >= related_threshold считаются тематически близкими.
         Результаты сортируются по убыванию релевантности.
         """
         scored = []
@@ -109,6 +115,7 @@ class FactCheckSearcher:
             score = cosine_similarity(claim, text)
             article["relevance_score"] = round(score, 3)
             article["is_confirming"] = score >= threshold
+            article["is_related"] = score >= related_threshold and score < threshold
             scored.append(article)
 
         # Сортировка по релевантности (убывание)
@@ -119,19 +126,27 @@ class FactCheckSearcher:
     def format_results(results: List[Dict[str, str]]) -> str:
         """Форматирование результатов в нумерованный текстовый блок для LLM."""
         if not results:
-            return "Новости по данному запросу не найдены. Ни один источник не подтверждает утверждение."
+            return "Новости по данному запросу не найдены."
 
         confirming = [r for r in results if r.get("is_confirming")]
+        related = [r for r in results if r.get("is_related")]
         total = len(results)
 
-        lines = [f"СТАТИСТИКА ПОИСКА: найдено {total} источников, подтверждающих: {len(confirming)}."]
-        if not confirming:
-            lines.append("НИ ОДИН источник не подтверждает данное утверждение.")
+        lines = [
+            f"СТАТИСТИКА: найдено {total} источников, "
+            f"подтверждающих: {len(confirming)}, "
+            f"тематически близких: {len(related)}."
+        ]
         lines.append("")
 
         for i, article in enumerate(results[:10], 1):
             score = article.get("relevance_score", 0)
-            status = "ПОДТВЕРЖДАЕТ" if article.get("is_confirming") else "НЕ ПОДТВЕРЖДАЕТ"
+            if article.get("is_confirming"):
+                status = "ПОДТВЕРЖДАЕТ"
+            elif article.get("is_related"):
+                status = "БЛИЗКАЯ ТЕМА"
+            else:
+                status = "НЕ СВЯЗАН"
             parts = [f"{i}. [{status}, релевантность: {score}] {article['title']}"]
             if article.get("source"):
                 parts.append(f"   Источник: {article['source']}")

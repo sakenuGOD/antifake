@@ -66,6 +66,6 @@ class SearchConfig:
 @dataclass
 class PipelineConfig:
     keyword_max_new_tokens: int = 128
-    verdict_max_new_tokens: int = 1024
+    verdict_max_new_tokens: int = 1500  # увеличено для Chain-of-Thought рассуждений
     temperature: float = 0.1
     repetition_penalty: float = 1.15

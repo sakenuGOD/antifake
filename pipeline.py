@@ -68,7 +68,7 @@ class FactCheckPipeline:
         )
         verdict_prompt = PromptTemplate(
             template=CREDIBILITY_ASSESSMENT_TEMPLATE,
-            input_variables=["claim", "search_results"],
+            input_variables=["claim", "search_results", "search_hint"],
         )
 
         # Шаг 1: Извлечение ключевых слов
@@ -84,7 +84,33 @@ class FactCheckPipeline:
             claim = state.get("claim", "")
             results = self.searcher.rank_by_relevance(claim, results)
             confirming = [r for r in results if r.get("is_confirming")]
-            print(f"  Подтверждающих (similarity >= 0.85): {len(confirming)}")
+            related = [r for r in results if r.get("is_related")]
+            print(f"  Подтверждающих: {len(confirming)}, близких: {len(related)}")
+
+            # Генерация подсказки для LLM на основе статистики поиска
+            total = len(results)
+            if not results:
+                hint = "ПОДСКАЗКА: По данному запросу не найдено новостей. Невозможно подтвердить или опровергнуть."
+            elif confirming:
+                hint = (
+                    f"ПОДСКАЗКА: {len(confirming)} из {total} источников "
+                    f"подтверждают утверждение. Проанализируй их содержание."
+                )
+            elif related:
+                hint = (
+                    f"ПОДСКАЗКА: Прямых подтверждений нет, но {len(related)} из "
+                    f"{total} источников обсуждают близкую тему. "
+                    f"Внимательно прочитай их — возможно, они подтверждают "
+                    f"утверждение другими словами."
+                )
+            else:
+                hint = (
+                    f"ПОДСКАЗКА: Найдено {total} источников, но ни один "
+                    f"не имеет высокого тематического сходства. Это может "
+                    f"означать, что новость слишком свежая или тема не освещена."
+                )
+            state["search_hint"] = hint
+
             # Сохраняем сырые результаты поиска в состояние
             state["_raw_search_results"] = results
             return self.searcher.format_results(results)
