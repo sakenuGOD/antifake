@@ -4,3 +4,4 @@ __pycache__/
 .DS_Store
 adapters/
 *.egg-info/
+lyrics_mixer/

@@ -50,37 +50,34 @@ echo Используется: %PYTHON_CMD%
 %PYTHON_CMD% --version
 echo.
 
-:: Удаляем старый venv если был создан с неправильным Python
-if exist "venv" (
-    echo Удаление старого venv...
-    rmdir /s /q venv
+:: Используем существующий venv или создаём новый
+if exist "venv\Scripts\activate.bat" (
+    echo [1/5] venv уже существует, пропускаю создание...
+    call venv\Scripts\activate.bat
+) else (
+    echo [1/5] Создание виртуального окружения...
+    %PYTHON_CMD% -m venv venv
+    call venv\Scripts\activate.bat
+
+    :: Установка PyTorch с CUDA 12.8 (Blackwell sm_120)
+    echo [2/5] Установка PyTorch с CUDA 12.8 (для RTX 5070^)...
+    pip install --upgrade pip
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+    :: Установка Unsloth и зависимостей
+    echo [3/5] Установка Unsloth (QLoRA + Flash Attention^)...
+    pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+    pip install --no-deps trl peft accelerate bitsandbytes
+
+    echo [4/5] Установка остальных зависимостей...
+    pip install transformers datasets sentencepiece protobuf xformers
 )
-
-:: Создание venv
-echo [1/5] Создание виртуального окружения...
-%PYTHON_CMD% -m venv venv
-
-:: Активация venv
-call venv\Scripts\activate.bat
-
-:: Установка PyTorch с CUDA 12.8 (Blackwell sm_120)
-echo [2/5] Установка PyTorch с CUDA 12.8 (для RTX 5070)...
-pip install --upgrade pip
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 :: Проверка CUDA
 echo.
 echo === Проверка GPU ===
-python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'); print('BF16:', torch.cuda.is_bf16_supported() if torch.cuda.is_available() else 'N/A'); print('VRAM:', round(torch.cuda.get_device_properties(0).total_mem/1024**3, 1), 'GB') if torch.cuda.is_available() else None"
+python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'); print('BF16:', torch.cuda.is_bf16_supported() if torch.cuda.is_available() else 'N/A'); print('VRAM:', round(torch.cuda.get_device_properties(0).total_memory/1024**3, 1), 'GB') if torch.cuda.is_available() else None"
 echo.
-
-:: Установка Unsloth и зависимостей
-echo [3/5] Установка Unsloth (QLoRA + Flash Attention)...
-pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-pip install --no-deps trl peft accelerate bitsandbytes
-
-echo [4/5] Установка остальных зависимостей...
-pip install transformers datasets sentencepiece protobuf xformers
 
 :: Скачивание датасета если не скачан
 if not exist "data\train.jsonl" (

@@ -115,8 +115,18 @@ def train(
         convos = examples["conversations"]
         texts = []
         for convo in convos:
+            # Конвертация ShareGPT (from/value) -> HuggingFace (role/content)
+            messages = []
+            for msg in convo:
+                role = msg.get("role") or msg.get("from", "")
+                content = msg.get("content") or msg.get("value", "")
+                if role in ("human", "user"):
+                    role = "user"
+                elif role in ("gpt", "assistant"):
+                    role = "assistant"
+                messages.append({"role": role, "content": content})
             text = tokenizer.apply_chat_template(
-                convo, tokenize=False, add_generation_prompt=False
+                messages, tokenize=False, add_generation_prompt=False
             )
             texts.append(text)
         return {"text": texts}
