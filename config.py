@@ -69,5 +69,7 @@ class SearchConfig:
 class PipelineConfig:
     keyword_max_new_tokens: int = 128
     verdict_max_new_tokens: int = 1500  # увеличено для Chain-of-Thought рассуждений
+    critique_max_new_tokens: int = 512  # для post-verdict self-critique
     temperature: float = 0.1
     repetition_penalty: float = 1.15
+    enable_self_critique: bool = True   # вторичный анализ для перепроверки
