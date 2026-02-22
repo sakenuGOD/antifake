@@ -92,20 +92,42 @@ class FactCheckSearcher:
             print(f"  [SerpAPI] Ошибка при поиске '{keyword}': {e}")
             return []
 
-    def search_all_keywords(self, keywords: List[str]) -> List[Dict[str, str]]:
-        """Поиск по всем ключевым словам с дедупликацией по URL."""
+    def search_all_keywords(
+        self, keywords: List[str], claim: str = ""
+    ) -> List[Dict[str, str]]:
+        """Поиск по всем ключевым словам + комбинированный запрос + прямой поиск утверждения.
+
+        Стратегия поиска (три уровня для максимального recall):
+        1. Комбинированный запрос: все ключевые слова вместе ("Львов теракт женщина")
+        2. Прямой поиск: первые 120 символов утверждения целиком
+        3. Поиск по отдельным ключевым словам (как раньше)
+        """
         seen_urls = set()
         all_results = []
 
-        for keyword in keywords:
-            if not keyword.strip():
-                continue
-            articles = self.search_keyword(keyword)
+        def _add_articles(articles: List[Dict[str, str]]):
             for article in articles:
                 url = article["link"]
                 if url and url not in seen_urls:
                     seen_urls.add(url)
                     all_results.append(article)
+
+        # 1. Комбинированный запрос (все ключевые слова вместе — лучший recall)
+        combined_query = " ".join(kw.strip() for kw in keywords if kw.strip())
+        if combined_query:
+            _add_articles(self.search_keyword(combined_query))
+
+        # 2. Прямой поиск утверждения (первые 120 символов)
+        if claim.strip():
+            direct_query = claim.strip()[:120]
+            if direct_query != combined_query:
+                _add_articles(self.search_keyword(direct_query))
+
+        # 3. Поиск по отдельным ключевым словам
+        for keyword in keywords:
+            if not keyword.strip():
+                continue
+            _add_articles(self.search_keyword(keyword))
 
         return all_results
 

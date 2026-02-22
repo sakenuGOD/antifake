@@ -88,12 +88,12 @@ class FactCheckPipeline:
         # Шаг 2: Поиск новостей — сохраняет hint и raw_results на self
         def search_step(state: dict) -> str:
             keywords = self._parse_keywords(state["keywords_raw"])
+            claim = state.get("claim", "")
             print(f"  Ключевые слова: {keywords}")
-            results = self.searcher.search_all_keywords(keywords)
+            results = self.searcher.search_all_keywords(keywords, claim=claim)
             print(f"  Найдено новостей: {len(results)}")
 
             # Ранжирование по косинусному сходству (Раздел 2.4)
-            claim = state.get("claim", "")
             results = self.searcher.rank_by_relevance(claim, results)
             confirming = [r for r in results if r.get("is_confirming")]
             related = [r for r in results if r.get("is_related")]
@@ -221,6 +221,54 @@ class FactCheckPipeline:
             })
         return sources
 
+    @staticmethod
+    def _apply_safety_net(
+        parsed: Dict[str, Any],
+        raw_results: List[Dict],
+    ) -> Dict[str, Any]:
+        """Программный safety net: предотвращает ложный вердикт ЛОЖЬ.
+
+        Правила:
+        1. Если есть подтверждающие источники, но модель сказала ЛОЖЬ → ЧАСТИЧНО (50)
+        2. Если есть тематически близкие источники, но модель сказала ЛОЖЬ → ЧАСТИЧНО (45)
+        3. Если источников нет вообще (поиск не нашёл ничего), ЛОЖЬ → ЧАСТИЧНО (40)
+        4. Модель может сказать ЛОЖЬ только если score < 30 И нет подтверждающих/близких
+           источников (т.е. источники АКТИВНО опровергают)
+        """
+        confirming = [r for r in raw_results if r.get("is_confirming")]
+        related = [r for r in raw_results if r.get("is_related")]
+        score = parsed["credibility_score"]
+        verdict = parsed["verdict"].upper().strip()
+
+        # Если модель выдала ЛОЖЬ (score < 30), проверяем обоснованность
+        if score < 30 or verdict == "ЛОЖЬ":
+            if confirming:
+                # Есть подтверждающие источники — модель ошиблась
+                parsed["credibility_score"] = max(score, 55)
+                parsed["verdict"] = "ЧАСТИЧНО"
+                parsed["reasoning"] += (
+                    " [КОРРЕКЦИЯ: обнаружены подтверждающие источники, "
+                    "вердикт скорректирован на ЧАСТИЧНО]"
+                )
+            elif related:
+                # Есть тематически близкие — не можем утверждать ЛОЖЬ
+                parsed["credibility_score"] = max(score, 45)
+                parsed["verdict"] = "ЧАСТИЧНО"
+                parsed["reasoning"] += (
+                    " [КОРРЕКЦИЯ: найдены тематически близкие источники, "
+                    "отсутствие прямого подтверждения не равно опровержению]"
+                )
+            elif not raw_results:
+                # Поиск ничего не нашёл — невозможно судить
+                parsed["credibility_score"] = max(score, 40)
+                parsed["verdict"] = "ЧАСТИЧНО"
+                parsed["reasoning"] += (
+                    " [КОРРЕКЦИЯ: поиск не дал результатов, "
+                    "невозможно подтвердить или опровергнуть]"
+                )
+
+        return parsed
+
     def check(self, claim: str) -> Dict[str, Any]:
         """Проверка одного утверждения. Возвращает структурированный результат."""
         print(f"\nПроверка: {claim}")
@@ -236,8 +284,9 @@ class FactCheckPipeline:
         raw_result = self.chain.invoke(state)
         total_time = time.time() - total_start
 
-        # Парсинг вердикта
+        # Парсинг вердикта + safety net
         parsed = self.parse_verdict(raw_result.get("verdict", ""))
+        parsed = self._apply_safety_net(parsed, self._last_raw_results)
 
         # Извлечение источников из self (не из chain output)
         raw_search = self._last_raw_results
