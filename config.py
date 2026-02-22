@@ -25,7 +25,7 @@ class ModelConfig:
 class LoraConfig:
     r: int = 16              # 16 для 12GB VRAM
     lora_alpha: int = 32     # alpha = 2*r
-    lora_dropout: float = 0.05  # регуляризация для малого датасета (<50K)
+    lora_dropout: float = 0.08  # усиленная регуляризация для малого датасета (~2500)
     target_modules: List[str] = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
@@ -38,13 +38,13 @@ class LoraConfig:
 @dataclass
 class TrainingConfig:
     output_dir: str = "adapters"
-    num_train_epochs: int = 3             # 3 эпохи с train_on_responses_only
+    num_train_epochs: int = 4             # 4 эпохи для малого датасета (~2500)
     per_device_train_batch_size: int = 2   # 2 — safe для 12GB
     gradient_accumulation_steps: int = 4   # эффективный batch = 8
-    learning_rate: float = 1e-4           # менее агрессивный LR для дообучения
+    learning_rate: float = 5e-5           # низкий LR для точного дообучения
     weight_decay: float = 0.01
-    warmup_steps: int = 50                # плавный старт для стабильности
-    lr_scheduler_type: str = "cosine"     # cosine для лучшей сходимости на 3 эпохах
+    warmup_steps: int = 30                # короткий warmup для малого датасета
+    lr_scheduler_type: str = "cosine"     # cosine для лучшей сходимости
     optim: str = "adamw_8bit"
     fp16: bool = False
     bf16: bool = True                     # нативная поддержка bf16 на Blackwell

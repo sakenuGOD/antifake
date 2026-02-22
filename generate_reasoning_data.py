@@ -6,7 +6,7 @@
 - Post-verdict self-critique (модель перепроверяет себя)
 - Глубокими ссылками на конкретные источники
 
-Для масштабной генерации можно заменить rule-based на Claude/GPT-4 API (distillation).
+Для масштабной генерации можно заменить rule-based на LLM API (distillation).
 
 Использование:
     python generate_reasoning_data.py
