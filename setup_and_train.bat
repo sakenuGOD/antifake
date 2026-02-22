@@ -70,8 +70,11 @@ if exist "venv\Scripts\activate.bat" (
     pip install --no-deps trl peft accelerate bitsandbytes
 
     echo [4/5] Установка остальных зависимостей...
-    pip install transformers datasets sentencepiece protobuf xformers
+    pip install transformers datasets sentencepiece protobuf
 )
+
+:: Удаляем xformers если установлен (не поддерживает Blackwell sm_120)
+pip uninstall xformers -y >nul 2>&1
 
 :: Проверка CUDA
 echo.
