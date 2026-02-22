@@ -88,16 +88,18 @@ echo === Проверка GPU ===
 python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'); print('BF16:', torch.cuda.is_bf16_supported() if torch.cuda.is_available() else 'N/A'); print('VRAM:', round(torch.cuda.get_device_properties(0).total_memory/1024**3, 1), 'GB') if torch.cuda.is_available() else None"
 echo.
 
-:: Скачивание датасета если не скачан
-if not exist "data\train.jsonl" (
-    echo.
-    echo [DATASET] Датасет не найден, скачиваю 10к примеров...
-    python download_dataset.py --limit 10000
+:: Перегенерация датасета (новые шаблоны ответов)
+if exist "data\train.jsonl" (
+    echo [DATASET] Удаление старого датасета (обновлены шаблоны^)...
+    del "data\train.jsonl"
 )
+echo.
+echo [DATASET] Генерация датасета 10к примеров (20 шаблонов на класс^)...
+python download_dataset.py --limit 10000
 
 :: Запуск тренировки
 echo.
-echo [5/5] Запуск тренировки (bf16, batch=2x4, seq=512, LoRA r=16)...
+echo [5/5] Запуск тренировки (bf16, packing, batch=2x4, seq=1024, LoRA r=16)...
 echo ============================================
 python train.py --dataset data/train.jsonl
 

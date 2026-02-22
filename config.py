@@ -38,12 +38,12 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 4   # эффективный batch = 8
     learning_rate: float = 2e-4
     weight_decay: float = 0.01
-    warmup_ratio: float = 0.03            # 3% от шагов (лучше для больших датасетов)
-    lr_scheduler_type: str = "cosine"     # cosine лучше linear для длинных тренировок
+    warmup_steps: int = 10                # 10 шагов разогрева (Unsloth рекомендация)
+    lr_scheduler_type: str = "linear"     # linear для коротких тренировок (1 эпоха)
     optim: str = "adamw_8bit"
     fp16: bool = False
     bf16: bool = True                     # нативная поддержка bf16 на Blackwell
-    logging_steps: int = 25
+    logging_steps: int = 10               # чаще логировать для мониторинга
     save_strategy: str = "epoch"            # сохранять только в конце
     save_steps: int = 5000
     save_total_limit: int = 1

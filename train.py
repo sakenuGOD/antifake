@@ -80,12 +80,12 @@ def train(
     setup_cuda_optimizations()
 
     from unsloth import FastLanguageModel
-    from unsloth.chat_templates import get_chat_template, train_on_responses_only
+    from unsloth.chat_templates import get_chat_template
     from trl import SFTTrainer
     from transformers import TrainingArguments
 
     # 1. Загрузка модели (4-bit NF4 квантизация)
-    print("\n[1/7] Загрузка модели...")
+    print("\n[1/6] Загрузка модели...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_config.base_model_name,
         max_seq_length=model_config.max_seq_length,
@@ -94,11 +94,11 @@ def train(
     )
 
     # 2. Настройка chat template
-    print("[2/7] Настройка chat template...")
+    print("[2/6] Настройка chat template...")
     tokenizer = get_chat_template(tokenizer, chat_template="mistral")
 
-    # 3. Добавление LoRA адаптеров (r=32, alpha=64)
-    print(f"[3/7] Добавление LoRA адаптеров (r={lora_config.r}, alpha={lora_config.lora_alpha})...")
+    # 3. Добавление LoRA адаптеров
+    print(f"[3/6] Добавление LoRA адаптеров (r={lora_config.r}, alpha={lora_config.lora_alpha})...")
     model = FastLanguageModel.get_peft_model(
         model,
         r=lora_config.r,
@@ -116,7 +116,7 @@ def train(
     print(f"  Обучаемых параметров: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
     # 4. Загрузка данных
-    print(f"\n[4/7] Загрузка данных из {training_config.dataset_path}...")
+    print(f"\n[4/6] Загрузка данных из {training_config.dataset_path}...")
     dataset = load_dataset_from_jsonl(training_config.dataset_path)
 
     def formatting_func(examples):
@@ -142,7 +142,8 @@ def train(
     dataset = dataset.map(formatting_func, batched=True, num_proc=1)
 
     # 5. Настройка тренера
-    print(f"\n[5/7] Настройка тренера...")
+    print(f"\n[5/6] Настройка тренера...")
+    print(f"  Packing: True (упаковка коротких примеров)")
     print(f"  Batch size: {training_config.per_device_train_batch_size}")
     print(f"  Gradient accumulation: {training_config.gradient_accumulation_steps}")
     print(f"  Effective batch: {training_config.per_device_train_batch_size * training_config.gradient_accumulation_steps}")
@@ -158,7 +159,7 @@ def train(
         dataset_text_field="text",
         max_seq_length=model_config.max_seq_length,
         dataset_num_proc=1,
-        packing=False,
+        packing=True,
         args=TrainingArguments(
             output_dir=training_config.output_dir,
             num_train_epochs=training_config.num_train_epochs,
@@ -166,7 +167,7 @@ def train(
             gradient_accumulation_steps=training_config.gradient_accumulation_steps,
             learning_rate=training_config.learning_rate,
             weight_decay=training_config.weight_decay,
-            warmup_ratio=training_config.warmup_ratio,
+            warmup_steps=training_config.warmup_steps,
             lr_scheduler_type=training_config.lr_scheduler_type,
             optim=training_config.optim,
             fp16=training_config.fp16,
@@ -183,16 +184,8 @@ def train(
         ),
     )
 
-    # 6. Loss только на ответах модели
-    print("[6/7] Настройка train_on_responses_only...")
-    trainer = train_on_responses_only(
-        trainer,
-        instruction_part="[INST]",
-        response_part="[/INST]",
-    )
-
-    # 7. Запуск обучения
-    print("\n[7/7] Запуск обучения...")
+    # 6. Запуск обучения
+    print("\n[6/6] Запуск обучения...")
     print("=" * 60)
     stats = trainer.train()
     print("=" * 60)
@@ -201,7 +194,7 @@ def train(
     print(f"  Время: {stats.metrics.get('train_runtime', 0):.0f} сек.")
     print(f"  Samples/sec: {stats.metrics.get('train_samples_per_second', 0):.1f}")
 
-    # 8. Сохранение адаптеров
+    # 7. Сохранение адаптеров
     save_path = os.path.join(training_config.output_dir, "fact_checker_lora")
     print(f"\nСохранение LoRA адаптеров в {save_path}...")
     model.save_pretrained(save_path)

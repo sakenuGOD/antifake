@@ -60,9 +60,8 @@ def build_langchain_llm(
         model=model,
         tokenizer=tokenizer,
         max_new_tokens=max_new_tokens,
-        temperature=pipeline_config.temperature,
         repetition_penalty=pipeline_config.repetition_penalty,
-        do_sample=True,
+        do_sample=False,
         return_full_text=False,
     )
     return HuggingFacePipeline(pipeline=pipe)
