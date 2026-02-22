@@ -18,8 +18,8 @@ class ModelConfig:
 
 @dataclass
 class LoraConfig:
-    r: int = 32              # увеличен с 16 — 12GB VRAM позволяет
-    lora_alpha: int = 64     # alpha = 2*r для стабильности
+    r: int = 16              # 16 для 12GB VRAM
+    lora_alpha: int = 32     # alpha = 2*r
     lora_dropout: float = 0
     target_modules: List[str] = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj",
@@ -34,8 +34,8 @@ class LoraConfig:
 class TrainingConfig:
     output_dir: str = "adapters"
     num_train_epochs: int = 1             # 1 эпоха — лосс сходится за 4% первой
-    per_device_train_batch_size: int = 8   # 8 влезает при seq=512
-    gradient_accumulation_steps: int = 2   # эффективный batch = 8*2 = 16
+    per_device_train_batch_size: int = 2   # 2 — safe для 12GB с Mistral 7B
+    gradient_accumulation_steps: int = 8   # эффективный batch = 2*8 = 16
     learning_rate: float = 2e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.03            # 3% от шагов (лучше для больших датасетов)
