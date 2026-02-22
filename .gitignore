@@ -5,3 +5,6 @@ __pycache__/
 adapters/
 *.egg-info/
 lyrics_mixer/
+.cache/
+*.log
+.env

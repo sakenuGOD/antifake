@@ -7,11 +7,13 @@ from dataclasses import dataclass, field
 from typing import List
 import os
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 
 @dataclass
 class ModelConfig:
     base_model_name: str = "unsloth/mistral-7b-instruct-v0.3-bnb-4bit"
-    max_seq_length: int = 1024           # запас для длинных примеров (batch=2 влезает)
+    max_seq_length: int = 2048           # 2048 для длинных источников + reasoning
     dtype: str = None  # auto-detect (bf16 на Blackwell)
     load_in_4bit: bool = True
 
@@ -48,7 +50,7 @@ class TrainingConfig:
     save_steps: int = 5000
     save_total_limit: int = 1
     seed: int = 3407
-    dataset_path: str = "data/train.jsonl"
+    dataset_path: str = os.path.join(PROJECT_ROOT, "data", "train.jsonl")
     dataloader_num_workers: int = 0       # 0 для Windows (multiprocessing incompatible with Unsloth)
     dataloader_pin_memory: bool = True    # pin memory для быстрой передачи в GPU
     tf32: bool = True                     # TF32 для матричных операций

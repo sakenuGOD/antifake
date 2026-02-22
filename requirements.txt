@@ -13,3 +13,5 @@ datasets>=2.16.0
 sentencepiece>=0.1.99
 protobuf>=4.25.0
 streamlit>=1.30.0
+sentence-transformers>=2.3.0
+duckduckgo-search>=4.0
