@@ -50,15 +50,17 @@ def load_finetuned_model(adapter_path: str, config: ModelConfig = None):
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    # Загрузка base-модели через plain transformers (без Unsloth/Triton)
+    # Загрузка ОРИГИНАЛЬНОЙ модели через plain transformers (без Unsloth/Triton)
+    # ВАЖНО: используем inference_model_name, НЕ base_model_name (Unsloth 4-bit)
+    # Двойная квантизация уже квантованной модели → деградация весов
     model = AutoModelForCausalLM.from_pretrained(
-        config.base_model_name,
+        config.inference_model_name,
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
-    tokenizer = AutoTokenizer.from_pretrained(config.base_model_name)
+    tokenizer = AutoTokenizer.from_pretrained(config.inference_model_name)
 
     # Загрузка и слияние LoRA адаптеров
     from peft import PeftModel

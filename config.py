@@ -13,6 +13,9 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 @dataclass
 class ModelConfig:
     base_model_name: str = "unsloth/mistral-7b-instruct-v0.3-bnb-4bit"
+    # Оригинальная модель для inference через plain transformers (без Unsloth)
+    # Unsloth-версия уже 4-bit — нельзя квантовать повторно через BitsAndBytes
+    inference_model_name: str = "mistralai/Mistral-7B-Instruct-v0.3"
     max_seq_length: int = 2048           # 2048 для длинных источников + reasoning
     dtype: str = None  # auto-detect (bf16 на Blackwell)
     load_in_4bit: bool = True
@@ -22,7 +25,7 @@ class ModelConfig:
 class LoraConfig:
     r: int = 16              # 16 для 12GB VRAM
     lora_alpha: int = 32     # alpha = 2*r
-    lora_dropout: float = 0
+    lora_dropout: float = 0.05  # регуляризация для малого датасета (<50K)
     target_modules: List[str] = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
@@ -35,13 +38,13 @@ class LoraConfig:
 @dataclass
 class TrainingConfig:
     output_dir: str = "adapters"
-    num_train_epochs: int = 1             # 1 эпоха — лосс сходится быстро
+    num_train_epochs: int = 3             # 3 эпохи с train_on_responses_only
     per_device_train_batch_size: int = 2   # 2 — safe для 12GB
     gradient_accumulation_steps: int = 4   # эффективный batch = 8
-    learning_rate: float = 2e-4
+    learning_rate: float = 1e-4           # менее агрессивный LR для дообучения
     weight_decay: float = 0.01
-    warmup_steps: int = 10                # 10 шагов разогрева (Unsloth рекомендация)
-    lr_scheduler_type: str = "linear"     # linear для коротких тренировок (1 эпоха)
+    warmup_steps: int = 50                # плавный старт для стабильности
+    lr_scheduler_type: str = "cosine"     # cosine для лучшей сходимости на 3 эпохах
     optim: str = "adamw_8bit"
     fp16: bool = False
     bf16: bool = True                     # нативная поддержка bf16 на Blackwell
