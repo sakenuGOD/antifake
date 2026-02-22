@@ -8,6 +8,13 @@ GRPO (Group Relative Policy Optimization) — обучение модели ра
   1. SFT на reasoning данных (train.py --resume)
   2. GRPO поверх SFT (этот скрипт)
 
+Reward-функции (5 штук):
+  1. format_reward — правильный XML формат
+  2. reasoning_quality_reward — глубина и качество рассуждений
+  3. verdict_consistency_reward — согласованность вердикта и score
+  4. correctness_reward — правильный вердикт (если известен ground truth)
+  5. devils_advocate_reward — наличие "адвоката дьявола" в рассуждениях
+
 Требования: ~12GB VRAM (RTX 5070), Unsloth + TRL >= 0.7.4.
 
 Использование:
@@ -34,7 +41,11 @@ SYSTEM_PROMPT = """\
 Шаг 1: Для каждого источника — описывает ли он ТО ЖЕ событие?
 Шаг 2: Из релевантных источников выпиши конкретные цитаты.
 Шаг 3: Числовая проверка — совпадают ли цифры?
-Шаг 4: Тройная самопроверка.
+Шаг 4: Тройная самопроверка + адвокат дьявола:
+  А) Источник про ТО ЖЕ событие или только тему?
+  Б) "Не найдено" ≠ "опровергнуто"?
+  В) Аргументы ПРОТИВ моего вердикта?
+  Г) Мой вердикт логичен?
 </reasoning>
 <answer>
 ДОСТОВЕРНОСТЬ: [0-100]
@@ -82,7 +93,7 @@ def format_reward(completions: list, **kwargs) -> list:
 def reasoning_quality_reward(completions: list, **kwargs) -> list:
     """Reward за качество рассуждений.
 
-    Оценивает: длину, наличие шагов, ссылки на источники.
+    Оценивает: длину, наличие шагов, ссылки на источники, адвокат дьявола.
     Штрафует: шаблонные фразы из синтетических данных.
     """
     scores = []
@@ -107,10 +118,10 @@ def reasoning_quality_reward(completions: list, **kwargs) -> list:
 
         # 2. Наличие шагов анализа
         step_keywords = [
-            ("шаг 1", "источник", "анализ"),
-            ("шаг 2", "цитат", "доказательств"),
+            ("шаг 1", "источник", "анализ", "идентификац"),
+            ("шаг 2", "цитат", "доказательств", "факт"),
             ("шаг 3", "числ", "цифр", "проверк"),
-            ("шаг 4", "самопроверк", "вывод"),
+            ("шаг 4", "самопроверк", "вывод", "адвокат"),
         ]
         for step_group in step_keywords:
             if any(kw in reasoning.lower() for kw in step_group):
@@ -123,7 +134,28 @@ def reasoning_quality_reward(completions: list, **kwargs) -> list:
         )
         score += min(len(source_refs) * 0.2, 1.0)
 
-        # 4. Штраф за шаблонные фразы (из синтетических данных)
+        # 4. Бонус за адвоката дьявола (аргументы ПРОТИВ)
+        devil_keywords = [
+            "адвокат дьявола", "против моего вердикта",
+            "что если", "а если", "может ли",
+            "аргументы против", "контраргумент",
+        ]
+        if any(kw in reasoning.lower() for kw in devil_keywords):
+            score += 0.5
+
+        # 5. Бонус за конкретные сравнения (не абстрактные)
+        comparison_keywords = [
+            "совпадает", "не совпадает", "расходится",
+            "подтверждает", "противоречит",
+            "то же событие", "другое событие",
+        ]
+        comparison_count = sum(
+            1 for kw in comparison_keywords
+            if kw in reasoning.lower()
+        )
+        score += min(comparison_count * 0.15, 0.6)
+
+        # 6. Штраф за шаблонные фразы (из синтетических данных)
         template_phrases = [
             "множественные источники подтвердили",
             "стилистика нейтральна",
@@ -227,6 +259,60 @@ def correctness_reward(completions: list, **kwargs) -> list:
         else:
             scores.append(-1.5)
 
+    return scores
+
+
+def devils_advocate_reward(completions: list, **kwargs) -> list:
+    """Reward за наличие «адвоката дьявола» — аргументов ПРОТИВ своего вердикта.
+
+    Учим модель не просто давать ответ, а критически анализировать собственные выводы.
+
+    +1.0 за наличие контраргументов в reasoning
+    +0.5 за явное отклонение контраргументов с обоснованием
+    -0.5 за reasoning без самокритики
+    """
+    scores = []
+    for completion in completions:
+        reasoning_match = re.search(
+            r"<reasoning>(.*?)</reasoning>", completion, re.DOTALL
+        )
+        if not reasoning_match:
+            scores.append(-0.5)
+            continue
+
+        reasoning = reasoning_match.group(1).lower()
+        score = 0.0
+
+        # Наличие контраргументов
+        contra_keywords = [
+            "адвокат дьявола", "против моего вердикта",
+            "что если", "а если", "может ли",
+            "контраргумент", "аргументы против",
+            "может быть", "возможно ли",
+            "не слишком ли", "с другой стороны",
+        ]
+        has_contra = sum(1 for kw in contra_keywords if kw in reasoning)
+
+        if has_contra >= 2:
+            score += 1.0
+        elif has_contra == 1:
+            score += 0.5
+
+        # Отклонение контраргументов с обоснованием
+        rejection_keywords = [
+            "нет —", "нет,", "маловероятно",
+            "проверил", "проверено",
+            "именно поэтому", "потому что",
+        ]
+        has_rejection = any(kw in reasoning for kw in rejection_keywords)
+        if has_contra > 0 and has_rejection:
+            score += 0.5
+
+        # Штраф за отсутствие самокритики
+        if has_contra == 0:
+            score -= 0.5
+
+        scores.append(score)
     return scores
 
 
@@ -393,6 +479,7 @@ def train_grpo(
             reasoning_quality_reward,
             verdict_consistency_reward,
             correctness_reward,
+            devils_advocate_reward,
         ],
         args=training_args,
         train_dataset=dataset,

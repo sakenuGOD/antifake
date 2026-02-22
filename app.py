@@ -45,6 +45,14 @@ st.markdown("""
         color: #ff6b6b; font-weight: bold; font-size: 14px;
         margin-bottom: 10px; text-transform: uppercase;
     }
+    .critique-box {
+        background: #1a2a1a; border: 1px solid #2d5a2d; border-radius: 8px;
+        padding: 16px; margin: 15px 0; line-height: 1.6;
+    }
+    .critique-title {
+        color: #4caf50; font-weight: bold; font-size: 14px;
+        margin-bottom: 10px; text-transform: uppercase;
+    }
     .source-item {
         padding: 8px 0; border-bottom: 1px solid #333;
     }
@@ -185,6 +193,23 @@ def main():
         </div>
         """, unsafe_allow_html=True)
 
+        # Self-critique (если есть)
+        critique_errors = result.get("self_critique_errors", "")
+        if critique_errors and critique_errors.lower() != "нет":
+            st.markdown(f"""
+            <div class="critique-box">
+                <div class="critique-title">Самопроверка (Self-Critique):</div>
+                <div>{critique_errors}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        elif critique_errors:
+            st.markdown(f"""
+            <div class="critique-box">
+                <div class="critique-title">Самопроверка (Self-Critique):</div>
+                <div>Ошибок не обнаружено — вердикт подтверждён.</div>
+            </div>
+            """, unsafe_allow_html=True)
+
         # Первоисточники для проверки
         st.markdown("#### Первоисточники для проверки:")
         if result["sources"]:
@@ -213,6 +238,8 @@ def main():
             """, unsafe_allow_html=True)
 
             st.text_area("Сырой ответ модели", result["raw_verdict"], height=150, disabled=True)
+            if result.get("self_critique"):
+                st.text_area("Сырой self-critique", result["self_critique"], height=100, disabled=True)
 
     elif check_btn:
         st.warning("Введите текст для проверки.")
