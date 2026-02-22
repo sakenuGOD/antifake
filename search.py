@@ -186,36 +186,28 @@ class FactCheckSearcher:
 
     @staticmethod
     def format_results(results: List[Dict[str, str]]) -> str:
-        """Форматирование результатов для LLM (топ-7, сниппеты до 200 символов)."""
+        """Форматирование результатов для LLM — НЕЙТРАЛЬНО, без предрешения.
+
+        ВАЖНО: НЕ помечаем источники как "подтверждающие" или "не связанные" —
+        bag-of-words cosine similarity не может отличить "Путин подписал указ
+        о судьях" от "Путин подписал указ о крипте" (совпадают общие слова).
+        Модель сама должна прочитать и определить релевантность.
+        """
         if not results:
             return "Новости по данному запросу не найдены."
 
-        confirming = [r for r in results if r.get("is_confirming")]
-        related = [r for r in results if r.get("is_related")]
-        total = len(results)
-
-        lines = [
-            f"СТАТИСТИКА: найдено {total} источников, "
-            f"подтверждающих: {len(confirming)}, "
-            f"тематически близких: {len(related)}."
-        ]
+        lines = [f"Найдено {len(results)} источников. Прочитай каждый и определи, "
+                 f"подтверждает ли он утверждение или нет."]
         lines.append("")
 
         for i, article in enumerate(results[:7], 1):
-            score = article.get("relevance_score", 0)
-            if article.get("is_confirming"):
-                status = "ПОДТВЕРЖДАЕТ"
-            elif article.get("is_related"):
-                status = "БЛИЗКАЯ ТЕМА"
-            else:
-                status = "НЕ СВЯЗАН"
-            parts = [f"{i}. [{status}, сходство: {score}] {article['title']}"]
+            parts = [f"{i}. {article['title']}"]
             if article.get("source"):
                 parts.append(f"   Источник: {article['source']}")
             if article.get("date"):
                 parts.append(f"   Дата: {article['date']}")
             if article.get("snippet"):
-                snippet = article["snippet"][:200]
+                snippet = article["snippet"][:300]
                 parts.append(f"   {snippet}")
             lines.append("\n".join(parts))
 
