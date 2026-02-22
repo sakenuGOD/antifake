@@ -81,8 +81,7 @@ def train(
 
     from unsloth import FastLanguageModel
     from unsloth.chat_templates import get_chat_template
-    from trl import SFTTrainer
-    from transformers import TrainingArguments
+    from trl import SFTTrainer, SFTConfig
 
     # 1. Загрузка модели (4-bit NF4 квантизация)
     print("\n[1/6] Загрузка модели...")
@@ -156,11 +155,7 @@ def train(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
-        dataset_text_field="text",
-        max_seq_length=model_config.max_seq_length,
-        dataset_num_proc=1,
-        packing=True,
-        args=TrainingArguments(
+        args=SFTConfig(
             output_dir=training_config.output_dir,
             num_train_epochs=training_config.num_train_epochs,
             per_device_train_batch_size=training_config.per_device_train_batch_size,
@@ -181,6 +176,11 @@ def train(
             dataloader_num_workers=training_config.dataloader_num_workers,
             dataloader_pin_memory=training_config.dataloader_pin_memory,
             report_to="none",
+            # Packing параметры (в новом TRL — через SFTConfig)
+            packing=True,
+            dataset_text_field="text",
+            max_seq_length=model_config.max_seq_length,
+            dataset_num_proc=1,
         ),
     )
 
