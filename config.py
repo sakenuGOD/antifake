@@ -11,7 +11,7 @@ import os
 @dataclass
 class ModelConfig:
     base_model_name: str = "unsloth/mistral-7b-instruct-v0.3-bnb-4bit"
-    max_seq_length: int = 4096
+    max_seq_length: int = 2048           # 2048 для 12GB VRAM (данные ~200 токенов)
     dtype: str = None  # auto-detect (bf16 на Blackwell)
     load_in_4bit: bool = True
 
@@ -34,8 +34,8 @@ class LoraConfig:
 class TrainingConfig:
     output_dir: str = "adapters"
     num_train_epochs: int = 3
-    per_device_train_batch_size: int = 8   # увеличен с 2 — 12GB + 4bit позволяет
-    gradient_accumulation_steps: int = 2   # эффективный batch = 16
+    per_device_train_batch_size: int = 2   # 2 для 12GB VRAM (Mistral 7B 4-bit)
+    gradient_accumulation_steps: int = 8   # эффективный batch = 2*8 = 16
     learning_rate: float = 2e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.03            # 3% от шагов (лучше для больших датасетов)

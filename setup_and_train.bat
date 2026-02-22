@@ -76,6 +76,12 @@ if exist "venv\Scripts\activate.bat" (
 :: Удаляем xformers если установлен (не поддерживает Blackwell sm_120)
 pip uninstall xformers -y >nul 2>&1
 
+:: Удаляем кэш Unsloth (может содержать старый код с xformers)
+if exist "unsloth_compiled_cache" (
+    echo Очистка кэша Unsloth...
+    rmdir /s /q unsloth_compiled_cache
+)
+
 :: Проверка CUDA
 echo.
 echo === Проверка GPU ===
@@ -91,7 +97,7 @@ if not exist "data\train.jsonl" (
 
 :: Запуск тренировки
 echo.
-echo [5/5] Запуск тренировки (bf16, batch=8, LoRA r=32)...
+echo [5/5] Запуск тренировки (bf16, batch=2x8, LoRA r=32)...
 echo ============================================
 python train.py --dataset data/train.jsonl
 

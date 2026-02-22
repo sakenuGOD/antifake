@@ -32,7 +32,10 @@ def setup_cuda_optimizations():
     torch.backends.cudnn.benchmark = True
 
     # Оптимизация аллокации CUDA-памяти
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+
+    # Очистка VRAM перед стартом
+    torch.cuda.empty_cache()
 
     print("CUDA-оптимизации включены: TF32, cuDNN benchmark, expandable segments")
 
@@ -131,7 +134,7 @@ def train(
             texts.append(text)
         return {"text": texts}
 
-    dataset = dataset.map(formatting_func, batched=True, num_proc=4)
+    dataset = dataset.map(formatting_func, batched=True, num_proc=1)
 
     # 5. Настройка тренера
     print(f"\n[5/7] Настройка тренера...")
@@ -149,7 +152,7 @@ def train(
         train_dataset=dataset,
         dataset_text_field="text",
         max_seq_length=model_config.max_seq_length,
-        dataset_num_proc=4,
+        dataset_num_proc=1,
         packing=False,
         args=TrainingArguments(
             output_dir=training_config.output_dir,
