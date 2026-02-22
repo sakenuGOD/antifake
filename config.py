@@ -40,7 +40,9 @@ class TrainingConfig:
     output_dir: str = "adapters"
     num_train_epochs: int = 4             # 4 эпохи для малого датасета (~2500)
     per_device_train_batch_size: int = 1   # 1 — safe для 12GB (избегает gradient offload)
+    per_device_eval_batch_size: int = 1   # 1 — eval тоже должен быть 1 (иначе OOM при evaluation)
     gradient_accumulation_steps: int = 8   # эффективный batch = 8
+    eval_accumulation_steps: int = 4      # накапливать predictions пошагово (не всё сразу на GPU)
     learning_rate: float = 5e-5           # низкий LR для точного дообучения
     weight_decay: float = 0.01
     warmup_steps: int = 30                # короткий warmup для малого датасета
