@@ -11,7 +11,7 @@ import os
 @dataclass
 class ModelConfig:
     base_model_name: str = "unsloth/mistral-7b-instruct-v0.3-bnb-4bit"
-    max_seq_length: int = 512            # данные ~200 токенов, 512 с запасом
+    max_seq_length: int = 1024           # запас для длинных примеров (batch=2 влезает)
     dtype: str = None  # auto-detect (bf16 на Blackwell)
     load_in_4bit: bool = True
 
