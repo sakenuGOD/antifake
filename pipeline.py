@@ -35,6 +35,11 @@ class FactCheckPipeline:
         self.pipeline_config = pipeline_config
         self.searcher = FactCheckSearcher(search_config)
 
+        # Промежуточное хранилище (RunnablePassthrough.assign создаёт новый dict,
+        # поэтому мутации state внутри функций НЕ пробрасываются в следующие шаги)
+        self._last_search_hint = ""
+        self._last_raw_results = []
+
         # Загрузка модели один раз
         if adapter_path and os.path.exists(adapter_path):
             print(f"Загрузка fine-tuned модели из {adapter_path}...")
@@ -61,7 +66,13 @@ class FactCheckPipeline:
         self.chain = self._build_chain()
 
     def _build_chain(self):
-        """Сборка LCEL цепочки с прогрессивным обогащением состояния."""
+        """Сборка LCEL цепочки с прогрессивным обогащением состояния.
+
+        ВАЖНО: RunnablePassthrough.assign() создаёт НОВЫЙ dict — мутации
+        исходного state внутри RunnableLambda не видны следующим шагам.
+        Поэтому промежуточные данные (search_hint, raw_results) сохраняются
+        на self, а для search_hint добавлен отдельный шаг assign().
+        """
         keyword_prompt = PromptTemplate(
             template=KEYWORD_EXTRACTION_TEMPLATE,
             input_variables=["claim"],
@@ -74,12 +85,13 @@ class FactCheckPipeline:
         # Шаг 1: Извлечение ключевых слов
         keyword_chain = keyword_prompt | self.keyword_llm | StrOutputParser()
 
-        # Шаг 2: Поиск новостей (как функция)
+        # Шаг 2: Поиск новостей — сохраняет hint и raw_results на self
         def search_step(state: dict) -> str:
             keywords = self._parse_keywords(state["keywords_raw"])
             print(f"  Ключевые слова: {keywords}")
             results = self.searcher.search_all_keywords(keywords)
             print(f"  Найдено новостей: {len(results)}")
+
             # Ранжирование по косинусному сходству (Раздел 2.4)
             claim = state.get("claim", "")
             results = self.searcher.rank_by_relevance(claim, results)
@@ -87,10 +99,14 @@ class FactCheckPipeline:
             related = [r for r in results if r.get("is_related")]
             print(f"  Подтверждающих: {len(confirming)}, близких: {len(related)}")
 
-            # Генерация подсказки для LLM на основе статистики поиска
+            # Генерация подсказки для LLM на основе статистики
             total = len(results)
             if not results:
-                hint = "ПОДСКАЗКА: По данному запросу не найдено новостей. Невозможно подтвердить или опровергнуть."
+                hint = (
+                    "ПОДСКАЗКА: По запросу не найдено новостей. "
+                    "Невозможно подтвердить или опровергнуть. "
+                    "Оцени правдоподобность на основе общих знаний."
+                )
             elif confirming:
                 hint = (
                     f"ПОДСКАЗКА: {len(confirming)} из {total} источников "
@@ -98,33 +114,42 @@ class FactCheckPipeline:
                 )
             elif related:
                 hint = (
-                    f"ПОДСКАЗКА: Прямых подтверждений нет, но {len(related)} из "
-                    f"{total} источников обсуждают близкую тему. "
+                    f"ПОДСКАЗКА: Прямых подтверждений нет, но {len(related)} "
+                    f"из {total} источников обсуждают близкую тему. "
                     f"Внимательно прочитай их — возможно, они подтверждают "
-                    f"утверждение другими словами."
+                    f"утверждение другими словами или с другими цифрами."
                 )
             else:
                 hint = (
                     f"ПОДСКАЗКА: Найдено {total} источников, но ни один "
-                    f"не имеет высокого тематического сходства. Это может "
-                    f"означать, что новость слишком свежая или тема не освещена."
+                    f"не имеет высокого тематического сходства. Возможно, "
+                    f"новость слишком свежая или тема не освещена в СМИ."
                 )
-            state["search_hint"] = hint
 
-            # Сохраняем сырые результаты поиска в состояние
-            state["_raw_search_results"] = results
+            # Сохраняем на self (не через мутацию state!)
+            self._last_search_hint = hint
+            self._last_raw_results = results
+
             return self.searcher.format_results(results)
 
-        # Шаг 3: Оценка достоверности
+        # Шаг 2.5: Извлечение search_hint из self (отдельный assign)
+        def get_search_hint(state: dict) -> str:
+            return self._last_search_hint
+
+        # Шаг 3: Оценка достоверности (Chain-of-Thought)
         verdict_chain = verdict_prompt | self.verdict_llm | StrOutputParser()
 
-        # Полная цепочка через RunnablePassthrough.assign()
+        # Полная цепочка:
+        # claim → +keywords_raw → +search_results → +search_hint → +verdict
         chain = (
             RunnablePassthrough.assign(
                 keywords_raw=keyword_chain,
             )
             | RunnablePassthrough.assign(
                 search_results=RunnableLambda(search_step),
+            )
+            | RunnablePassthrough.assign(
+                search_hint=RunnableLambda(get_search_hint),
             )
             | RunnablePassthrough.assign(
                 verdict=verdict_chain,
@@ -199,10 +224,11 @@ class FactCheckPipeline:
     def check(self, claim: str) -> Dict[str, Any]:
         """Проверка одного утверждения. Возвращает структурированный результат."""
         print(f"\nПроверка: {claim}")
-        timings = {}
 
-        # Шаг 1: Ключевые слова
-        t0 = time.time()
+        # Сброс промежуточного состояния
+        self._last_search_hint = ""
+        self._last_raw_results = []
+
         state = {"claim": claim}
 
         # Запускаем полную цепочку
@@ -213,8 +239,8 @@ class FactCheckPipeline:
         # Парсинг вердикта
         parsed = self.parse_verdict(raw_result.get("verdict", ""))
 
-        # Извлечение источников из результатов поиска
-        raw_search = raw_result.get("_raw_search_results", [])
+        # Извлечение источников из self (не из chain output)
+        raw_search = self._last_raw_results
         sources = self.extract_sources(raw_search) if raw_search else []
 
         # Ключевые слова

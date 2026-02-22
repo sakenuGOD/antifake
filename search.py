@@ -14,18 +14,27 @@ RELATED_THRESHOLD = 0.20    # Тематически близкий источн
 
 
 def _simple_tokenize(text: str) -> Dict[str, int]:
-    """Простая токенизация текста для вычисления TF-вектора."""
+    """Токенизация текста с псевдо-стеммингом для русского языка.
+
+    Для каждого слова длиннее 4 символов добавляет его 4-символьный
+    префикс как дополнительный токен. Это компенсирует отсутствие
+    полноценной лемматизации: "снежного" и "снежный" → общий токен "снеж".
+    """
     words = text.lower().split()
     freq = {}
     for w in words:
         w = w.strip(".,!?;:\"'()-[]{}»«")
         if len(w) > 2:
             freq[w] = freq.get(w, 0) + 1
+            # Псевдо-стемминг: 4-символьный префикс для морфологических вариаций
+            if len(w) > 4:
+                stem = w[:4]
+                freq[stem] = freq.get(stem, 0) + 1
     return freq
 
 
 def cosine_similarity(text_a: str, text_b: str) -> float:
-    """Косинусное сходство между двумя текстами (bag-of-words)."""
+    """Косинусное сходство между двумя текстами (bag-of-words + псевдо-стемминг)."""
     vec_a = _simple_tokenize(text_a)
     vec_b = _simple_tokenize(text_b)
 
@@ -56,28 +65,32 @@ class FactCheckSearcher:
 
     def search_keyword(self, keyword: str) -> List[Dict[str, str]]:
         """Поиск новостей по одному ключевому слову."""
-        params = {
-            "q": keyword.strip(),
-            "engine": "google",
-            "gl": self.config.gl,
-            "hl": self.config.hl,
-            "tbm": self.config.tbm,
-            "num": self.config.num_results,
-            "api_key": self.config.api_key,
-        }
-        search = GoogleSearch(params)
-        results = search.get_dict()
+        try:
+            params = {
+                "q": keyword.strip(),
+                "engine": "google",
+                "gl": self.config.gl,
+                "hl": self.config.hl,
+                "tbm": self.config.tbm,
+                "num": self.config.num_results,
+                "api_key": self.config.api_key,
+            }
+            search = GoogleSearch(params)
+            results = search.get_dict()
 
-        articles = []
-        for item in results.get("news_results", []):
-            articles.append({
-                "title": item.get("title", ""),
-                "snippet": item.get("snippet", ""),
-                "source": item.get("source", ""),
-                "link": item.get("link", ""),
-                "date": item.get("date", ""),
-            })
-        return articles
+            articles = []
+            for item in results.get("news_results", []):
+                articles.append({
+                    "title": item.get("title", ""),
+                    "snippet": item.get("snippet", ""),
+                    "source": item.get("source", ""),
+                    "link": item.get("link", ""),
+                    "date": item.get("date", ""),
+                })
+            return articles
+        except Exception as e:
+            print(f"  [SerpAPI] Ошибка при поиске '{keyword}': {e}")
+            return []
 
     def search_all_keywords(self, keywords: List[str]) -> List[Dict[str, str]]:
         """Поиск по всем ключевым словам с дедупликацией по URL."""
@@ -124,7 +137,7 @@ class FactCheckSearcher:
 
     @staticmethod
     def format_results(results: List[Dict[str, str]]) -> str:
-        """Форматирование результатов в нумерованный текстовый блок для LLM."""
+        """Форматирование результатов для LLM (топ-7, сниппеты до 200 символов)."""
         if not results:
             return "Новости по данному запросу не найдены."
 
@@ -139,7 +152,7 @@ class FactCheckSearcher:
         ]
         lines.append("")
 
-        for i, article in enumerate(results[:10], 1):
+        for i, article in enumerate(results[:7], 1):
             score = article.get("relevance_score", 0)
             if article.get("is_confirming"):
                 status = "ПОДТВЕРЖДАЕТ"
@@ -147,13 +160,14 @@ class FactCheckSearcher:
                 status = "БЛИЗКАЯ ТЕМА"
             else:
                 status = "НЕ СВЯЗАН"
-            parts = [f"{i}. [{status}, релевантность: {score}] {article['title']}"]
+            parts = [f"{i}. [{status}, сходство: {score}] {article['title']}"]
             if article.get("source"):
                 parts.append(f"   Источник: {article['source']}")
             if article.get("date"):
                 parts.append(f"   Дата: {article['date']}")
             if article.get("snippet"):
-                parts.append(f"   {article['snippet']}")
+                snippet = article["snippet"][:200]
+                parts.append(f"   {snippet}")
             lines.append("\n".join(parts))
 
         return "\n\n".join(lines)
