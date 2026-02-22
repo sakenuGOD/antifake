@@ -49,7 +49,7 @@ class TrainingConfig:
     save_total_limit: int = 3             # хранить только 3 последних чекпоинта
     seed: int = 3407
     dataset_path: str = "data/train.jsonl"
-    dataloader_num_workers: int = 4       # параллельная загрузка данных
+    dataloader_num_workers: int = 0       # 0 для Windows (multiprocessing incompatible with Unsloth)
     dataloader_pin_memory: bool = True    # pin memory для быстрой передачи в GPU
     tf32: bool = True                     # TF32 для матричных операций
 
