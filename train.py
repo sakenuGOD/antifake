@@ -34,10 +34,15 @@ def setup_cuda_optimizations():
     # Оптимизация аллокации CUDA-памяти
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
 
+    # Принудительно SDPA (не xformers) — Blackwell sm_120
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    os.environ["XFORMERS_DISABLED"] = "1"
+
     # Очистка VRAM перед стартом
     torch.cuda.empty_cache()
 
-    print("CUDA-оптимизации включены: TF32, cuDNN benchmark, expandable segments")
+    print("CUDA-оптимизации включены: TF32, cuDNN benchmark, SDPA flash, expandable segments")
 
 
 def load_dataset_from_jsonl(path: str):

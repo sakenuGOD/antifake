@@ -33,9 +33,9 @@ class LoraConfig:
 @dataclass
 class TrainingConfig:
     output_dir: str = "adapters"
-    num_train_epochs: int = 1             # 1 эпоха — лосс сходится за 4% первой
-    per_device_train_batch_size: int = 2   # 2 — safe для 12GB с Mistral 7B
-    gradient_accumulation_steps: int = 8   # эффективный batch = 2*8 = 16
+    num_train_epochs: int = 1             # 1 эпоха — лосс сходится быстро
+    per_device_train_batch_size: int = 2   # 2 — safe для 12GB
+    gradient_accumulation_steps: int = 4   # эффективный batch = 8
     learning_rate: float = 2e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.03            # 3% от шагов (лучше для больших датасетов)
@@ -44,9 +44,9 @@ class TrainingConfig:
     fp16: bool = False
     bf16: bool = True                     # нативная поддержка bf16 на Blackwell
     logging_steps: int = 25
-    save_strategy: str = "steps"
-    save_steps: int = 2000
-    save_total_limit: int = 3             # хранить только 3 последних чекпоинта
+    save_strategy: str = "epoch"            # сохранять только в конце
+    save_steps: int = 5000
+    save_total_limit: int = 1
     seed: int = 3407
     dataset_path: str = "data/train.jsonl"
     dataloader_num_workers: int = 0       # 0 для Windows (multiprocessing incompatible with Unsloth)

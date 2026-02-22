@@ -91,13 +91,13 @@ echo.
 :: Скачивание датасета если не скачан
 if not exist "data\train.jsonl" (
     echo.
-    echo [DATASET] Датасет не найден, скачиваю 50к примеров...
-    python download_dataset.py --limit 50000
+    echo [DATASET] Датасет не найден, скачиваю 10к примеров...
+    python download_dataset.py --limit 10000
 )
 
 :: Запуск тренировки
 echo.
-echo [5/5] Запуск тренировки (bf16, batch=2x8, LoRA r=32)...
+echo [5/5] Запуск тренировки (bf16, batch=2x4, seq=512, LoRA r=16)...
 echo ============================================
 python train.py --dataset data/train.jsonl
 
