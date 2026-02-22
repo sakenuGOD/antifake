@@ -51,18 +51,14 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    # Проверка API-ключа
-    if not os.environ.get("SERPAPI_API_KEY"):
-        print("Ошибка: переменная окружения SERPAPI_API_KEY не установлена.")
-        print("Получите ключ на https://serpapi.com/ и установите:")
-        print("  export SERPAPI_API_KEY='ваш_ключ'")
-        sys.exit(1)
-
     # Импортируем здесь, чтобы быстро показать ошибки CLI без загрузки модели
     from pipeline import FactCheckPipeline
     from config import SearchConfig
 
-    search_config = SearchConfig(api_key=os.environ["SERPAPI_API_KEY"])
+    api_key = os.environ.get("SERPAPI_API_KEY", "")
+    if not api_key:
+        print("Внимание: SERPAPI_API_KEY не установлен — используется DuckDuckGo.")
+    search_config = SearchConfig(api_key=api_key)
 
     adapter_path = args.adapter_path if os.path.exists(args.adapter_path) else None
     pipeline = FactCheckPipeline(

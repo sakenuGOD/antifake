@@ -115,11 +115,12 @@ def evaluate_rag(pipeline) -> Dict:
         verdict = result.get("verdict", "").upper()
         score = result.get("credibility_score", 50)
 
-        if verdict in ("ЛОЖЬ", "FALSE") or score < 40:
+        if verdict in ("ЛОЖЬ", "FALSE") or score < 30:
             predicted = 0  # fake
         elif verdict in ("ПРАВДА", "TRUE") or score >= 70:
             predicted = 1  # real
         else:
+            # НЕ ПОДТВЕРЖДЕНО (30-69): используем score для решения
             predicted = 1 if score >= 50 else 0
 
         predictions.append(predicted)

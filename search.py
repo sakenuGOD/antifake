@@ -1,14 +1,9 @@
-"""SerpAPI обёртка для поиска новостей + ранжирование по косинусному сходству."""
+"""Поиск новостей: SerpAPI (основной) → DuckDuckGo (fallback) + ранжирование."""
 
-from typing import List, Dict, Tuple
-from serpapi import GoogleSearch
-
+from typing import List, Dict
 from config import SearchConfig
 
-# Порог релевантности для bag-of-words cosine similarity.
-# Для точного (embedding-based) сходства порог 0.85 корректен (Раздел 2.4),
-# но bag-of-words без лемматизации даёт низкие скоры из-за морфологии русского языка
-# (например, "снежного" != "снежный"), поэтому пороги снижены.
+# Пороги для bag-of-words cosine similarity с псевдо-стеммингом.
 RELEVANCE_THRESHOLD = 0.35  # Подтверждающий источник
 RELATED_THRESHOLD = 0.20    # Тематически близкий источник
 
@@ -26,7 +21,6 @@ def _simple_tokenize(text: str) -> Dict[str, int]:
         w = w.strip(".,!?;:\"'()-[]{}»«")
         if len(w) > 2:
             freq[w] = freq.get(w, 0) + 1
-            # Псевдо-стемминг: 4-символьный префикс для морфологических вариаций
             if len(w) > 4:
                 stem = w[:4]
                 freq[stem] = freq.get(stem, 0) + 1
@@ -41,11 +35,9 @@ def cosine_similarity(text_a: str, text_b: str) -> float:
     if not vec_a or not vec_b:
         return 0.0
 
-    # Скалярное произведение
     common_keys = set(vec_a.keys()) & set(vec_b.keys())
     dot_product = sum(vec_a[k] * vec_b[k] for k in common_keys)
 
-    # Нормы
     norm_a = sum(v ** 2 for v in vec_a.values()) ** 0.5
     norm_b = sum(v ** 2 for v in vec_b.values()) ** 0.5
 
@@ -56,51 +48,92 @@ def cosine_similarity(text_a: str, text_b: str) -> float:
 
 
 class FactCheckSearcher:
-    """Поиск новостей через SerpAPI для проверки фактов."""
+    """Поиск новостей: SerpAPI (основной) → DuckDuckGo (бесплатный fallback)."""
 
     def __init__(self, config: SearchConfig = None):
         if config is None:
             config = SearchConfig()
         self.config = config
+        self._serpapi_failed = False  # Если True — все запросы идут через DDG
+
+    def _search_serpapi(self, keyword: str) -> List[Dict[str, str]]:
+        """Поиск через SerpAPI (платный, основной)."""
+        from serpapi import GoogleSearch
+
+        params = {
+            "q": keyword.strip(),
+            "engine": "google",
+            "gl": self.config.gl,
+            "hl": self.config.hl,
+            "tbm": self.config.tbm,
+            "num": self.config.num_results,
+            "api_key": self.config.api_key,
+        }
+        search = GoogleSearch(params)
+        results = search.get_dict()
+
+        articles = []
+        for item in results.get("news_results", []):
+            articles.append({
+                "title": item.get("title", ""),
+                "snippet": item.get("snippet", ""),
+                "source": item.get("source", ""),
+                "link": item.get("link", ""),
+                "date": item.get("date", ""),
+            })
+        return articles
+
+    def _search_ddg(self, keyword: str) -> List[Dict[str, str]]:
+        """Поиск через DuckDuckGo (бесплатный fallback, без API-ключа)."""
+        from duckduckgo_search import DDGS
+
+        results = DDGS().news(
+            keywords=keyword.strip(),
+            region="ru-ru",
+            max_results=self.config.num_results,
+        )
+        articles = []
+        for item in results:
+            articles.append({
+                "title": item.get("title", ""),
+                "snippet": item.get("body", ""),
+                "source": item.get("source", ""),
+                "link": item.get("url", ""),
+                "date": item.get("date", ""),
+            })
+        return articles
 
     def search_keyword(self, keyword: str) -> List[Dict[str, str]]:
-        """Поиск новостей по одному ключевому слову."""
-        try:
-            params = {
-                "q": keyword.strip(),
-                "engine": "google",
-                "gl": self.config.gl,
-                "hl": self.config.hl,
-                "tbm": self.config.tbm,
-                "num": self.config.num_results,
-                "api_key": self.config.api_key,
-            }
-            search = GoogleSearch(params)
-            results = search.get_dict()
+        """Поиск новостей с автоматическим fallback: SerpAPI → DuckDuckGo.
 
-            articles = []
-            for item in results.get("news_results", []):
-                articles.append({
-                    "title": item.get("title", ""),
-                    "snippet": item.get("snippet", ""),
-                    "source": item.get("source", ""),
-                    "link": item.get("link", ""),
-                    "date": item.get("date", ""),
-                })
-            return articles
+        Если SerpAPI падает (ошибка, исчерпан лимит), все последующие
+        запросы в этой сессии автоматически идут через DuckDuckGo.
+        """
+        # 1. SerpAPI (если ключ есть и API не упал)
+        if self.config.api_key and not self._serpapi_failed:
+            try:
+                return self._search_serpapi(keyword)
+            except Exception as e:
+                print(f"  [SerpAPI] Ошибка: {e}")
+                print(f"  [SerpAPI] Переключаюсь на DuckDuckGo для всех запросов")
+                self._serpapi_failed = True
+
+        # 2. DuckDuckGo (fallback)
+        try:
+            return self._search_ddg(keyword)
         except Exception as e:
-            print(f"  [SerpAPI] Ошибка при поиске '{keyword}': {e}")
+            print(f"  [DDG] Ошибка при поиске '{keyword}': {e}")
             return []
 
     def search_all_keywords(
         self, keywords: List[str], claim: str = ""
     ) -> List[Dict[str, str]]:
-        """Поиск по всем ключевым словам + комбинированный запрос + прямой поиск утверждения.
+        """Поиск по всем ключевым словам + комбинированный запрос + прямой поиск.
 
         Стратегия поиска (три уровня для максимального recall):
-        1. Комбинированный запрос: все ключевые слова вместе ("Львов теракт женщина")
+        1. Комбинированный запрос: все ключевые слова вместе
         2. Прямой поиск: первые 120 символов утверждения целиком
-        3. Поиск по отдельным ключевым словам (как раньше)
+        3. Поиск по отдельным ключевым словам
         """
         seen_urls = set()
         all_results = []
@@ -138,12 +171,7 @@ class FactCheckSearcher:
         threshold: float = RELEVANCE_THRESHOLD,
         related_threshold: float = RELATED_THRESHOLD,
     ) -> List[Dict[str, str]]:
-        """Ранжирование результатов по косинусному сходству с утверждением.
-
-        Источники с similarity >= threshold считаются подтверждающими.
-        Источники с similarity >= related_threshold считаются тематически близкими.
-        Результаты сортируются по убыванию релевантности.
-        """
+        """Ранжирование результатов по косинусному сходству с утверждением."""
         scored = []
         for article in results:
             text = f"{article.get('title', '')} {article.get('snippet', '')}"
@@ -153,7 +181,6 @@ class FactCheckSearcher:
             article["is_related"] = score >= related_threshold and score < threshold
             scored.append(article)
 
-        # Сортировка по релевантности (убывание)
         scored.sort(key=lambda x: x["relevance_score"], reverse=True)
         return scored
 

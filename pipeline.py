@@ -14,6 +14,18 @@ from prompts import KEYWORD_EXTRACTION_TEMPLATE, CREDIBILITY_ASSESSMENT_TEMPLATE
 from model import load_unsloth_model, load_finetuned_model, build_langchain_llm
 from search import FactCheckSearcher
 
+# Месяцы и общие слова для программной очистки ключевых слов
+_MONTHS_RU = {
+    "январь", "февраль", "март", "апрель", "май", "июнь",
+    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+}
+_GENERIC_WORDS = {
+    "женщина", "мужчина", "человек", "люди", "год", "день", "время",
+    "место", "новость", "сообщение", "данные", "информация",
+}
+
 
 class FactCheckPipeline:
     """Пайплайн проверки достоверности утверждений."""
@@ -93,7 +105,7 @@ class FactCheckPipeline:
             results = self.searcher.search_all_keywords(keywords, claim=claim)
             print(f"  Найдено новостей: {len(results)}")
 
-            # Ранжирование по косинусному сходству (Раздел 2.4)
+            # Ранжирование по косинусному сходству
             results = self.searcher.rank_by_relevance(claim, results)
             confirming = [r for r in results if r.get("is_confirming")]
             related = [r for r in results if r.get("is_related")]
@@ -105,7 +117,8 @@ class FactCheckPipeline:
                 hint = (
                     "ПОДСКАЗКА: По запросу не найдено новостей. "
                     "Невозможно подтвердить или опровергнуть. "
-                    "Оцени правдоподобность на основе общих знаний."
+                    "Оцени правдоподобность на основе общих знаний. "
+                    "Вердикт: НЕ ПОДТВЕРЖДЕНО."
                 )
             elif confirming:
                 hint = (
@@ -117,13 +130,14 @@ class FactCheckPipeline:
                     f"ПОДСКАЗКА: Прямых подтверждений нет, но {len(related)} "
                     f"из {total} источников обсуждают близкую тему. "
                     f"Внимательно прочитай их — возможно, они подтверждают "
-                    f"утверждение другими словами или с другими цифрами."
+                    f"утверждение другими словами."
                 )
             else:
                 hint = (
                     f"ПОДСКАЗКА: Найдено {total} источников, но ни один "
-                    f"не имеет высокого тематического сходства. Возможно, "
-                    f"новость слишком свежая или тема не освещена в СМИ."
+                    f"не имеет высокого тематического сходства. "
+                    f"Вероятно, новость не освещена в СМИ. "
+                    f"Это НЕ опровержение — вердикт: НЕ ПОДТВЕРЖДЕНО."
                 )
 
             # Сохраняем на self (не через мутацию state!)
@@ -136,7 +150,7 @@ class FactCheckPipeline:
         def get_search_hint(state: dict) -> str:
             return self._last_search_hint
 
-        # Шаг 3: Оценка достоверности (Chain-of-Thought)
+        # Шаг 3: Оценка достоверности (Quote-Then-Judge + Triple Self-Check)
         verdict_chain = verdict_prompt | self.verdict_llm | StrOutputParser()
 
         # Полная цепочка:
@@ -159,27 +173,61 @@ class FactCheckPipeline:
 
     @staticmethod
     def _parse_keywords(raw_output: str) -> List[str]:
-        """Парсер ключевых слов с fallback для нечистого вывода модели."""
+        """Парсер ключевых слов с программной очисткой.
+
+        1. Извлекает слова из вывода модели
+        2. Программно удаляет: месяцы, числа, общие слова
+        3. Fallback если всё отфильтровано
+        """
         text = raw_output.strip()
 
-        for prefix in ["Ключевые слова:", "Keywords:", "ключевые слова:"]:
+        # Убираем типичные префиксы
+        for prefix in ["Ключевые слова:", "Keywords:", "ключевые слова:",
+                       "КЛЮЧЕВЫЕ СЛОВА:"]:
             if text.lower().startswith(prefix.lower()):
                 text = text[len(prefix):].strip()
 
-        keywords = [kw.strip().strip('"').strip("'") for kw in text.split(",")]
-        keywords = [kw for kw in keywords if kw and len(kw) < 50]
+        # Парсинг по запятой
+        raw_keywords = [kw.strip().strip('"').strip("'") for kw in text.split(",")]
+        raw_keywords = [kw for kw in raw_keywords if kw and len(kw) < 50]
 
-        if not keywords:
-            keywords = [w for w in text.split() if len(w) > 2][:5]
+        # Fallback: если не разделено запятыми
+        if not raw_keywords:
+            raw_keywords = [w for w in text.split() if len(w) > 2][:5]
 
-        return keywords[:5]
+        # === Программная очистка (модель 7B не всегда слушается инструкций) ===
+        cleaned = []
+        for kw in raw_keywords:
+            kw_lower = kw.lower().strip()
+
+            # Пропуск месяцев
+            if kw_lower in _MONTHS_RU:
+                continue
+
+            # Пропуск чисто числовых или "число + слово" (e.g. "22 год", "33 бойца")
+            if re.match(r'^\d+\s*\S*$', kw_lower):
+                continue
+
+            # Пропуск общих слов
+            if kw_lower in _GENERIC_WORDS:
+                continue
+
+            # Пропуск слишком коротких
+            if len(kw_lower) < 2:
+                continue
+
+            cleaned.append(kw)
+
+        # Fallback: если всё отфильтровано, вернуть оригинал
+        result = cleaned if cleaned else raw_keywords
+        return result[:5]
 
     @staticmethod
     def parse_verdict(raw_verdict: str) -> Dict[str, Any]:
         """Парсинг структурированного вердикта из ответа модели."""
         result = {
             "credibility_score": 50,
-            "verdict": "НЕИЗВЕСТНО",
+            "verdict": "НЕ ПОДТВЕРЖДЕНО",
             "confidence": 50,
             "reasoning": "",
             "sources": "",
@@ -226,47 +274,45 @@ class FactCheckPipeline:
         parsed: Dict[str, Any],
         raw_results: List[Dict],
     ) -> Dict[str, Any]:
-        """Программный safety net: предотвращает ложный вердикт ЛОЖЬ.
+        """Умный safety net: целевая коррекция только очевидных ошибок модели.
 
-        Правила:
-        1. Если есть подтверждающие источники, но модель сказала ЛОЖЬ → ЧАСТИЧНО (50)
-        2. Если есть тематически близкие источники, но модель сказала ЛОЖЬ → ЧАСТИЧНО (45)
-        3. Если источников нет вообще (поиск не нашёл ничего), ЛОЖЬ → ЧАСТИЧНО (40)
-        4. Модель может сказать ЛОЖЬ только если score < 30 И нет подтверждающих/близких
-           источников (т.е. источники АКТИВНО опровергают)
+        Правила (минимальное вмешательство):
+        1. Модель сказала ПРАВДА, но НЕТ подтверждающих источников → НЕ ПОДТВЕРЖДЕНО
+        2. Модель сказала ЛОЖЬ, но ЕСТЬ подтверждающие источники → НЕ ПОДТВЕРЖДЕНО
+        3. Модель сказала ЛОЖЬ, но поиск ВООБЩЕ не дал результатов → НЕ ПОДТВЕРЖДЕНО
+        4. Во всех остальных случаях — доверяем модели
         """
         confirming = [r for r in raw_results if r.get("is_confirming")]
-        related = [r for r in raw_results if r.get("is_related")]
         score = parsed["credibility_score"]
         verdict = parsed["verdict"].upper().strip()
 
-        # Если модель выдала ЛОЖЬ (score < 30), проверяем обоснованность
-        if score < 30 or verdict == "ЛОЖЬ":
-            if confirming:
-                # Есть подтверждающие источники — модель ошиблась
-                parsed["credibility_score"] = max(score, 55)
-                parsed["verdict"] = "ЧАСТИЧНО"
-                parsed["reasoning"] += (
-                    " [КОРРЕКЦИЯ: обнаружены подтверждающие источники, "
-                    "вердикт скорректирован на ЧАСТИЧНО]"
-                )
-            elif related:
-                # Есть тематически близкие — не можем утверждать ЛОЖЬ
-                parsed["credibility_score"] = max(score, 45)
-                parsed["verdict"] = "ЧАСТИЧНО"
-                parsed["reasoning"] += (
-                    " [КОРРЕКЦИЯ: найдены тематически близкие источники, "
-                    "отсутствие прямого подтверждения не равно опровержению]"
-                )
-            elif not raw_results:
-                # Поиск ничего не нашёл — невозможно судить
-                parsed["credibility_score"] = max(score, 40)
-                parsed["verdict"] = "ЧАСТИЧНО"
-                parsed["reasoning"] += (
-                    " [КОРРЕКЦИЯ: поиск не дал результатов, "
-                    "невозможно подтвердить или опровергнуть]"
-                )
+        # Rule 1: ПРАВДА без подтверждающих источников → снижаем
+        if verdict == "ПРАВДА" and not confirming:
+            parsed["credibility_score"] = min(score, 55)
+            parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
+            parsed["reasoning"] += (
+                " [Коррекция: вердикт снижен — подтверждающие источники не найдены]"
+            )
 
+        # Rule 2: ЛОЖЬ при наличии подтверждающих источников → повышаем
+        elif verdict == "ЛОЖЬ" and confirming:
+            parsed["credibility_score"] = max(score, 60)
+            parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
+            parsed["reasoning"] += (
+                " [Коррекция: найдены подтверждающие источники, "
+                "вердикт ЛОЖЬ необоснован]"
+            )
+
+        # Rule 3: ЛОЖЬ без каких-либо результатов поиска → нельзя опровергнуть
+        elif verdict == "ЛОЖЬ" and not raw_results:
+            parsed["credibility_score"] = max(score, 40)
+            parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
+            parsed["reasoning"] += (
+                " [Коррекция: поиск не дал результатов — "
+                "невозможно подтвердить или опровергнуть]"
+            )
+
+        # Rule 4: всё остальное — доверяем модели
         return parsed
 
     def check(self, claim: str) -> Dict[str, Any]:
@@ -284,7 +330,7 @@ class FactCheckPipeline:
         raw_result = self.chain.invoke(state)
         total_time = time.time() - total_start
 
-        # Парсинг вердикта + safety net
+        # Парсинг вердикта + smart safety net
         parsed = self.parse_verdict(raw_result.get("verdict", ""))
         parsed = self._apply_safety_net(parsed, self._last_raw_results)
 

@@ -76,16 +76,15 @@ def load_pipeline():
 
 def main():
     st.markdown('<div class="main-header">Система определения достоверности новостей</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Mistral 7B + RAG-Pipeline | LangChain | SerpAPI</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Mistral 7B + RAG-Pipeline | LangChain | SerpAPI + DuckDuckGo</div>', unsafe_allow_html=True)
 
-    # Проверка API ключа
+    # Проверка API ключа (не обязательно — есть DuckDuckGo fallback)
     api_key = os.environ.get("SERPAPI_API_KEY", "")
     if not api_key:
-        st.error(
-            "Переменная окружения `SERPAPI_API_KEY` не установлена. "
-            "Установите перед запуском: `export SERPAPI_API_KEY='ваш_ключ'`"
+        st.warning(
+            "SERPAPI_API_KEY не установлен — поиск через DuckDuckGo. "
+            "Для лучших результатов установите: `export SERPAPI_API_KEY='ваш_ключ'`"
         )
-        st.stop()
 
     # Загрузка пайплайна
     with st.spinner("Загрузка модели Mistral 7B..."):
@@ -134,17 +133,17 @@ def main():
             score_color = "#dc3545"
             delta_prefix = "↓"
             verdict_class = "verdict-false"
-            verdict_label = f"ЛОЖЬ / FALSE"
+            verdict_label = "ЛОЖЬ / FALSE"
         elif verdict.upper() in ("ПРАВДА", "TRUE"):
             score_color = "#28a745"
             delta_prefix = "↑"
             verdict_class = "verdict-true"
-            verdict_label = f"ПРАВДА / TRUE"
+            verdict_label = "ПРАВДА / TRUE"
         else:
             score_color = "#ffc107"
             delta_prefix = "~"
             verdict_class = "verdict-partial"
-            verdict_label = f"ЧАСТИЧНО / PARTIAL"
+            verdict_label = "НЕ ПОДТВЕРЖДЕНО / UNVERIFIED"
 
         # Метрики: Достоверность | Статус | Уверенность ИИ
         col1, col2, col3 = st.columns(3)
@@ -201,7 +200,7 @@ def main():
             • <b>Метод оптимизации:</b> QLoRA 4-bit NF4<br>
             • <b>Инфраструктура:</b> LangChain Agentic RAG Pipeline<br>
             • <b>Задержка (Latency):</b> {latency} сек<br>
-            • <b>Источники:</b> SerpAPI Google Index<br>
+            • <b>Источники:</b> SerpAPI Google Index + DuckDuckGo (fallback)<br>
             • <b>Ключевые слова:</b> {', '.join(result['keywords'])}
             </div>
             """, unsafe_allow_html=True)
