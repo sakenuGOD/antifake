@@ -578,7 +578,9 @@ def train_grpo(
 
     # Попытка загрузить SFT адаптеры (если уже обучены)
     sft_adapter_path = os.path.join(PROJECT_ROOT, "adapters", "fact_checker_lora")
-    if os.path.exists(sft_adapter_path):
+    has_sft_adapters = os.path.exists(sft_adapter_path)
+
+    if has_sft_adapters:
         print(f"  Загружаю SFT адаптеры из {sft_adapter_path}")
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=sft_adapter_path,
@@ -597,16 +599,22 @@ def train_grpo(
 
     # 2. LoRA адаптеры
     print("[2/4] Настройка LoRA...")
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=lora_config.r,
-        lora_alpha=lora_config.lora_alpha,
-        lora_dropout=lora_config.lora_dropout,
-        target_modules=lora_config.target_modules,
-        bias=lora_config.bias,
-        use_gradient_checkpointing=lora_config.use_gradient_checkpointing,
-        random_state=lora_config.random_state,
-    )
+    if has_sft_adapters:
+        # SFT адаптеры уже содержат LoRA — продолжаем обучение тех же весов
+        # НЕ вызываем get_peft_model, иначе Unsloth выдаст ошибку
+        print("  LoRA уже загружены из SFT адаптеров, продолжаю обучение...")
+        FastLanguageModel.for_training(model)
+    else:
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=lora_config.r,
+            lora_alpha=lora_config.lora_alpha,
+            lora_dropout=lora_config.lora_dropout,
+            target_modules=lora_config.target_modules,
+            bias=lora_config.bias,
+            use_gradient_checkpointing=lora_config.use_gradient_checkpointing,
+            random_state=lora_config.random_state,
+        )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
