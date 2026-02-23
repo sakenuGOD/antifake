@@ -8,3 +8,6 @@ lyrics_mixer/
 .cache/
 *.log
 .env
+antifake/
+unsloth_compiled_cache/
+data/
