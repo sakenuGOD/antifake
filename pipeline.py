@@ -21,7 +21,7 @@ from prompts import (
     CREDIBILITY_ASSESSMENT_REASONING_TEMPLATE,
     SELF_CRITIQUE_TEMPLATE,
 )
-from model import load_unsloth_model, load_finetuned_model, build_langchain_llm, is_grpo_adapter
+from model import load_base_model, load_finetuned_model, build_langchain_llm, is_grpo_adapter
 from search import FactCheckSearcher
 from claim_parser import classify_claim, format_verification_hints
 
@@ -91,9 +91,7 @@ class FactCheckPipeline:
             model, tokenizer = load_finetuned_model(adapter_path, model_config)
         else:
             print("Загрузка base модели...")
-            model, tokenizer = load_unsloth_model(model_config)
-            from unsloth import FastLanguageModel
-            FastLanguageModel.for_inference(model)
+            model, tokenizer = load_base_model(model_config)
 
         # Три LLM-wrapper с разными max_new_tokens
         self.keyword_llm = build_langchain_llm(
