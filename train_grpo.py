@@ -612,8 +612,9 @@ def train_grpo(
         use_vllm=False,
     )
 
-    # 3-часовой лимит (10800 сек) — callback корректно остановит и сохранит
-    time_limit_cb = TimeLimitCallback(max_seconds=10800)
+    # Safety-net: 10 часов (36000 сек) — только защита от зависания.
+    # Реальный ограничитель — max_steps. Качество модели важнее скорости.
+    time_limit_cb = TimeLimitCallback(max_seconds=36000)
 
     trainer = GRPOTrainer(
         model=model,
