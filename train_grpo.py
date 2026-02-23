@@ -516,10 +516,16 @@ def train_grpo(
 
     setup_cuda()
 
-    # ИСПРАВЛЕНИЕ: КРИТИЧЕСКИ ВАЖНО импортировать PatchFastRL ДО импорта TRL
-    from unsloth import FastLanguageModel, PatchFastRL
-    PatchFastRL("GRPO", FastLanguageModel)
-    
+    # ВАЖНО: PatchFastRL должен быть вызван ДО импорта TRL.
+    # В Unsloth 2026.2.1 функцию убрали, потом вернули — оборачиваем в try/except.
+    from unsloth import FastLanguageModel
+    try:
+        from unsloth import PatchFastRL
+        PatchFastRL("GRPO", FastLanguageModel)
+        print("  PatchFastRL применён (gradient_checkpointing управляется Unsloth)")
+    except (ImportError, AttributeError):
+        print("  PatchFastRL недоступен в этой версии Unsloth — используем gradient_checkpointing=False")
+
     from trl import GRPOConfig, GRPOTrainer
 
     model_config = ModelConfig()
