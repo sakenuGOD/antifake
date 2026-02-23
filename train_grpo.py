@@ -530,6 +530,12 @@ def train_grpo(
             attn_implementation="sdpa",
             dtype=torch.bfloat16,
         )
+        # enable_input_require_grads ПЕРЕД загрузкой адаптера —
+        # без этого gradient_checkpointing не получает grad-enabled inputs
+        for param in model.parameters():
+            param.requires_grad = False
+        model.enable_input_require_grads()
+
         model = PeftModel.from_pretrained(model, adapter_path, is_trainable=True)
         tokenizer = AutoTokenizer.from_pretrained(adapter_path)
         print("  SFT адаптер загружен")
