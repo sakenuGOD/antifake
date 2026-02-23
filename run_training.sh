@@ -25,7 +25,7 @@ python train.py --dataset data/train_russian.jsonl --epochs 4
 # 3. GRPO обучение — 300 шагов с 6 reward-функциями (~50 мин)
 echo ""
 echo "[3/3] GRPO обучение (300 шагов, 6 reward-функций)..."
-python train_grpo.py --dataset data/train_russian.jsonl --steps 300 --generations 2
+python train_grpo.py --dataset data/train_russian.jsonl --steps 300 --generations 2 --load-adapter adapters/fact_checker_lora
 
 END=$(date +%s)
 ELAPSED=$(( (END - START) / 60 ))
