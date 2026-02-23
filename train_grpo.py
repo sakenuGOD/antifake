@@ -567,7 +567,7 @@ def train_grpo(
 
     setup_cuda()
 
-    from unsloth import FastLanguageModel
+    from unsloth import FastLanguageModel, PatchFastRL
     from trl import GRPOConfig, GRPOTrainer
 
     model_config = ModelConfig()
@@ -616,6 +616,13 @@ def train_grpo(
             random_state=lora_config.random_state,
         )
 
+    # Патч для RL-совместимости (обязателен для GRPO с Unsloth)
+    model = PatchFastRL(
+        model,
+        FastLanguageModel=FastLanguageModel,
+        algorithm="grpo",
+    )
+
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"  Обучаемых: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
@@ -627,14 +634,23 @@ def train_grpo(
     # 4. GRPO Training
     print(f"[4/4] Запуск GRPO (steps={max_steps}, generations={num_generations})...")
 
+    # Убеждаемся, что pad_token установлен
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # GRPO требует left-padding для генерации
+
+    # max_prompt_length + max_completion_length <= max_seq_length
+    max_prompt_len = model_config.max_seq_length // 2
+    max_completion_len = model_config.max_seq_length - max_prompt_len
+
     training_args = GRPOConfig(
         output_dir=output_dir,
         learning_rate=5e-6,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         num_generations=num_generations,
-        max_prompt_length=512,
-        max_completion_length=512,
+        max_prompt_length=max_prompt_len,
+        max_completion_length=max_completion_len,
         max_steps=max_steps,
         save_steps=100,
         logging_steps=1,
