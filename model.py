@@ -1,11 +1,12 @@
-"""Загрузка модели (base / fine-tuned) через Unsloth (train) / transformers (inference).
+"""Загрузка модели (base / fine-tuned) через transformers + bitsandbytes.
 
 Поддерживает:
-  - Base модель (Unsloth) — для обучения
+  - Base модель (4-bit NF4) — для обучения и inference
   - SFT адаптеры — для inference после SFT
-  - GRPO адаптеры — для inference после SFT + GRPO (2-этапная загрузка)
+  - GRPO адаптеры — для inference после GRPO
 
 RTX 5070 (Blackwell sm_120): используем SDPA вместо Triton-based flash attention.
+Unsloth удалён — его Triton-ядра вызывают segfault на sm_120.
 """
 
 import os
@@ -35,20 +36,46 @@ def is_grpo_adapter(adapter_path: str) -> bool:
     return adapter_path is not None and "grpo" in os.path.basename(adapter_path).lower()
 
 
-def load_unsloth_model(config: ModelConfig = None):
-    """Загрузка base-модели через Unsloth для обучения."""
+def load_base_model(config: ModelConfig = None):
+    """Загрузка base-модели через transformers + bitsandbytes (4-bit NF4).
+
+    Используется для inference без адаптеров. Для обучения используется train_grpo.py.
+    """
     if config is None:
         config = ModelConfig()
 
-    from unsloth import FastLanguageModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=config.base_model_name,
-        max_seq_length=config.max_seq_length,
-        dtype=config.dtype,
-        load_in_4bit=config.load_in_4bit,
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
     )
+
+    print(f"  Загрузка base модели: {config.inference_model_name}")
+    model = AutoModelForCausalLM.from_pretrained(
+        config.inference_model_name,
+        quantization_config=bnb_config,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+    )
+    tokenizer = AutoTokenizer.from_pretrained(config.inference_model_name)
+
+    model.eval()
     return model, tokenizer
+
+
+# Обратная совместимость — pipeline.py импортирует load_unsloth_model
+load_unsloth_model = load_base_model
 
 
 def load_finetuned_model(adapter_path: str, config: ModelConfig = None):
