@@ -30,7 +30,6 @@ import json
 import os
 import platform
 import re
-import shutil
 
 if platform.system() == "Windows":
     os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
@@ -574,7 +573,7 @@ def train_grpo(
 
     use_fa2 = check_flash_attention()
 
-    # 1. Загрузка модели (base или base+SFT merged)
+    # 1. Загрузка модели (base или base+SFT)
     if load_adapter is not None:
         adapter_path = load_adapter
         if not os.path.isabs(adapter_path):
@@ -584,38 +583,20 @@ def train_grpo(
             print(f"  ОШИБКА: директория {adapter_path} не существует!")
             return None
 
-        print(f"\n[1/4] Загрузка SFT-адаптера из {adapter_path} (merge → base)...")
-
-        # FIX: merge_and_unload() в памяти ломает внутренние хуки Unsloth,
-        # что приводит к segfault при генерации в GRPO (issue #3069, #1877).
-        # Решение: сохраняем merged модель на диск и загружаем заново.
-        sft_model, sft_tokenizer = FastLanguageModel.from_pretrained(
+        # FIX: merge_and_unload() ломает внутренние хуки Unsloth и вызывает
+        # segfault при генерации в GRPO (issue #3069, #1877).
+        # Решение: загружаем SFT-адаптер как есть, GRPO дообучает
+        # существующие LoRA-веса напрямую (без merge, без нового get_peft_model).
+        print(f"\n[1/4] Загрузка SFT-адаптера из {adapter_path}...")
+        model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=adapter_path,
             max_seq_length=grpo_max_seq_length,
             dtype=model_config.dtype,
             load_in_4bit=True,
             attn_implementation="flash_attention_2" if use_fa2 else None,
         )
-
-        temp_merged_dir = os.path.join(PROJECT_ROOT, "adapters", "_sft_merged_temp")
-        print("  Сохранение merged SFT модели на диск...")
-        sft_model.save_pretrained_merged(
-            temp_merged_dir, sft_tokenizer, save_method="merged_16bit",
-        )
-        del sft_model, sft_tokenizer
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        print("  Загрузка merged модели как fresh Unsloth model...")
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=temp_merged_dir,
-            max_seq_length=grpo_max_seq_length,
-            dtype=model_config.dtype,
-            load_in_4bit=True,
-            attn_implementation="flash_attention_2" if use_fa2 else None,
-        )
-        shutil.rmtree(temp_merged_dir, ignore_errors=True)
-        print("  SFT веса вмержены в base model")
+        print("  SFT адаптер загружен, GRPO дообучит LoRA веса")
+        print("[2/4] Используются существующие LoRA из SFT-адаптера")
     else:
         print("\n[1/4] Загрузка базовой модели...")
         model, tokenizer = FastLanguageModel.from_pretrained(
@@ -627,21 +608,21 @@ def train_grpo(
         )
         print("  Инициализация с нуля (без SFT-адаптера)")
 
-    # 2. Свежие LoRA адаптеры для GRPO (dropout=0 — обязательно для Unsloth fast patching)
-    print("[2/4] Настройка LoRA...")
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=3407,
-    )
+        # Свежие LoRA адаптеры (только при загрузке с нуля)
+        print("[2/4] Настройка LoRA...")
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=3407,
+        )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())

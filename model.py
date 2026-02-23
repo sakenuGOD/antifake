@@ -97,22 +97,11 @@ def load_finetuned_model(adapter_path: str, config: ModelConfig = None):
     )
     tokenizer = AutoTokenizer.from_pretrained(config.inference_model_name)
 
-    # GRPO адаптеры: двухэтапная загрузка (SFT → merge → GRPO → merge)
-    if is_grpo_adapter(adapter_path):
-        sft_path = os.path.join(PROJECT_ROOT, "adapters", "fact_checker_lora")
-        if os.path.exists(sft_path):
-            print(f"  Этап 1: Применение SFT адаптеров из {sft_path}")
-            model = PeftModel.from_pretrained(model, sft_path)
-            model = model.merge_and_unload()
-
-        print(f"  Этап 2: Применение GRPO адаптеров из {adapter_path}")
-        model = PeftModel.from_pretrained(model, adapter_path)
-        model = model.merge_and_unload()
-    else:
-        # SFT адаптеры: одноэтапная загрузка
-        print(f"  Применение адаптеров из {adapter_path}")
-        model = PeftModel.from_pretrained(model, adapter_path)
-        model = model.merge_and_unload()
+    # GRPO адаптеры уже содержат SFT-веса (GRPO дообучает SFT LoRA напрямую),
+    # поэтому загрузка одноэтапная — как и для SFT адаптеров.
+    print(f"  Применение адаптеров из {adapter_path}")
+    model = PeftModel.from_pretrained(model, adapter_path)
+    model = model.merge_and_unload()
 
     model.eval()
     return model, tokenizer
