@@ -21,19 +21,30 @@ Reward-функции (6 штук):
 Использование:
     python train_grpo.py
     python train_grpo.py --dataset data/train_russian.jsonl --steps 300 --generations 2
+    python train_grpo.py --load-adapter adapters/fact_checker_lora
 """
 
 import argparse
 import json
 import os
+import platform
 import re
+
+if platform.system() == "Windows":
+    os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+    os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+
 import torch
 
+if platform.system() == "Windows":
+    try:
+        torch._dynamo.config.disable = True
+    except AttributeError:
+        pass
+
 from claim_parser import extract_numbers, extract_dates
-from config import ModelConfig, LoraConfig, PROJECT_ROOT
+from config import ModelConfig, PROJECT_ROOT
 
-
-# ===== СИСТЕМА ПРОМПТОВ =====
 
 SYSTEM_PROMPT = """\
 Ты — эксперт по проверке фактов. Проанализируй утверждение и источники.
@@ -59,14 +70,11 @@ SYSTEM_PROMPT = """\
 """
 
 
-# ===== ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ =====
-
 def _extract_contents(completions: list) -> list:
     """Извлечение текста из completions.
 
     TRL GRPOTrainer передаёт completions в conversational формате:
     list[list[dict]] — каждый completion = [{"role": "assistant", "content": "..."}]
-    Эта функция извлекает content из каждого completion.
     """
     contents = []
     for completion in completions:
@@ -87,7 +95,6 @@ def format_reward(completions: list, **kwargs) -> list:
     +1.0 за <reasoning>...</reasoning>
     +1.0 за <answer>...</answer>
     -0.5 за дублирующиеся теги (галлюцинация)
-    Нормализовано к [-1, +1]
     """
     contents = _extract_contents(completions)
     scores = []
@@ -104,7 +111,6 @@ def format_reward(completions: list, **kwargs) -> list:
         if has_a_open and has_a_close:
             score += 0.5
 
-        # Штраф за множественные теги
         if text.count("<reasoning>") > 1:
             score -= 0.5
         if text.count("<answer>") > 1:
@@ -119,7 +125,6 @@ def reasoning_quality_reward(completions: list, **kwargs) -> list:
 
     Оценивает: длину, наличие шагов, ссылки на источники, адвокат дьявола.
     Штрафует: шаблонные фразы из синтетических данных.
-    Нормализовано к [-1, +1]
     """
     contents = _extract_contents(completions)
     scores = []
@@ -136,13 +141,11 @@ def reasoning_quality_reward(completions: list, **kwargs) -> list:
         reasoning = reasoning_match.group(1)
         word_count = len(reasoning.split())
 
-        # 1. Длина (оптимум 50-500 слов)
         if 50 <= word_count <= 500:
             score += 0.5
         elif word_count < 20:
             score -= 0.5
 
-        # 2. Наличие шагов анализа
         step_keywords = [
             ("шаг 1", "источник", "анализ", "идентификац"),
             ("шаг 2", "цитат", "доказательств", "факт"),
@@ -153,14 +156,12 @@ def reasoning_quality_reward(completions: list, **kwargs) -> list:
             if any(kw in reasoning.lower() for kw in step_group):
                 score += 0.3
 
-        # 3. Конкретные ссылки на источники
         source_refs = re.findall(
             r"источник\s*\d|по данным|сообщает|согласно|цитата",
             reasoning.lower(),
         )
         score += min(len(source_refs) * 0.2, 1.0)
 
-        # 4. Бонус за адвоката дьявола (аргументы ПРОТИВ)
         devil_keywords = [
             "адвокат дьявола", "против моего вердикта",
             "что если", "а если", "может ли",
@@ -169,7 +170,6 @@ def reasoning_quality_reward(completions: list, **kwargs) -> list:
         if any(kw in reasoning.lower() for kw in devil_keywords):
             score += 0.5
 
-        # 5. Бонус за конкретные сравнения (не абстрактные)
         comparison_keywords = [
             "совпадает", "не совпадает", "расходится",
             "подтверждает", "противоречит",
@@ -181,7 +181,6 @@ def reasoning_quality_reward(completions: list, **kwargs) -> list:
         )
         score += min(comparison_count * 0.15, 0.6)
 
-        # 6. Штраф за шаблонные фразы (из синтетических данных)
         template_phrases = [
             "множественные источники подтвердили",
             "стилистика нейтральна",
@@ -194,7 +193,6 @@ def reasoning_quality_reward(completions: list, **kwargs) -> list:
             if phrase in reasoning.lower():
                 score -= 0.3
 
-        # Нормализация к [-1, +1]
         scores.append(max(-1.0, min(1.0, score)))
     return scores
 
@@ -230,7 +228,6 @@ def verdict_consistency_reward(completions: list, **kwargs) -> list:
         cred_score = int(score_match.group(1))
         verdict = verdict_match.group(1).upper().strip()
 
-        # Проверка консистентности
         if verdict == "ПРАВДА" and 70 <= cred_score <= 100:
             score += 1.0
         elif verdict == "ЛОЖЬ" and 0 <= cred_score <= 29:
@@ -238,9 +235,8 @@ def verdict_consistency_reward(completions: list, **kwargs) -> list:
         elif "НЕ ПОДТВЕРЖДЕНО" in verdict and 30 <= cred_score <= 69:
             score += 1.0
         else:
-            score -= 1.0  # Несоответствие
+            score -= 1.0
 
-        # Бонус за наличие обоснования
         if "ОБОСНОВАНИЕ:" in answer:
             reasoning_text = answer.split("ОБОСНОВАНИЕ:")[1]
             if len(reasoning_text.split()) > 15:
@@ -256,9 +252,8 @@ def correctness_reward(completions: list, **kwargs) -> list:
     +1.0 за точное совпадение вердикта
     -1.0 за неверный вердикт
     -0.2 за НЕ ПОДТВЕРЖДЕНО когда ответ известен (мягкий штраф)
-    Нормализовано к [-1, +1]
 
-    ВАЖНО: GRPOTrainer генерирует num_generations completions на КАЖДЫЙ промпт,
+    GRPOTrainer генерирует num_generations completions на каждый промпт,
     но expected_verdict — одно значение на промпт. Реплицируем expected_verdict.
     """
     expected_verdicts = kwargs.get("expected_verdict", [])
@@ -267,9 +262,6 @@ def correctness_reward(completions: list, **kwargs) -> list:
 
     contents = _extract_contents(completions)
 
-    # GRPOTrainer: len(completions) = batch_size * num_generations
-    # expected_verdicts: len = batch_size
-    # Нужно реплицировать каждый expected_verdict на num_generations
     if len(expected_verdicts) > 0 and len(contents) > len(expected_verdicts):
         num_gen = len(contents) // len(expected_verdicts)
         expanded_verdicts = []
@@ -309,12 +301,9 @@ def correctness_reward(completions: list, **kwargs) -> list:
 def devils_advocate_reward(completions: list, **kwargs) -> list:
     """Reward за наличие «адвоката дьявола» — аргументов ПРОТИВ своего вердикта.
 
-    Учим модель не просто давать ответ, а критически анализировать собственные выводы.
-
     +0.5 за наличие контраргументов в reasoning
     +0.5 за явное отклонение контраргументов с обоснованием
     -0.5 за reasoning без самокритики
-    Нормализовано к [-1, +1]
     """
     contents = _extract_contents(completions)
     scores = []
@@ -329,7 +318,6 @@ def devils_advocate_reward(completions: list, **kwargs) -> list:
         reasoning = reasoning_match.group(1).lower()
         score = 0.0
 
-        # Наличие контраргументов
         contra_keywords = [
             "адвокат дьявола", "против моего вердикта",
             "что если", "а если", "может ли",
@@ -344,7 +332,6 @@ def devils_advocate_reward(completions: list, **kwargs) -> list:
         elif has_contra == 1:
             score += 0.25
 
-        # Отклонение контраргументов с обоснованием
         rejection_keywords = [
             "нет —", "нет,", "маловероятно",
             "проверил", "проверено",
@@ -354,7 +341,6 @@ def devils_advocate_reward(completions: list, **kwargs) -> list:
         if has_contra > 0 and has_rejection:
             score += 0.5
 
-        # Штраф за отсутствие самокритики
         if has_contra == 0:
             score -= 0.5
 
@@ -367,20 +353,11 @@ def numerical_accuracy_reward(completions: list, **kwargs) -> list:
 
     Извлекает числа/даты из промпта (утверждение), затем проверяет,
     что модель явно упоминает и сравнивает их в reasoning.
-
-    +0.4 за каждое число из утверждения, упомянутое в reasoning (max +0.8)
-    +0.3 за явное сравнение чисел ("совпадает"/"не совпадает"/"расходится")
-    +0.3 за упоминание дат из утверждения в reasoning
-    -0.5 если в утверждении есть числа, но reasoning их игнорирует
-    -0.3 если в утверждении есть даты, но reasoning их игнорирует
-    Нормализовано к [-1, +1]
     """
     contents = _extract_contents(completions)
 
-    # Извлекаем промпты для получения чисел/дат из утверждений
     prompts = kwargs.get("prompts", [])
 
-    # Реплицируем промпты на num_generations (как в correctness_reward)
     if len(prompts) > 0 and len(contents) > len(prompts):
         num_gen = len(contents) // len(prompts)
         expanded_prompts = []
@@ -388,7 +365,6 @@ def numerical_accuracy_reward(completions: list, **kwargs) -> list:
             expanded_prompts.extend([p] * num_gen)
         prompts = expanded_prompts
 
-    # Если промпты недоступны — нейтральный reward
     if not prompts:
         return [0.0] * len(contents)
 
@@ -396,7 +372,6 @@ def numerical_accuracy_reward(completions: list, **kwargs) -> list:
     for text, prompt in zip(contents, prompts):
         score = 0.0
 
-        # Извлекаем текст промпта
         if isinstance(prompt, list):
             prompt_text = " ".join(
                 msg.get("content", "") for msg in prompt if isinstance(msg, dict)
@@ -404,32 +379,26 @@ def numerical_accuracy_reward(completions: list, **kwargs) -> list:
         else:
             prompt_text = str(prompt)
 
-        # Извлекаем числа и даты из утверждения
         claim_numbers = extract_numbers(prompt_text)
         claim_dates = extract_dates(prompt_text)
 
-        # Если нет чисел и дат — нейтральный reward
         if not claim_numbers and not claim_dates:
             scores.append(0.0)
             continue
 
-        # Извлекаем reasoning
         reasoning_match = re.search(
             r"<reasoning>(.*?)</reasoning>", text, re.DOTALL
         )
         if not reasoning_match:
-            # Нет reasoning при наличии чисел/дат = штраф
             scores.append(-0.5)
             continue
 
         reasoning = reasoning_match.group(1)
         reasoning_lower = reasoning.lower()
 
-        # --- Проверка чисел ---
         if claim_numbers:
             mentioned_count = 0
             for num in claim_numbers:
-                # Проверяем упоминание числа в reasoning (raw или value)
                 raw = num["raw"]
                 if raw in reasoning or str(int(num["value"])) in reasoning:
                     mentioned_count += 1
@@ -437,9 +406,8 @@ def numerical_accuracy_reward(completions: list, **kwargs) -> list:
             if mentioned_count > 0:
                 score += min(mentioned_count * 0.4, 0.8)
             else:
-                score -= 0.5  # Числа есть, но reasoning их игнорирует
+                score -= 0.5
 
-            # Бонус за явное сравнение чисел
             comparison_patterns = [
                 r"совпада\w*", r"не совпада\w*", r"расходи\w*",
                 r"отличает\w*", r"соответств\w*", r"не соответств\w*",
@@ -452,7 +420,6 @@ def numerical_accuracy_reward(completions: list, **kwargs) -> list:
             if has_comparison:
                 score += 0.3
 
-        # --- Проверка дат ---
         if claim_dates:
             date_mentioned = False
             for date in claim_dates:
@@ -465,9 +432,8 @@ def numerical_accuracy_reward(completions: list, **kwargs) -> list:
             if date_mentioned:
                 score += 0.3
             else:
-                score -= 0.3  # Даты есть, но reasoning их игнорирует
+                score -= 0.3
 
-            # Бонус за сравнение дат
             date_comparison = [
                 r"в \d{4}.*а не в \d{4}",
                 r"год[уае]?\s+(?:совпада|не совпада|расходи)",
@@ -505,7 +471,6 @@ def prepare_grpo_dataset(jsonl_path: str):
             human_msg = convos[0].get("value", "")
             gpt_msg = convos[1].get("value", "")
 
-            # Извлекаем ожидаемый вердикт
             verdict_match = re.search(r"ВЕРДИКТ:\s*(.+?)(?:\n|$)", gpt_msg)
             expected = verdict_match.group(1).strip() if verdict_match else "НЕ ПОДТВЕРЖДЕНО"
 
@@ -522,6 +487,27 @@ def prepare_grpo_dataset(jsonl_path: str):
 
 
 # ===== ОБУЧЕНИЕ =====
+
+def check_flash_attention():
+    """Проверка доступности Flash Attention 2.
+    Возвращает True если FA2 доступен и может быть использован.
+    """
+    if not torch.cuda.is_available():
+        return False
+
+    capability = torch.cuda.get_device_capability(0)
+    if capability[0] < 8:
+        print(f"  Flash Attention 2 требует SM >= 80, текущая: SM {capability[0]}{capability[1]}")
+        return False
+
+    try:
+        import flash_attn  # noqa: F401
+        print(f"  Flash Attention 2 доступен (v{flash_attn.__version__})")
+        return True
+    except ImportError:
+        print("  Flash Attention 2 не установлен (pip install flash-attn)")
+        return False
+
 
 def setup_cuda():
     """CUDA оптимизации."""
@@ -540,7 +526,6 @@ def setup_cuda():
         "PYTORCH_CUDA_ALLOC_CONF",
         "expandable_segments:True,max_split_size_mb:128",
     )
-    # Blackwell (sm_120): flash SDP не поддерживается нативно, используем mem_efficient
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(True)
@@ -553,6 +538,7 @@ def train_grpo(
     output_dir: str = None,
     max_steps: int = 500,
     num_generations: int = 2,
+    load_adapter: str = None,
 ):
     """Запуск GRPO обучения для reasoning.
 
@@ -561,6 +547,9 @@ def train_grpo(
         output_dir: Директория для сохранения адаптеров
         max_steps: Количество шагов обучения
         num_generations: Сколько вариантов генерировать на пример (2 для 12GB VRAM)
+        load_adapter: Путь к SFT-адаптеру для инициализации весов (опционально).
+                      Адаптер загружается через PEFT API, мержится в base model,
+                      затем накладывается свежая LoRA (dropout=0) для GRPO.
 
     ВАЖНО: max_seq_length при загрузке модели ДОЛЖЕН совпадать с
     max_prompt_length + max_completion_length (требование Unsloth).
@@ -576,88 +565,85 @@ def train_grpo(
     from trl import GRPOConfig, GRPOTrainer
 
     model_config = ModelConfig()
-    lora_config = LoraConfig()
 
-    # Unsloth GRPO требует: max_seq_length == max_prompt_length + max_completion_length
-    # Иначе attention_mask получает неверную размерность (4D вместо 2D)
-    # и LlamaModel_fast_forward падает с tensor size mismatch.
-    max_prompt_len = 512   # SYSTEM_PROMPT ~300-400 токенов + user msg ~100-150
-    max_completion_len = 512  # reasoning + answer ~300-500 токенов
+    max_prompt_len = 512
+    max_completion_len = 512
     grpo_max_seq_length = max_prompt_len + max_completion_len  # 1024
 
-    # 1. Загрузка базовой модели (всегда base, не адаптеры!)
-    # GRPO требует правильные Unsloth-патчи через get_peft_model.
-    # Если загружать SFT адаптеры напрямую, Unsloth не патчит модель для RL
-    # и получаем tensor size mismatch в LlamaModel_fast_forward.
-    print("\n[1/4] Загрузка базовой модели...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_config.base_model_name,
-        max_seq_length=grpo_max_seq_length,
-        dtype=model_config.dtype,
-        load_in_4bit=True,
-    )
+    use_fa2 = check_flash_attention()
 
-    # 2. LoRA адаптеры (всегда через get_peft_model для корректных RL-патчей)
+    # 1. Загрузка модели (base или base+SFT merged)
+    if load_adapter is not None:
+        adapter_path = load_adapter
+        if not os.path.isabs(adapter_path):
+            adapter_path = os.path.join(PROJECT_ROOT, adapter_path)
+
+        if not os.path.exists(adapter_path):
+            print(f"  ОШИБКА: директория {adapter_path} не существует!")
+            return None
+
+        print(f"\n[1/4] Загрузка SFT-адаптера из {adapter_path} (merge → base)...")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=adapter_path,
+            max_seq_length=grpo_max_seq_length,
+            dtype=model_config.dtype,
+            load_in_4bit=True,
+            attn_implementation="flash_attention_2" if use_fa2 else None,
+        )
+
+        # Мержим SFT LoRA в base-веса и снимаем адаптер.
+        # После этого модель — чистый base + SFT-знания без LoRA-слоёв.
+        from peft import PeftModel
+        if isinstance(model, PeftModel):
+            model = model.merge_and_unload()
+            print("  SFT веса вмержены в base model")
+    else:
+        print("\n[1/4] Загрузка базовой модели...")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_config.base_model_name,
+            max_seq_length=grpo_max_seq_length,
+            dtype=model_config.dtype,
+            load_in_4bit=True,
+            attn_implementation="flash_attention_2" if use_fa2 else None,
+        )
+        print("  Инициализация с нуля (без SFT-адаптера)")
+
+    # 2. Свежие LoRA адаптеры для GRPO (dropout=0 — обязательно для Unsloth fast patching)
     print("[2/4] Настройка LoRA...")
     model = FastLanguageModel.get_peft_model(
         model,
-        r=lora_config.r,
-        lora_alpha=lora_config.lora_alpha,
-        lora_dropout=lora_config.lora_dropout,
-        target_modules=lora_config.target_modules,
-        bias=lora_config.bias,
-        use_gradient_checkpointing=lora_config.use_gradient_checkpointing,
-        random_state=lora_config.random_state,
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        bias="none",
+        use_gradient_checkpointing="unsloth",
+        random_state=3407,
     )
-
-    # Подгружаем SFT веса если есть (перезаписываем рандомные LoRA-веса обученными)
-    sft_adapter_path = os.path.join(PROJECT_ROOT, "adapters", "fact_checker_lora")
-    if os.path.exists(sft_adapter_path):
-        print(f"  Загружаю SFT веса из {sft_adapter_path}...")
-        sft_weights_file = os.path.join(sft_adapter_path, "adapter_model.safetensors")
-        if not os.path.exists(sft_weights_file):
-            sft_weights_file = os.path.join(sft_adapter_path, "adapter_model.bin")
-
-        if os.path.exists(sft_weights_file):
-            if sft_weights_file.endswith(".safetensors"):
-                from safetensors.torch import load_file
-                sft_weights = load_file(sft_weights_file)
-            else:
-                sft_weights = torch.load(sft_weights_file, map_location="cpu")
-            result = model.load_state_dict(sft_weights, strict=False)
-            print(f"  SFT веса загружены (пропущено: {len(result.missing_keys)}, лишних: {len(result.unexpected_keys)})")
-        else:
-            print("  ВНИМАНИЕ: файл весов не найден, начинаю с нуля")
-    else:
-        print("  SFT адаптеры не найдены, начинаю с base модели")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"  Обучаемых: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
-    # WORKAROUND: Unsloth LlamaModel_fast_forward ожидает 2D attention_mask [batch, seq],
-    # но transformers _update_causal_mask создаёт 4D маску [batch, 1, seq, seq],
-    # которая просачивается в forward и вызывает tensor size mismatch (4096 vs seq_len).
-    # Исправление: перехватываем forward внутренней модели (MistralModel) и
-    # конвертируем 4D маску обратно в 2D перед тем, как Unsloth её обработает.
+    # FIX: Unsloth fast_forward ожидает 2D attention_mask [batch, seq],
+    # но transformers >= 4.43 создаёт 4D маску [batch, 1, seq, seq].
     try:
-        _inner_model = model.base_model.model.model  # PeftModel→LoraModel→CausalLM→BaseModel
-        _orig_forward = _inner_model.forward
+        _inner_model = model.base_model.model.model
 
-        def _forward_fix_attn_mask(*args, **kwargs):
+        def _fix_mask_hook(module, args, kwargs):
             if "attention_mask" in kwargs and kwargs["attention_mask"] is not None:
                 mask = kwargs["attention_mask"]
                 if mask.dim() == 4:
-                    # 4D causal [batch, 1, tgt, src] → 2D padding [batch, src]
-                    # Последняя строка каузальной маски = полная padding-маска
-                    # 0.0 = attend, large_negative = mask → конвертируем в 1/0
                     kwargs = {**kwargs, "attention_mask": (mask[:, 0, -1, :] > -1.0).to(torch.long)}
-            return _orig_forward(*args, **kwargs)
+            return args, kwargs
 
-        _inner_model.forward = _forward_fix_attn_mask
-        print("  [fix] Workaround для 4D attention_mask установлен")
+        _inner_model.register_forward_pre_hook(_fix_mask_hook, with_kwargs=True)
+        print("  [fix] Pre-hook для 4D→2D attention_mask установлен")
     except AttributeError:
-        print("  [warn] Не удалось установить workaround для attention_mask")
+        print("  [warn] Не удалось установить hook для attention_mask")
 
     # 3. Датасет
     print(f"[3/4] Загрузка датасета из {dataset_path}...")
@@ -666,17 +652,18 @@ def train_grpo(
     # 4. GRPO Training
     print(f"[4/4] Запуск GRPO (steps={max_steps}, generations={num_generations})...")
 
-    # Убеждаемся, что pad_token установлен
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"  # GRPO требует left-padding для генерации
+    tokenizer.padding_side = "left"
 
     training_args = GRPOConfig(
         output_dir=output_dir,
         learning_rate=5e-6,
-        beta=0.0,  # Отключает KL-penalty и reference model → обходит баг Unsloth с 4D mask
+        beta=0.0,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         num_generations=num_generations,
         max_prompt_length=max_prompt_len,
         max_completion_length=max_completion_len,
@@ -696,6 +683,7 @@ def train_grpo(
 
     trainer = GRPOTrainer(
         model=model,
+        ref_model=None,
         processing_class=tokenizer,
         reward_funcs=[
             format_reward,
@@ -713,7 +701,6 @@ def train_grpo(
     trainer.train()
     print("=" * 60)
 
-    # Сохранение
     print(f"\nСохранение GRPO адаптеров в {output_dir}...")
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -742,6 +729,10 @@ def main():
         "--generations", type=int, default=2,
         help="Вариантов генерации на пример (по умолчанию: 2, для 12GB VRAM)",
     )
+    parser.add_argument(
+        "--load-adapter", type=str, default=None,
+        help="Путь к SFT-адаптеру для инициализации LoRA весов (по умолчанию: с нуля)",
+    )
     args = parser.parse_args()
 
     train_grpo(
@@ -749,6 +740,7 @@ def main():
         output_dir=args.output_dir,
         max_steps=args.steps,
         num_generations=args.generations,
+        load_adapter=args.load_adapter,
     )
 
 
