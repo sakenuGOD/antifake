@@ -512,7 +512,7 @@ def train_grpo(
     base_model_name = model_config.base_model_name
 
     max_prompt_len = 512
-    max_completion_len = 1024  # было 512, completions обрезались (clipped_ratio=1.0)
+    max_completion_len = 512  # баланс скорости и качества (1024 слишком медленно)
 
     if load_adapter is not None:
         adapter_path = load_adapter
@@ -587,8 +587,11 @@ def train_grpo(
 
     training_args = GRPOConfig(
         output_dir=output_dir,
-        learning_rate=5e-6,
-        beta=0.04,  # KL penalty для стабильности (было 0.0)
+        # === Оптимизированные гиперпараметры ===
+        learning_rate=1e-5,           # агрессивнее (SFT фундамент позволяет)
+        beta=0.04,                    # KL penalty — не забыть SFT знания
+        loss_type="dr_grpo",          # Dr. GRPO: token-efficient loss
+        num_iterations=2,             # 2 gradient update на 1 генерацию = 2x обучения бесплатно
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         gradient_checkpointing=True,
@@ -597,16 +600,16 @@ def train_grpo(
         max_prompt_length=max_prompt_len,
         max_completion_length=max_completion_len,
         max_steps=max_steps,
-        save_steps=8,  # ~16 мин при ~2 мин/шаг — частые чекпоинты
-        save_total_limit=5,  # хранить последние 5 чекпоинтов
+        save_steps=10,                # чекпоинт каждые ~20 мин
+        save_total_limit=5,
         logging_steps=1,
-        warmup_ratio=0.1,
+        warmup_ratio=0.03,            # короткий warmup (SFT модель уже прогрета)
         lr_scheduler_type="cosine",
         optim="adamw_8bit",
-        weight_decay=0.1,
-        max_grad_norm=0.1,
-        temperature=0.9,
-        bf16=False,  # native bfloat16 вместо mixed precision (иначе Accelerator кастует lm_head в float32)
+        weight_decay=0.05,
+        max_grad_norm=0.3,            # менее жёсткий клиппинг
+        temperature=1.0,              # разнообразие генераций для GRPO exploration
+        bf16=False,                   # native bfloat16 (Accelerator dtype fix)
         report_to="none",
         log_completions=True,
         use_vllm=False,
