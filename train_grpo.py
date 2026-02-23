@@ -550,7 +550,7 @@ def train_grpo(
     dataset_path: str = None,
     output_dir: str = None,
     max_steps: int = 500,
-    num_generations: int = 4,
+    num_generations: int = 2,
 ):
     """Запуск GRPO обучения для reasoning.
 
@@ -617,11 +617,7 @@ def train_grpo(
         )
 
     # Патч для RL-совместимости (обязателен для GRPO с Unsloth)
-    model = PatchFastRL(
-        model,
-        FastLanguageModel=FastLanguageModel,
-        algorithm="grpo",
-    )
+    model = PatchFastRL(model, algorithm="grpo")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -639,9 +635,9 @@ def train_grpo(
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # GRPO требует left-padding для генерации
 
-    # max_prompt_length + max_completion_length <= max_seq_length
-    max_prompt_len = model_config.max_seq_length // 2
-    max_completion_len = model_config.max_seq_length - max_prompt_len
+    # Безопасные значения для RTX 5070 12GB (короче = меньше VRAM)
+    max_prompt_len = 256
+    max_completion_len = 512
 
     training_args = GRPOConfig(
         output_dir=output_dir,
@@ -708,8 +704,8 @@ def main():
         help="Количество шагов обучения (по умолчанию: 500)",
     )
     parser.add_argument(
-        "--generations", type=int, default=4,
-        help="Вариантов генерации на пример (по умолчанию: 4, уменьши если OOM)",
+        "--generations", type=int, default=2,
+        help="Вариантов генерации на пример (по умолчанию: 2, для 12GB VRAM)",
     )
     args = parser.parse_args()
 

@@ -2,7 +2,7 @@
 chcp 65001 >nul
 echo ============================================
 echo  FACT-CHECKER: Полный цикл обучения
-echo  Русский язык, SFT + GRPO (~1.5 часа)
+echo  Русский язык, SFT + GRPO
 echo  RTX 5070 (12GB, Blackwell, bf16, CUDA 12.8)
 echo ============================================
 echo.
@@ -74,33 +74,39 @@ echo.
 
 :: ============================================
 :: ЭТАП 1: ГЕНЕРАЦИЯ РУССКОГО ДАТАСЕТА
-:: 2500 примеров, все с <reasoning> тегами
-:: 35%% ПРАВДА + 35%% ЛОЖЬ + 30%% НЕ ПОДТВЕРЖДЕНО
+:: Пропускается если данные уже существуют
 :: ============================================
-echo ============================================
-echo [1/3] Генерация русского датасета (2500 примеров с reasoning)...
-echo ============================================
-python generate_russian_data.py --limit 2500 -o data/train_russian.jsonl
-if errorlevel 1 (
-    echo ОШИБКА: Генерация данных не удалась!
-    pause
-    exit /b 1
+if exist "data\train_russian.jsonl" (
+    echo [1/3] Датасет data\train_russian.jsonl уже существует, пропускаю генерацию.
+) else (
+    echo ============================================
+    echo [1/3] Генерация русского датасета (2500 примеров с reasoning^)...
+    echo ============================================
+    python generate_russian_data.py --limit 2500 -o data/train_russian.jsonl
+    if errorlevel 1 (
+        echo ОШИБКА: Генерация данных не удалась!
+        pause
+        exit /b 1
+    )
 )
 echo.
 
 :: ============================================
 :: ЭТАП 2: SFT ОБУЧЕНИЕ
-:: 4 эпохи, LoRA r=16, bf16, train_on_responses_only
-:: Резюмирует с существующих адаптеров если есть
+:: Пропускается если адаптеры уже обучены
 :: ============================================
-echo ============================================
-echo [2/3] SFT обучение (4 эпохи, reasoning данные)...
-echo ============================================
-python train.py --dataset data/train_russian.jsonl --epochs 4
-if errorlevel 1 (
-    echo ОШИБКА: SFT обучение не удалось!
-    pause
-    exit /b 1
+if exist "adapters\fact_checker_lora\adapter_config.json" (
+    echo [2/3] SFT адаптеры уже обучены в adapters\fact_checker_lora, пропускаю SFT.
+) else (
+    echo ============================================
+    echo [2/3] SFT обучение (4 эпохи, reasoning данные^)...
+    echo ============================================
+    python train.py --dataset data/train_russian.jsonl --epochs 4
+    if errorlevel 1 (
+        echo ОШИБКА: SFT обучение не удалось!
+        pause
+        exit /b 1
+    )
 )
 echo.
 
@@ -110,7 +116,7 @@ echo.
 :: Учит модель рассуждать качественно
 :: ============================================
 echo ============================================
-echo [3/3] GRPO обучение (300 шагов, reasoning rewards)...
+echo [3/3] GRPO обучение (300 шагов, reasoning rewards^)...
 echo ============================================
 python train_grpo.py --dataset data/train_russian.jsonl --steps 300 --generations 2
 if errorlevel 1 (
