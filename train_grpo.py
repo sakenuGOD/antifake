@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import time
 
 # ============================================================
 # Blackwell (sm_120) fix: Unsloth Triton kernels segfault
@@ -26,7 +27,7 @@ import sys
 # ============================================================
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftModel
 
 from claim_parser import extract_numbers, extract_dates
@@ -430,6 +431,36 @@ def prepare_grpo_dataset(jsonl_path: str):
     return Dataset.from_list(data)
 
 
+# ===== CALLBACKS =====
+
+class TimeLimitCallback(TrainerCallback):
+    """Остановка обучения по таймеру. Сохраняет чекпоинт перед выходом."""
+
+    def __init__(self, max_seconds: int = 10800):
+        self.max_seconds = max_seconds
+        self.start_time = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.start_time = time.time()
+        hours = self.max_seconds / 3600
+        print(f"  [TimeLimitCallback] Лимит: {hours:.1f} ч ({self.max_seconds} сек)")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        elapsed = time.time() - self.start_time
+        if elapsed >= self.max_seconds:
+            print(f"\n  [TimeLimitCallback] Лимит времени достигнут "
+                  f"({elapsed/3600:.1f} ч). Сохраняю и завершаю...")
+            control.should_save = True
+            control.should_training_stop = True
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if self.start_time and logs:
+            elapsed = time.time() - self.start_time
+            remaining = self.max_seconds - elapsed
+            logs["time_elapsed_min"] = round(elapsed / 60, 1)
+            logs["time_remaining_min"] = round(remaining / 60, 1)
+
+
 # ===== ОБУЧЕНИЕ =====
 
 def setup_cuda():
@@ -481,7 +512,7 @@ def train_grpo(
     base_model_name = model_config.base_model_name
 
     max_prompt_len = 512
-    max_completion_len = 512
+    max_completion_len = 1024  # было 512, completions обрезались (clipped_ratio=1.0)
 
     if load_adapter is not None:
         adapter_path = load_adapter
@@ -557,7 +588,7 @@ def train_grpo(
     training_args = GRPOConfig(
         output_dir=output_dir,
         learning_rate=5e-6,
-        beta=0.0,
+        beta=0.04,  # KL penalty для стабильности (было 0.0)
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         gradient_checkpointing=True,
@@ -566,7 +597,8 @@ def train_grpo(
         max_prompt_length=max_prompt_len,
         max_completion_length=max_completion_len,
         max_steps=max_steps,
-        save_steps=100,
+        save_steps=8,  # ~16 мин при ~2 мин/шаг — частые чекпоинты
+        save_total_limit=5,  # хранить последние 5 чекпоинтов
         logging_steps=1,
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
@@ -579,6 +611,9 @@ def train_grpo(
         log_completions=True,
         use_vllm=False,
     )
+
+    # 3-часовой лимит (10800 сек) — callback корректно остановит и сохранит
+    time_limit_cb = TimeLimitCallback(max_seconds=10800)
 
     trainer = GRPOTrainer(
         model=model,
@@ -593,6 +628,7 @@ def train_grpo(
         ],
         args=training_args,
         train_dataset=dataset,
+        callbacks=[time_limit_cb],
     )
 
     # Страховка: оборачиваем generate() в autocast для совместимости dtype
@@ -606,14 +642,32 @@ def train_grpo(
     trainer._generate_single_turn = _patched_generate
 
     print("\n" + "=" * 60)
-    trainer.train()
+    train_result = trainer.train()
     print("=" * 60)
+
+    # Финальные метрики
+    metrics = train_result.metrics
+    elapsed_min = metrics.get("train_runtime", 0) / 60
+    steps_done = metrics.get("train_steps", max_steps)
+    print(f"\n--- Итоги обучения ---")
+    print(f"  Шагов: {steps_done}")
+    print(f"  Время: {elapsed_min:.1f} мин")
+    print(f"  Train loss: {metrics.get('train_loss', 'N/A')}")
+    if elapsed_min > 0 and steps_done > 0:
+        print(f"  Скорость: {elapsed_min / steps_done:.1f} мин/шаг")
 
     print(f"\nСохранение GRPO адаптеров в {output_dir}...")
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    print("GRPO обучение завершено!")
 
+    # Сохраняем метрики в JSON для анализа
+    import json as _json
+    metrics_path = os.path.join(output_dir, "train_metrics.json")
+    with open(metrics_path, "w") as f:
+        _json.dump(metrics, f, indent=2)
+    print(f"  Метрики сохранены: {metrics_path}")
+
+    print("GRPO обучение завершено!")
     return output_dir
 
 
