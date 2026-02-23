@@ -567,7 +567,7 @@ def train_grpo(
 
     setup_cuda()
 
-    from unsloth import FastLanguageModel, PatchFastRL
+    from unsloth import FastLanguageModel
     from trl import GRPOConfig, GRPOTrainer
 
     model_config = ModelConfig()
@@ -615,9 +615,6 @@ def train_grpo(
             use_gradient_checkpointing=lora_config.use_gradient_checkpointing,
             random_state=lora_config.random_state,
         )
-
-    # Патч для RL-совместимости (обязателен для GRPO с Unsloth)
-    model = PatchFastRL(model, algorithm="grpo")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
