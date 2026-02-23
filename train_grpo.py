@@ -635,6 +635,30 @@ def train_grpo(
     total = sum(p.numel() for p in model.parameters())
     print(f"  Обучаемых: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
+    # WORKAROUND: Unsloth LlamaModel_fast_forward ожидает 2D attention_mask [batch, seq],
+    # но transformers _update_causal_mask создаёт 4D маску [batch, 1, seq, seq],
+    # которая просачивается в forward и вызывает tensor size mismatch (4096 vs seq_len).
+    # Исправление: перехватываем forward внутренней модели (MistralModel) и
+    # конвертируем 4D маску обратно в 2D перед тем, как Unsloth её обработает.
+    try:
+        _inner_model = model.base_model.model.model  # PeftModel→LoraModel→CausalLM→BaseModel
+        _orig_forward = _inner_model.forward
+
+        def _forward_fix_attn_mask(*args, **kwargs):
+            if "attention_mask" in kwargs and kwargs["attention_mask"] is not None:
+                mask = kwargs["attention_mask"]
+                if mask.dim() == 4:
+                    # 4D causal [batch, 1, tgt, src] → 2D padding [batch, src]
+                    # Последняя строка каузальной маски = полная padding-маска
+                    # 0.0 = attend, large_negative = mask → конвертируем в 1/0
+                    kwargs = {**kwargs, "attention_mask": (mask[:, 0, -1, :] > -1.0).to(torch.long)}
+            return _orig_forward(*args, **kwargs)
+
+        _inner_model.forward = _forward_fix_attn_mask
+        print("  [fix] Workaround для 4D attention_mask установлен")
+    except AttributeError:
+        print("  [warn] Не удалось установить workaround для attention_mask")
+
     # 3. Датасет
     print(f"[3/4] Загрузка датасета из {dataset_path}...")
     dataset = prepare_grpo_dataset(dataset_path)
@@ -650,6 +674,7 @@ def train_grpo(
     training_args = GRPOConfig(
         output_dir=output_dir,
         learning_rate=5e-6,
+        beta=0.0,  # Отключает KL-penalty и reference model → обходит баг Unsloth с 4D mask
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         num_generations=num_generations,
