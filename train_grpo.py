@@ -8,14 +8,6 @@ GRPO (Group Relative Policy Optimization) — обучение модели ра
   1. SFT на reasoning данных (train.py --resume)
   2. GRPO поверх SFT (этот скрипт)
 
-Reward-функции (6 штук):
-  1. format_reward — правильный XML формат
-  2. reasoning_quality_reward — глубина и качество рассуждений
-  3. verdict_consistency_reward — согласованность вердикта и score
-  4. correctness_reward — правильный вердикт (если известен ground truth)
-  5. devils_advocate_reward — наличие "адвоката дьявола" в рассуждениях
-  6. numerical_accuracy_reward — точная работа с числами, датами, процентами
-
 Требования: ~12GB VRAM (RTX 5070), Unsloth + TRL >= 0.7.4.
 
 Использование:
@@ -72,11 +64,7 @@ SYSTEM_PROMPT = """\
 
 
 def _extract_contents(completions: list) -> list:
-    """Извлечение текста из completions.
-
-    TRL GRPOTrainer передаёт completions в conversational формате:
-    list[list[dict]] — каждый completion = [{"role": "assistant", "content": "..."}]
-    """
+    """Извлечение текста из completions."""
     contents = []
     for completion in completions:
         if isinstance(completion, str):
@@ -91,12 +79,6 @@ def _extract_contents(completions: list) -> list:
 # ===== REWARD-ФУНКЦИИ =====
 
 def format_reward(completions: list, **kwargs) -> list:
-    """Reward за правильный формат ответа (XML теги).
-
-    +1.0 за <reasoning>...</reasoning>
-    +1.0 за <answer>...</answer>
-    -0.5 за дублирующиеся теги (галлюцинация)
-    """
     contents = _extract_contents(completions)
     scores = []
     for text in contents:
@@ -122,11 +104,6 @@ def format_reward(completions: list, **kwargs) -> list:
 
 
 def reasoning_quality_reward(completions: list, **kwargs) -> list:
-    """Reward за качество рассуждений.
-
-    Оценивает: длину, наличие шагов, ссылки на источники, адвокат дьявола.
-    Штрафует: шаблонные фразы из синтетических данных.
-    """
     contents = _extract_contents(completions)
     scores = []
     for text in contents:
@@ -199,12 +176,6 @@ def reasoning_quality_reward(completions: list, **kwargs) -> list:
 
 
 def verdict_consistency_reward(completions: list, **kwargs) -> list:
-    """Reward за консистентность вердикта и score.
-
-    ПРАВДА → score 70-100
-    ЛОЖЬ → score 0-29
-    НЕ ПОДТВЕРЖДЕНО → score 30-69
-    """
     contents = _extract_contents(completions)
     scores = []
     for text in contents:
@@ -248,15 +219,6 @@ def verdict_consistency_reward(completions: list, **kwargs) -> list:
 
 
 def correctness_reward(completions: list, **kwargs) -> list:
-    """Reward за правильный вердикт (если known ground truth).
-
-    +1.0 за точное совпадение вердикта
-    -1.0 за неверный вердикт
-    -0.2 за НЕ ПОДТВЕРЖДЕНО когда ответ известен (мягкий штраф)
-
-    GRPOTrainer генерирует num_generations completions на каждый промпт,
-    но expected_verdict — одно значение на промпт. Реплицируем expected_verdict.
-    """
     expected_verdicts = kwargs.get("expected_verdict", [])
     if not expected_verdicts:
         return [0.0] * len(completions)
@@ -300,12 +262,6 @@ def correctness_reward(completions: list, **kwargs) -> list:
 
 
 def devils_advocate_reward(completions: list, **kwargs) -> list:
-    """Reward за наличие «адвоката дьявола» — аргументов ПРОТИВ своего вердикта.
-
-    +0.5 за наличие контраргументов в reasoning
-    +0.5 за явное отклонение контраргументов с обоснованием
-    -0.5 за reasoning без самокритики
-    """
     contents = _extract_contents(completions)
     scores = []
     for text in contents:
@@ -350,14 +306,10 @@ def devils_advocate_reward(completions: list, **kwargs) -> list:
 
 
 def numerical_accuracy_reward(completions: list, **kwargs) -> list:
-    """Reward за точную работу с числами, датами и процентами.
-
-    Извлекает числа/даты из промпта (утверждение), затем проверяет,
-    что модель явно упоминает и сравнивает их в reasoning.
-    """
     contents = _extract_contents(completions)
-
-    prompts = kwargs.get("prompts", [])
+    
+    # ИСПРАВЛЕНИЕ: TRL передает ключ как "prompt" (единственное число), а не "prompts"
+    prompts = kwargs.get("prompt", []) 
 
     if len(prompts) > 0 and len(contents) > len(prompts):
         num_gen = len(contents) // len(prompts)
@@ -454,7 +406,6 @@ def numerical_accuracy_reward(completions: list, **kwargs) -> list:
 # ===== ПОДГОТОВКА ДАННЫХ =====
 
 def prepare_grpo_dataset(jsonl_path: str):
-    """Подготовка датасета для GRPO."""
     from datasets import Dataset
 
     data = []
@@ -490,9 +441,6 @@ def prepare_grpo_dataset(jsonl_path: str):
 # ===== ОБУЧЕНИЕ =====
 
 def check_flash_attention():
-    """Проверка доступности Flash Attention 2.
-    Возвращает True если FA2 доступен и может быть использован.
-    """
     if not torch.cuda.is_available():
         return False
 
@@ -511,7 +459,6 @@ def check_flash_attention():
 
 
 def setup_cuda():
-    """CUDA оптимизации."""
     if not torch.cuda.is_available():
         print("CUDA недоступна!")
         return
@@ -541,20 +488,6 @@ def train_grpo(
     num_generations: int = 2,
     load_adapter: str = None,
 ):
-    """Запуск GRPO обучения для reasoning.
-
-    Args:
-        dataset_path: Путь к данным с reasoning (train_russian.jsonl)
-        output_dir: Директория для сохранения адаптеров
-        max_steps: Количество шагов обучения
-        num_generations: Сколько вариантов генерировать на пример (2 для 12GB VRAM)
-        load_adapter: Путь к SFT-адаптеру для инициализации весов (опционально).
-                      Адаптер загружается через PEFT API, мержится в base model,
-                      затем накладывается свежая LoRA (dropout=0) для GRPO.
-
-    ВАЖНО: max_seq_length при загрузке модели ДОЛЖЕН совпадать с
-    max_prompt_length + max_completion_length (требование Unsloth).
-    """
     if dataset_path is None:
         dataset_path = os.path.join(PROJECT_ROOT, "data", "train_russian.jsonl")
     if output_dir is None:
@@ -562,7 +495,10 @@ def train_grpo(
 
     setup_cuda()
 
-    from unsloth import FastLanguageModel
+    # ИСПРАВЛЕНИЕ: КРИТИЧЕСКИ ВАЖНО импортировать PatchFastRL ДО импорта TRL
+    from unsloth import FastLanguageModel, PatchFastRL
+    PatchFastRL("GRPO", FastLanguageModel)
+    
     from trl import GRPOConfig, GRPOTrainer
 
     model_config = ModelConfig()
@@ -573,7 +509,6 @@ def train_grpo(
 
     use_fa2 = check_flash_attention()
 
-    # 1. Загрузка модели (base или base+SFT)
     if load_adapter is not None:
         adapter_path = load_adapter
         if not os.path.isabs(adapter_path):
@@ -583,10 +518,6 @@ def train_grpo(
             print(f"  ОШИБКА: директория {adapter_path} не существует!")
             return None
 
-        # FIX: merge_and_unload() ломает внутренние хуки Unsloth и вызывает
-        # segfault при генерации в GRPO (issue #3069, #1877).
-        # Решение: загружаем SFT-адаптер как есть, GRPO дообучает
-        # существующие LoRA-веса напрямую (без merge, без нового get_peft_model).
         print(f"\n[1/4] Загрузка SFT-адаптера из {adapter_path}...")
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=adapter_path,
@@ -608,7 +539,6 @@ def train_grpo(
         )
         print("  Инициализация с нуля (без SFT-адаптера)")
 
-        # Свежие LoRA адаптеры (только при загрузке с нуля)
         print("[2/4] Настройка LoRA...")
         model = FastLanguageModel.get_peft_model(
             model,
@@ -624,15 +554,20 @@ def train_grpo(
             random_state=3407,
         )
 
+    # ИСПРАВЛЕНИЕ: Принудительно включаем градиенты для загруженного адаптера
+    if not any(p.requires_grad for p in model.parameters()):
+        print("  [ВНИМАНИЕ] Веса заморожены, включаем requires_grad для LoRA...")
+        for name, param in model.named_parameters():
+            if "lora" in name.lower():
+                param.requires_grad = True
+
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"  Обучаемых: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
-    # 3. Датасет
     print(f"[3/4] Загрузка датасета из {dataset_path}...")
     dataset = prepare_grpo_dataset(dataset_path)
 
-    # 4. GRPO Training
     print(f"[4/4] Запуск GRPO (steps={max_steps}, generations={num_generations})...")
 
     if tokenizer.pad_token is None:
@@ -642,7 +577,7 @@ def train_grpo(
     training_args = GRPOConfig(
         output_dir=output_dir,
         learning_rate=5e-6,
-        beta=0.0,
+        beta=0.01, # ИСПРАВЛЕНИЕ: 0.01 стабильнее для GRPO
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         gradient_checkpointing=True,
@@ -662,6 +597,7 @@ def train_grpo(
         bf16=True,
         report_to="none",
         log_completions=True,
+        use_vllm=False # ИСПРАВЛЕНИЕ: Строго отключаем vLLM для экономии VRAM
     )
 
     trainer = GRPOTrainer(
