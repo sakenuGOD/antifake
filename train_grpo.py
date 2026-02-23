@@ -573,48 +573,51 @@ def train_grpo(
     model_config = ModelConfig()
     lora_config = LoraConfig()
 
-    # 1. Загрузка модели
-    print("\n[1/4] Загрузка модели...")
+    # 1. Загрузка базовой модели (всегда base, не адаптеры!)
+    # GRPO требует правильные Unsloth-патчи через get_peft_model.
+    # Если загружать SFT адаптеры напрямую, Unsloth не патчит модель для RL
+    # и получаем tensor size mismatch в LlamaModel_fast_forward.
+    print("\n[1/4] Загрузка базовой модели...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_config.base_model_name,
+        max_seq_length=model_config.max_seq_length,
+        dtype=model_config.dtype,
+        load_in_4bit=True,
+    )
 
-    # Попытка загрузить SFT адаптеры (если уже обучены)
-    sft_adapter_path = os.path.join(PROJECT_ROOT, "adapters", "fact_checker_lora")
-    has_sft_adapters = os.path.exists(sft_adapter_path)
-
-    if has_sft_adapters:
-        print(f"  Загружаю SFT адаптеры из {sft_adapter_path}")
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=sft_adapter_path,
-            max_seq_length=model_config.max_seq_length,
-            dtype=model_config.dtype,
-            load_in_4bit=True,
-        )
-    else:
-        print(f"  SFT адаптеры не найдены, загружаю base модель")
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_config.base_model_name,
-            max_seq_length=model_config.max_seq_length,
-            dtype=model_config.dtype,
-            load_in_4bit=True,
-        )
-
-    # 2. LoRA адаптеры
+    # 2. LoRA адаптеры (всегда через get_peft_model для корректных RL-патчей)
     print("[2/4] Настройка LoRA...")
-    if has_sft_adapters:
-        # SFT адаптеры уже содержат LoRA — продолжаем обучение тех же весов
-        # НЕ вызываем get_peft_model, иначе Unsloth выдаст ошибку
-        print("  LoRA уже загружены из SFT адаптеров, продолжаю обучение...")
-        FastLanguageModel.for_training(model)
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=lora_config.r,
+        lora_alpha=lora_config.lora_alpha,
+        lora_dropout=lora_config.lora_dropout,
+        target_modules=lora_config.target_modules,
+        bias=lora_config.bias,
+        use_gradient_checkpointing=lora_config.use_gradient_checkpointing,
+        random_state=lora_config.random_state,
+    )
+
+    # Подгружаем SFT веса если есть (перезаписываем рандомные LoRA-веса обученными)
+    sft_adapter_path = os.path.join(PROJECT_ROOT, "adapters", "fact_checker_lora")
+    if os.path.exists(sft_adapter_path):
+        print(f"  Загружаю SFT веса из {sft_adapter_path}...")
+        sft_weights_file = os.path.join(sft_adapter_path, "adapter_model.safetensors")
+        if not os.path.exists(sft_weights_file):
+            sft_weights_file = os.path.join(sft_adapter_path, "adapter_model.bin")
+
+        if os.path.exists(sft_weights_file):
+            if sft_weights_file.endswith(".safetensors"):
+                from safetensors.torch import load_file
+                sft_weights = load_file(sft_weights_file)
+            else:
+                sft_weights = torch.load(sft_weights_file, map_location="cpu")
+            result = model.load_state_dict(sft_weights, strict=False)
+            print(f"  SFT веса загружены (пропущено: {len(result.missing_keys)}, лишних: {len(result.unexpected_keys)})")
+        else:
+            print("  ВНИМАНИЕ: файл весов не найден, начинаю с нуля")
     else:
-        model = FastLanguageModel.get_peft_model(
-            model,
-            r=lora_config.r,
-            lora_alpha=lora_config.lora_alpha,
-            lora_dropout=lora_config.lora_dropout,
-            target_modules=lora_config.target_modules,
-            bias=lora_config.bias,
-            use_gradient_checkpointing=lora_config.use_gradient_checkpointing,
-            random_state=lora_config.random_state,
-        )
+        print("  SFT адаптеры не найдены, начинаю с base модели")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
