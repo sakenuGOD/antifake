@@ -22,6 +22,19 @@ import json
 import os
 import platform
 import re
+import sys
+
+# Blackwell (sm_120): xformers 0.0.35 не имеет ядер для этой архитектуры.
+# Unsloth детектит xformers при импорте и использует его для attention —
+# первый вызов generate() → segfault на уровне C++.
+# None в sys.modules вызывает ImportError при import, Unsloth откатится на SDPA.
+os.environ["XFORMERS_DISABLED"] = "1"
+for _mod in list(sys.modules):
+    if _mod.split(".")[0] == "xformers":
+        del sys.modules[_mod]
+sys.modules["xformers"] = None
+sys.modules["xformers.ops"] = None
+sys.modules["xformers.ops.fmha"] = None
 
 if platform.system() == "Windows":
     os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
