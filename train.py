@@ -236,7 +236,7 @@ def train(
     )
 
     # Callback: очистка CUDA-кэша перед eval (предотвращает OOM от фрагментации)
-    from transformers import TrainerCallback
+    from transformers import TrainerCallback, EarlyStoppingCallback
 
     class ClearCacheCallback(TrainerCallback):
         def on_evaluate(self, args, state, control, **kwargs):
@@ -244,6 +244,10 @@ def train(
                 torch.cuda.empty_cache()
 
     trainer.add_callback(ClearCacheCallback())
+
+    # Early stopping: остановка если eval_loss не улучшается 1 эпоху подряд
+    # Предотвращает бесполезные эпохи при переобучении
+    trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=1))
 
     # 7. Запуск обучения
     print("\n[7/7] Запуск обучения...")
