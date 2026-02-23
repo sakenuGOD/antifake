@@ -4,11 +4,7 @@ GRPO (Group Relative Policy Optimization) — обучение модели ра
 Модель генерирует N вариантов ответа, каждый оценивается reward-функциями,
 и модель учится генерировать ответы с высоким reward.
 
-Трёхэтапный план:
-  1. SFT на reasoning данных (train.py --resume)
-  2. GRPO поверх SFT (этот скрипт)
-
-Требования: ~12GB VRAM (RTX 5070), Unsloth + TRL >= 0.7.4.
+Требования: ~12GB VRAM (RTX 5070), transformers + PEFT + TRL.
 
 Использование:
     python train_grpo.py
@@ -20,33 +16,18 @@ import argparse
 import gc
 import json
 import os
-import platform
 import re
 import sys
 
-# Blackwell (sm_120): xformers 0.0.35 не имеет ядер для этой архитектуры.
-# Unsloth детектит xformers при импорте и использует его для attention —
-# первый вызов generate() → segfault на уровне C++.
-# None в sys.modules вызывает ImportError при import, Unsloth откатится на SDPA.
-os.environ["XFORMERS_DISABLED"] = "1"
-for _mod in list(sys.modules):
-    if _mod.split(".")[0] == "xformers":
-        del sys.modules[_mod]
-sys.modules["xformers"] = None
-sys.modules["xformers.ops"] = None
-sys.modules["xformers.ops.fmha"] = None
-
-if platform.system() == "Windows":
-    os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
-    os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+# ============================================================
+# Blackwell (sm_120) fix: Unsloth Triton kernels segfault
+# на RTX 5070 при первом generate(). Используем чистый
+# transformers + PEFT + TRL без Unsloth.
+# ============================================================
 
 import torch
-
-if platform.system() == "Windows":
-    try:
-        torch._dynamo.config.disable = True
-    except AttributeError:
-        pass
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftModel
 
 from claim_parser import extract_numbers, extract_dates
 from config import ModelConfig, PROJECT_ROOT
@@ -320,8 +301,6 @@ def devils_advocate_reward(completions: list, **kwargs) -> list:
 
 def numerical_accuracy_reward(completions: list, **kwargs) -> list:
     contents = _extract_contents(completions)
-    
-    # ИСПРАВЛЕНИЕ: TRL передает ключ как "prompt" (единственное число), а не "prompts"
     prompts = kwargs.get("prompt", kwargs.get("prompts", []))
 
     if len(prompts) > 0 and len(contents) > len(prompts):
@@ -453,24 +432,6 @@ def prepare_grpo_dataset(jsonl_path: str):
 
 # ===== ОБУЧЕНИЕ =====
 
-def check_flash_attention():
-    if not torch.cuda.is_available():
-        return False
-
-    capability = torch.cuda.get_device_capability(0)
-    if capability[0] < 8:
-        print(f"  Flash Attention 2 требует SM >= 80, текущая: SM {capability[0]}{capability[1]}")
-        return False
-
-    try:
-        import flash_attn  # noqa: F401
-        print(f"  Flash Attention 2 доступен (v{flash_attn.__version__})")
-        return True
-    except ImportError:
-        print("  Flash Attention 2 не установлен (pip install flash-attn)")
-        return False
-
-
 def setup_cuda():
     if not torch.cuda.is_available():
         print("CUDA недоступна!")
@@ -484,18 +445,16 @@ def setup_cuda():
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    # expandable_segments:True вызывает Segfault на Linux/CUDA 12.8
-    # при tight VRAM — cuMemAddressReserve падает вместо OOM.
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
         "expandable_segments:False,"
         "max_split_size_mb:256,"
         "garbage_collection_threshold:0.8"
     )
 
+    # SDPA backends: flash отключен (нет flash-attn), mem_efficient + math
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(True)
-    os.environ["XFORMERS_DISABLED"] = "1"
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -516,25 +475,13 @@ def train_grpo(
 
     setup_cuda()
 
-    # ВАЖНО: PatchFastRL должен быть вызван ДО импорта TRL.
-    # В Unsloth 2026.2.1 функцию убрали, потом вернули — оборачиваем в try/except.
-    from unsloth import FastLanguageModel
-    try:
-        from unsloth import PatchFastRL
-        PatchFastRL("GRPO", FastLanguageModel)
-        print("  PatchFastRL применён (gradient_checkpointing управляется Unsloth)")
-    except (ImportError, AttributeError):
-        print("  PatchFastRL недоступен в этой версии Unsloth — используем gradient_checkpointing=False")
-
     from trl import GRPOConfig, GRPOTrainer
 
     model_config = ModelConfig()
+    base_model_name = model_config.base_model_name
 
     max_prompt_len = 512
     max_completion_len = 512
-    grpo_max_seq_length = max_prompt_len + max_completion_len  # 1024
-
-    use_fa2 = check_flash_attention()
 
     if load_adapter is not None:
         adapter_path = load_adapter
@@ -545,30 +492,35 @@ def train_grpo(
             print(f"  ОШИБКА: директория {adapter_path} не существует!")
             return None
 
-        print(f"\n[1/4] Загрузка SFT-адаптера из {adapter_path}...")
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=adapter_path,
-            max_seq_length=grpo_max_seq_length,
-            dtype=model_config.dtype,
-            load_in_4bit=True,
-            attn_implementation="flash_attention_2" if use_fa2 else None,
+        print(f"\n[1/4] Загрузка базовой модели + SFT-адаптера из {adapter_path}...")
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model_name,
+            device_map="auto",
+            attn_implementation="sdpa",
+            dtype=torch.bfloat16,
         )
-        print("  SFT адаптер загружен, GRPO дообучит LoRA веса")
+        model = PeftModel.from_pretrained(model, adapter_path, is_trainable=True)
+        tokenizer = AutoTokenizer.from_pretrained(adapter_path)
+        print("  SFT адаптер загружен")
         print("[2/4] Используются существующие LoRA из SFT-адаптера")
     else:
-        print("\n[1/4] Загрузка базовой модели...")
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_config.base_model_name,
-            max_seq_length=grpo_max_seq_length,
-            dtype=model_config.dtype,
-            load_in_4bit=True,
-            attn_implementation="flash_attention_2" if use_fa2 else None,
+        print(f"\n[1/4] Загрузка базовой модели: {base_model_name}")
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model_name,
+            device_map="auto",
+            attn_implementation="sdpa",
+            dtype=torch.bfloat16,
         )
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name)
         print("  Инициализация с нуля (без SFT-адаптера)")
 
         print("[2/4] Настройка LoRA...")
-        model = FastLanguageModel.get_peft_model(
-            model,
+        # Ручная подготовка вместо prepare_model_for_kbit_training
+        # (которая кастует lm_head/embed_tokens в float32, ломая generate())
+        for param in model.parameters():
+            param.requires_grad = False
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        lora_config = LoraConfig(
             r=16,
             lora_alpha=32,
             lora_dropout=0,
@@ -577,11 +529,11 @@ def train_grpo(
                 "gate_proj", "up_proj", "down_proj",
             ],
             bias="none",
-            use_gradient_checkpointing="unsloth",
-            random_state=3407,
+            task_type="CAUSAL_LM",
         )
+        model = get_peft_model(model, lora_config)
 
-    # ИСПРАВЛЕНИЕ: Принудительно включаем градиенты для загруженного адаптера
+    # Включаем градиенты для LoRA слоёв
     if not any(p.requires_grad for p in model.parameters()):
         print("  [ВНИМАНИЕ] Веса заморожены, включаем requires_grad для LoRA...")
         for name, param in model.named_parameters():
@@ -607,9 +559,8 @@ def train_grpo(
         beta=0.0,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
-        # gradient_checkpointing управляется Unsloth через PatchFastRL.
-        # TRL с gradient_checkpointing=True ставит двойные хуки → segfault.
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         num_generations=num_generations,
         max_prompt_length=max_prompt_len,
         max_completion_length=max_completion_len,
@@ -622,7 +573,7 @@ def train_grpo(
         weight_decay=0.1,
         max_grad_norm=0.1,
         temperature=0.9,
-        bf16=True,
+        bf16=False,  # native bfloat16 вместо mixed precision (иначе Accelerator кастует lm_head в float32)
         report_to="none",
         log_completions=True,
         use_vllm=False,
@@ -630,7 +581,6 @@ def train_grpo(
 
     trainer = GRPOTrainer(
         model=model,
-        ref_model=None,
         processing_class=tokenizer,
         reward_funcs=[
             format_reward,
