@@ -25,10 +25,12 @@ Reward-функции (6 штук):
 """
 
 import argparse
+import gc
 import json
 import os
 import platform
 import re
+import shutil
 
 if platform.system() == "Windows":
     os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
@@ -583,7 +585,11 @@ def train_grpo(
             return None
 
         print(f"\n[1/4] Загрузка SFT-адаптера из {adapter_path} (merge → base)...")
-        model, tokenizer = FastLanguageModel.from_pretrained(
+
+        # FIX: merge_and_unload() в памяти ломает внутренние хуки Unsloth,
+        # что приводит к segfault при генерации в GRPO (issue #3069, #1877).
+        # Решение: сохраняем merged модель на диск и загружаем заново.
+        sft_model, sft_tokenizer = FastLanguageModel.from_pretrained(
             model_name=adapter_path,
             max_seq_length=grpo_max_seq_length,
             dtype=model_config.dtype,
@@ -591,12 +597,25 @@ def train_grpo(
             attn_implementation="flash_attention_2" if use_fa2 else None,
         )
 
-        # Мержим SFT LoRA в base-веса и снимаем адаптер.
-        # После этого модель — чистый base + SFT-знания без LoRA-слоёв.
-        from peft import PeftModel
-        if isinstance(model, PeftModel):
-            model = model.merge_and_unload()
-            print("  SFT веса вмержены в base model")
+        temp_merged_dir = os.path.join(PROJECT_ROOT, "adapters", "_sft_merged_temp")
+        print("  Сохранение merged SFT модели на диск...")
+        sft_model.save_pretrained_merged(
+            temp_merged_dir, sft_tokenizer, save_method="merged_16bit",
+        )
+        del sft_model, sft_tokenizer
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print("  Загрузка merged модели как fresh Unsloth model...")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=temp_merged_dir,
+            max_seq_length=grpo_max_seq_length,
+            dtype=model_config.dtype,
+            load_in_4bit=True,
+            attn_implementation="flash_attention_2" if use_fa2 else None,
+        )
+        shutil.rmtree(temp_merged_dir, ignore_errors=True)
+        print("  SFT веса вмержены в base model")
     else:
         print("\n[1/4] Загрузка базовой модели...")
         model, tokenizer = FastLanguageModel.from_pretrained(
@@ -627,23 +646,6 @@ def train_grpo(
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"  Обучаемых: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
-
-    # FIX: Unsloth fast_forward ожидает 2D attention_mask [batch, seq],
-    # но transformers >= 4.43 создаёт 4D маску [batch, 1, seq, seq].
-    try:
-        _inner_model = model.base_model.model.model
-
-        def _fix_mask_hook(module, args, kwargs):
-            if "attention_mask" in kwargs and kwargs["attention_mask"] is not None:
-                mask = kwargs["attention_mask"]
-                if mask.dim() == 4:
-                    kwargs = {**kwargs, "attention_mask": (mask[:, 0, -1, :] > -1.0).to(torch.long)}
-            return args, kwargs
-
-        _inner_model.register_forward_pre_hook(_fix_mask_hook, with_kwargs=True)
-        print("  [fix] Pre-hook для 4D→2D attention_mask установлен")
-    except AttributeError:
-        print("  [warn] Не удалось установить hook для attention_mask")
 
     # 3. Датасет
     print(f"[3/4] Загрузка датасета из {dataset_path}...")

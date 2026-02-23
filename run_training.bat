@@ -118,7 +118,7 @@ echo.
 echo ============================================
 echo [3/3] GRPO обучение (300 шагов, reasoning rewards^)...
 echo ============================================
-python train_grpo.py --dataset data/train_russian.jsonl --steps 300 --generations 2
+python train_grpo.py --dataset data/train_russian.jsonl --steps 300 --generations 2 --load-adapter adapters/fact_checker_lora
 if errorlevel 1 (
     echo ОШИБКА: GRPO обучение не удалось!
     pause
