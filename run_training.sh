@@ -11,6 +11,10 @@ echo "  Русский язык | SFT + GRPO"
 echo "=========================================="
 START=$(date +%s)
 
+# Blackwell sm_120: xformers 0.0.35 не поддерживает эту архитектуру → segfault
+pip uninstall xformers -y 2>/dev/null || true
+rm -rf unsloth_compiled_cache 2>/dev/null || true
+
 # 1. Русский датасет с reasoning (2500 примеров, ~1 сек)
 echo ""
 echo "[1/3] Генерация русского датасета (2500: 35% правда + 35% ложь + 30% не подтверждено)..."
