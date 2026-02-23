@@ -309,7 +309,7 @@ def numerical_accuracy_reward(completions: list, **kwargs) -> list:
     contents = _extract_contents(completions)
     
     # ИСПРАВЛЕНИЕ: TRL передает ключ как "prompt" (единственное число), а не "prompts"
-    prompts = kwargs.get("prompt", []) 
+    prompts = kwargs.get("prompt", kwargs.get("prompts", []))
 
     if len(prompts) > 0 and len(contents) > len(prompts):
         num_gen = len(contents) // len(prompts)
@@ -470,15 +470,23 @@ def setup_cuda():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
-    os.environ.setdefault(
-        "PYTORCH_CUDA_ALLOC_CONF",
-        "expandable_segments:True,max_split_size_mb:128",
+
+    # expandable_segments:True вызывает Segfault на Linux/CUDA 12.8
+    # при tight VRAM — cuMemAddressReserve падает вместо OOM.
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+        "expandable_segments:False,"
+        "max_split_size_mb:256,"
+        "garbage_collection_threshold:0.8"
     )
+
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(True)
     os.environ["XFORMERS_DISABLED"] = "1"
+
+    gc.collect()
     torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
 
 
 def train_grpo(
@@ -577,11 +585,12 @@ def train_grpo(
     training_args = GRPOConfig(
         output_dir=output_dir,
         learning_rate=5e-6,
-        beta=0.01, # ИСПРАВЛЕНИЕ: 0.01 стабильнее для GRPO
+        beta=0.0,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        # gradient_checkpointing управляется Unsloth через PatchFastRL.
+        # TRL с gradient_checkpointing=True ставит двойные хуки → segfault.
+        gradient_checkpointing=False,
         num_generations=num_generations,
         max_prompt_length=max_prompt_len,
         max_completion_length=max_completion_len,
@@ -597,7 +606,7 @@ def train_grpo(
         bf16=True,
         report_to="none",
         log_completions=True,
-        use_vllm=False # ИСПРАВЛЕНИЕ: Строго отключаем vLLM для экономии VRAM
+        use_vllm=False,
     )
 
     trainer = GRPOTrainer(
