@@ -519,7 +519,8 @@ def train_grpo(
         # (которая кастует lm_head/embed_tokens в float32, ломая generate())
         for param in model.parameters():
             param.requires_grad = False
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.enable_input_require_grads()  # нужен для backward через bnb-4bit
+        # gradient_checkpointing включается через GRPOConfig (не дублируем)
         lora_config = LoraConfig(
             r=16,
             lora_alpha=32,
@@ -593,6 +594,16 @@ def train_grpo(
         args=training_args,
         train_dataset=dataset,
     )
+
+    # Страховка: оборачиваем generate() в autocast для совместимости dtype
+    # (bnb-4bit отдаёт hidden_states в bf16, lm_head может быть в другом dtype)
+    _orig_generate = trainer._generate_single_turn
+
+    def _patched_generate(prompts, images=None):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            return _orig_generate(prompts, images)
+
+    trainer._generate_single_turn = _patched_generate
 
     print("\n" + "=" * 60)
     trainer.train()
