@@ -540,8 +540,10 @@ def setup_cuda():
         "PYTORCH_CUDA_ALLOC_CONF",
         "expandable_segments:True,max_split_size_mb:128",
     )
-    torch.backends.cuda.enable_flash_sdp(True)
+    # Blackwell (sm_120): flash SDP не поддерживается нативно, используем mem_efficient
+    torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)
     os.environ["XFORMERS_DISABLED"] = "1"
     torch.cuda.empty_cache()
 
@@ -558,7 +560,10 @@ def train_grpo(
         dataset_path: Путь к данным с reasoning (train_russian.jsonl)
         output_dir: Директория для сохранения адаптеров
         max_steps: Количество шагов обучения
-        num_generations: Сколько вариантов генерировать на пример (4 для 12GB VRAM)
+        num_generations: Сколько вариантов генерировать на пример (2 для 12GB VRAM)
+
+    ВАЖНО: max_seq_length при загрузке модели ДОЛЖЕН совпадать с
+    max_prompt_length + max_completion_length (требование Unsloth).
     """
     if dataset_path is None:
         dataset_path = os.path.join(PROJECT_ROOT, "data", "train_russian.jsonl")
@@ -573,6 +578,13 @@ def train_grpo(
     model_config = ModelConfig()
     lora_config = LoraConfig()
 
+    # Unsloth GRPO требует: max_seq_length == max_prompt_length + max_completion_length
+    # Иначе attention_mask получает неверную размерность (4D вместо 2D)
+    # и LlamaModel_fast_forward падает с tensor size mismatch.
+    max_prompt_len = 512   # SYSTEM_PROMPT ~300-400 токенов + user msg ~100-150
+    max_completion_len = 512  # reasoning + answer ~300-500 токенов
+    grpo_max_seq_length = max_prompt_len + max_completion_len  # 1024
+
     # 1. Загрузка базовой модели (всегда base, не адаптеры!)
     # GRPO требует правильные Unsloth-патчи через get_peft_model.
     # Если загружать SFT адаптеры напрямую, Unsloth не патчит модель для RL
@@ -580,7 +592,7 @@ def train_grpo(
     print("\n[1/4] Загрузка базовой модели...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_config.base_model_name,
-        max_seq_length=model_config.max_seq_length,
+        max_seq_length=grpo_max_seq_length,
         dtype=model_config.dtype,
         load_in_4bit=True,
     )
@@ -635,10 +647,6 @@ def train_grpo(
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # GRPO требует left-padding для генерации
 
-    # Безопасные значения для RTX 5070 12GB (короче = меньше VRAM)
-    max_prompt_len = 256
-    max_completion_len = 512
-
     training_args = GRPOConfig(
         output_dir=output_dir,
         learning_rate=5e-6,
@@ -654,9 +662,11 @@ def train_grpo(
         lr_scheduler_type="cosine",
         optim="adamw_8bit",
         weight_decay=0.1,
+        max_grad_norm=0.1,
         temperature=0.9,
         bf16=True,
         report_to="none",
+        log_completions=True,
     )
 
     trainer = GRPOTrainer(
