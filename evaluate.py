@@ -127,6 +127,8 @@ def evaluate_rag(pipeline) -> Dict:
     predictions = []
     labels = []
     latencies = []
+    verdicts = []
+    unverified_count = 0
 
     for i, sample in enumerate(TEST_DATASET):
         claim = sample["claim"]
@@ -140,27 +142,24 @@ def evaluate_rag(pipeline) -> Dict:
         latencies.append(latency)
 
         # Маппинг вердикта в label
-        # Приоритет: явный вердикт модели > score > дефолт
         verdict = result.get("verdict", "").upper()
         score = result.get("credibility_score", 50)
+        verdicts.append(verdict)
 
         if verdict in ("ЛОЖЬ", "FALSE"):
-            predicted = 0  # fake — модель уверена
+            predicted = 0  # fake
         elif verdict in ("ПРАВДА", "TRUE"):
-            predicted = 1  # real — модель уверена
-        elif score >= 70:
-            predicted = 1  # высокий score — скорее правда
-        elif score < 30:
-            predicted = 0  # низкий score — скорее фейк
+            predicted = 1  # real
         else:
-            # НЕ ПОДТВЕРЖДЕНО (30-69): серая зона — используем score 50 как порог
-            predicted = 1 if score >= 50 else 0
+            # НЕ ПОДТВЕРЖДЕНО → conservative: treat as suspicious (fake)
+            predicted = 0
+
+        is_unverified = "НЕ ПОДТВЕРЖДЕНО" in verdict
+        if is_unverified:
+            unverified_count += 1
 
         predictions.append(predicted)
         labels.append(true_label)
-
-        # Трекинг НЕ ПОДТВЕРЖДЕНО отдельно
-        is_unverified = "НЕ ПОДТВЕРЖДЕНО" in verdict or (30 <= score < 70 and verdict not in ("ПРАВДА", "TRUE", "ЛОЖЬ", "FALSE"))
 
         status = "OK" if predicted == true_label else "MISS"
         uv_tag = " [UV]" if is_unverified else ""
@@ -168,6 +167,8 @@ def evaluate_rag(pipeline) -> Dict:
 
     metrics = compute_metrics(predictions, labels)
     metrics["avg_latency"] = round(sum(latencies) / len(latencies), 2)
+    metrics["unverified_count"] = unverified_count
+    metrics["unverified_rate"] = round(unverified_count / len(TEST_DATASET), 3)
 
     # Per-type breakdown
     type_results = {}
@@ -231,6 +232,7 @@ def main():
     print("=" * 60)
     print(f"Accuracy:     {metrics['accuracy']}")
     print(f"F1 (macro):   {metrics['f1_macro']}")
+    print(f"Unverified:   {metrics['unverified_count']}/{len(TEST_DATASET)} ({metrics['unverified_rate']*100:.1f}%)")
     print(f"Avg Latency:  {metrics['avg_latency']} сек.")
     print(f"\n--- Fake detection (positive = fake) ---")
     print(f"Precision:    {metrics['precision_fake']}")

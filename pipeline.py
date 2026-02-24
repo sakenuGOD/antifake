@@ -1,6 +1,6 @@
 """LangChain LCEL цепочка для проверки фактов.
 
-v3: умное извлечение ключевых слов + post-verdict self-critique.
+v4: NLI-first ensemble — DeBERTa классифицирует, LLM объясняет.
 """
 
 import logging
@@ -23,7 +23,7 @@ from prompts import (
 )
 from model import load_base_model, load_finetuned_model, build_langchain_llm, is_grpo_adapter
 from search import FactCheckSearcher
-from claim_parser import classify_claim, format_verification_hints
+from claim_parser import classify_claim, format_verification_hints, extract_numbers, compare_numbers
 
 logger = logging.getLogger("fact_checker")
 
@@ -58,7 +58,7 @@ _MULTI_WORD_ENTITIES = [
 class FactCheckPipeline:
     """Пайплайн проверки достоверности утверждений.
 
-    v3: умное извлечение ключевых слов + post-verdict self-critique.
+    v4: NLI-first ensemble — DeBERTa классифицирует, LLM объясняет.
     """
 
     def __init__(
@@ -83,6 +83,20 @@ class FactCheckPipeline:
         # (RunnablePassthrough.assign создаёт новый dict, мутации state не пробрасываются)
         # Используем threading.local() для thread-safety в multi-user сценариях (Streamlit)
         self._local = threading.local()
+
+        # NLI checker (CPU, не занимает GPU)
+        self.nli_checker = None
+        if pipeline_config.enable_nli:
+            try:
+                from nli_checker import NLIChecker
+                print("Загрузка NLI модели на CPU...")
+                self.nli_checker = NLIChecker(
+                    device=pipeline_config.nli_device,
+                    model_name=pipeline_config.nli_model_name,
+                )
+                print("NLI модель загружена.")
+            except Exception as e:
+                print(f"NLI модель не загружена: {e}")
 
         # Загрузка модели один раз
         if adapter_path and os.path.exists(adapter_path):
@@ -116,13 +130,9 @@ class FactCheckPipeline:
     def _build_chain(self):
         """Сборка LCEL цепочки с прогрессивным обогащением состояния.
 
-        ВАЖНО: RunnablePassthrough.assign() создаёт НОВЫЙ dict — мутации
-        исходного state внутри RunnableLambda не видны следующим шагам.
-        Поэтому промежуточные данные (search_hint, raw_results) сохраняются
-        на self, а для search_hint добавлен отдельный шаг assign().
-
         Цепочка:
-        claim → +keywords_raw → +search_results → +search_hint → +verdict [→ +self_critique]
+        claim → +keywords_raw → +search_results → +search_hint,verification_hints
+              → +nli_hint,number_comparison → +verdict [→ +self_critique]
         """
         keyword_prompt = PromptTemplate(
             template=KEYWORD_EXTRACTION_TEMPLATE,
@@ -136,7 +146,8 @@ class FactCheckPipeline:
         )
         verdict_prompt = PromptTemplate(
             template=verdict_template,
-            input_variables=["claim", "search_results", "search_hint", "verification_hints"],
+            input_variables=["claim", "search_results", "search_hint",
+                             "verification_hints", "nli_hint", "number_comparison"],
         )
 
         # Шаг 1: Извлечение ключевых слов
@@ -191,7 +202,83 @@ class FactCheckPipeline:
                       f"чисел: {len(claim_info['numbers'])}, дат: {len(claim_info['dates'])}")
             return hints
 
-        # Шаг 3: Оценка достоверности (Quote-Then-Judge + Triple Self-Check)
+        # Шаг 2.7: NLI анализ — DeBERTa классифицирует claim vs каждый source
+        def nli_analysis_step(state: dict) -> str:
+            if self.nli_checker is None:
+                self._local.nli_result = None
+                return ""
+
+            raw_results = getattr(self._local, "raw_results", [])
+            if not raw_results:
+                self._local.nli_result = {
+                    "max_entailment": 0.0, "max_contradiction": 0.0,
+                    "entailment_count": 0, "contradiction_count": 0,
+                }
+                return "NLI АНАЛИЗ: источники не найдены."
+
+            claim = state.get("claim", "")
+            nli_result = self.nli_checker.check_claim(claim, raw_results, snippet_key="snippet")
+            self._local.nli_result = nli_result
+
+            ent = nli_result["max_entailment"]
+            con = nli_result["max_contradiction"]
+            ent_c = nli_result["entailment_count"]
+            con_c = nli_result["contradiction_count"]
+            print(f"  NLI: entailment={ent:.2f} ({ent_c} src), contradiction={con:.2f} ({con_c} src)")
+
+            if con >= 0.60:
+                return (f"NLI АНАЛИЗ: {con_c} источник(ов) ОПРОВЕРГАЮТ утверждение "
+                        f"(contradiction={con:.2f}). Есть прямое противоречие с фактами.")
+            elif ent >= 0.60:
+                return (f"NLI АНАЛИЗ: {ent_c} источник(ов) подтверждают утверждение "
+                        f"(entailment={ent:.2f}).")
+            else:
+                return (f"NLI АНАЛИЗ: источники не дают чёткого сигнала "
+                        f"(entailment={ent:.2f}, contradiction={con:.2f}).")
+
+        # Шаг 2.8: Детерминистическая проверка чисел — claim vs sources
+        def number_check_step(state: dict) -> str:
+            claim = state.get("claim", "")
+            claim_numbers = extract_numbers(claim)
+            if not claim_numbers:
+                self._local.num_comparisons = []
+                return ""
+
+            raw_results = getattr(self._local, "raw_results", [])
+            all_comparisons = []
+            for source in raw_results:
+                snippet = source.get("snippet", "")
+                source_numbers = extract_numbers(snippet)
+                if source_numbers:
+                    comps = compare_numbers(claim_numbers, source_numbers)
+                    all_comparisons.extend(comps)
+            self._local.num_comparisons = all_comparisons
+
+            mismatches = [c for c in all_comparisons if c["source_number"] and not c["match"]]
+            matches = [c for c in all_comparisons if c["source_number"] and c["match"]]
+
+            if mismatches:
+                parts = []
+                for m in mismatches[:3]:
+                    cv = m["claim_number"]["raw"]
+                    sv = m["source_number"]["raw"]
+                    dev = m["deviation"]
+                    parts.append(f"claim={cv}, источник={sv} (расхождение {dev*100:.0f}%)")
+                hint = "ЧИСЛОВАЯ ПРОВЕРКА: РАСХОЖДЕНИЕ! " + "; ".join(parts)
+                print(f"  Числа: РАСХОЖДЕНИЕ ({len(mismatches)} несовпадений)")
+                return hint
+            elif matches:
+                parts = []
+                for m in matches[:3]:
+                    cv = m["claim_number"]["raw"]
+                    sv = m["source_number"]["raw"]
+                    parts.append(f"{cv}={sv}")
+                print(f"  Числа: совпадают ({len(matches)})")
+                return "ЧИСЛОВАЯ ПРОВЕРКА: числа совпадают: " + ", ".join(parts)
+            else:
+                return ""
+
+        # Шаг 3: Оценка достоверности
         verdict_chain = verdict_prompt | self.verdict_llm | StrOutputParser()
 
         # Полная цепочка
@@ -205,6 +292,10 @@ class FactCheckPipeline:
             | RunnablePassthrough.assign(
                 search_hint=RunnableLambda(get_search_hint),
                 verification_hints=RunnableLambda(get_verification_hints),
+            )
+            | RunnablePassthrough.assign(
+                nli_hint=RunnableLambda(nli_analysis_step),
+                number_comparison=RunnableLambda(number_check_step),
             )
             | RunnablePassthrough.assign(
                 verdict=verdict_chain,
@@ -385,19 +476,13 @@ class FactCheckPipeline:
         parsed_verdict: Dict[str, Any],
         critique: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Применение коррекций из self-critique к вердикту.
-
-        Коррекция применяется только если:
-        1. Критик нашёл ошибки (КОРРЕКЦИЯ: ДА)
-        2. Рекомендуемый вердикт и score консистентны
-        """
+        """Применение коррекций из self-critique к вердикту."""
         if not critique["needs_correction"]:
             return parsed_verdict
 
         rec_score = critique["recommended_score"]
         rec_verdict = critique["recommended_verdict"]
 
-        # Проверяем консистентность рекомендации критика
         if rec_score is not None and rec_verdict is not None:
             is_consistent = False
             if rec_verdict == "ПРАВДА" and 70 <= rec_score <= 100:
@@ -411,7 +496,6 @@ class FactCheckPipeline:
                 parsed_verdict["credibility_score"] = rec_score
                 parsed_verdict["verdict"] = rec_verdict
 
-        # Добавляем информацию о коррекции
         errors = critique.get("errors", "")
         if errors and errors.lower() != "нет":
             parsed_verdict["reasoning"] += f" [Самопроверка: {errors}]"
@@ -431,28 +515,83 @@ class FactCheckPipeline:
             })
         return sources
 
-    @staticmethod
-    def _apply_safety_net(
+    def _ensemble_verdict(
+        self,
         parsed: Dict[str, Any],
+        nli_result: Dict[str, Any],
+        num_comparisons: List[Dict],
         raw_results: List[Dict],
     ) -> Dict[str, Any]:
-        """Минимальный safety net: проверка ГРУБОЙ консистентности вердикта.
+        """NLI-first ensemble verdict.
 
-        Модель может использовать параметрические знания (обучающие данные),
-        поэтому отсутствие источников НЕ означает невозможность судить.
-
-        Правила (только для грубых противоречий):
-        1. ПРАВДА но score < 40 → явное противоречие → НЕ ПОДТВЕРЖДЕНО
-        2. ЛОЖЬ но score > 60 → явное противоречие → НЕ ПОДТВЕРЖДЕНО
+        Приоритет: числовая проверка > NLI DeBERTa > LLM reasoning.
         """
-        score = parsed["credibility_score"]
         verdict = parsed["verdict"].upper().strip()
+        score = parsed["credibility_score"]
 
-        # Rule 1: ПРАВДА но score очень низкий → модель сама не уверена
+        has_sources = len(raw_results) > 0
+        nums_mismatch = any(
+            c for c in num_comparisons
+            if c["source_number"] and not c["match"]
+        )
+
+        nli_ent = 0.0
+        nli_con = 0.0
+        if nli_result:
+            nli_ent = nli_result.get("max_entailment", 0.0)
+            nli_con = nli_result.get("max_contradiction", 0.0)
+
+        # Rule 1: Числовое расхождение → ЛОЖЬ (детерминистика, 100%)
+        if nums_mismatch:
+            parsed["verdict"] = "ЛОЖЬ"
+            parsed["credibility_score"] = min(score, 20)
+            logger.info("Ensemble: Rule 1 — числовое расхождение → ЛОЖЬ")
+            return parsed
+
+        # Rule 2: NLI contradiction сильная → ЛОЖЬ
+        if nli_con >= 0.70 and nli_ent < 0.40:
+            parsed["verdict"] = "ЛОЖЬ"
+            parsed["credibility_score"] = min(score, 25)
+            logger.info(f"Ensemble: Rule 2 — NLI contradiction={nli_con:.2f} → ЛОЖЬ")
+            return parsed
+
+        # Rule 3: NLI entailment сильная + числа ok → ПРАВДА
+        if nli_ent >= 0.65 and nli_con < 0.30 and not nums_mismatch:
+            parsed["verdict"] = "ПРАВДА"
+            parsed["credibility_score"] = max(score, 75)
+            logger.info(f"Ensemble: Rule 3 — NLI entailment={nli_ent:.2f} → ПРАВДА")
+            return parsed
+
+        # Rule 4: Нет источников
+        if not has_sources:
+            if verdict == "ПРАВДА" and score > 70:
+                # common knowledge, cap confidence
+                parsed["credibility_score"] = min(score, 80)
+            elif verdict == "ЛОЖЬ":
+                pass  # LLM уверена что ложь — доверяем
+            else:
+                parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
+                parsed["credibility_score"] = min(score, 55)
+            logger.info("Ensemble: Rule 4 — нет источников")
+            return parsed
+
+        # Rule 5: LLM ПРАВДА но NLI не подтверждает
+        if verdict == "ПРАВДА" and nli_ent < 0.40 and has_sources:
+            parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
+            parsed["credibility_score"] = min(score, 55)
+            logger.info(f"Ensemble: Rule 5 — LLM ПРАВДА но NLI ent={nli_ent:.2f} → НЕ ПОДТВЕРЖДЕНО")
+            return parsed
+
+        # Rule 6: LLM ЛОЖЬ но NLI entailment (LLM ошиблась)
+        if verdict == "ЛОЖЬ" and nli_con < 0.30 and nli_ent > 0.50:
+            parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
+            parsed["credibility_score"] = 45
+            logger.info(f"Ensemble: Rule 6 — LLM ЛОЖЬ но NLI ent={nli_ent:.2f} → НЕ ПОДТВЕРЖДЕНО")
+            return parsed
+
+        # Default: trust LLM + basic consistency check
         if verdict == "ПРАВДА" and score < 40:
             parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
-
-        # Rule 2: ЛОЖЬ но score высокий → модель сама противоречит себе
         elif verdict == "ЛОЖЬ" and score > 60:
             parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
 
@@ -466,6 +605,8 @@ class FactCheckPipeline:
         # Сброс промежуточного состояния (thread-local)
         self._local.search_hint = ""
         self._local.raw_results = []
+        self._local.nli_result = None
+        self._local.num_comparisons = []
 
         state = {"claim": claim}
 
@@ -491,10 +632,15 @@ class FactCheckPipeline:
                 "total_time": 0,
             }
 
-        # Парсинг вердикта + smart safety net
+        # Парсинг вердикта
         raw_results = getattr(self._local, "raw_results", [])
+        nli_result = getattr(self._local, "nli_result", None)
+        num_comparisons = getattr(self._local, "num_comparisons", [])
         parsed = self.parse_verdict(raw_result.get("verdict", ""))
-        parsed = self._apply_safety_net(parsed, raw_results)
+
+        # NLI ensemble verdict (заменяет _apply_safety_net)
+        parsed = self._ensemble_verdict(parsed, nli_result, num_comparisons, raw_results)
+        print(f"  Ensemble verdict: {parsed['verdict']} (score={parsed['credibility_score']})")
 
         # Post-verdict self-critique
         critique_info = {}

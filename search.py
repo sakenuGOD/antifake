@@ -141,25 +141,37 @@ class FactCheckSearcher:
         return articles
 
     def _search_ddg(self, keyword: str, web_mode: bool = False) -> List[Dict[str, str]]:
-        """Поиск через DuckDuckGo (бесплатный fallback, без API-ключа)."""
+        """Поиск через DuckDuckGo (бесплатный fallback, без API-ключа).
+
+        Retry 3 попытки с exponential backoff (2/4/8 сек).
+        """
         from duckduckgo_search import DDGS
 
-        # Всегда используем text search — news для русского языка возвращает 0
-        results = DDGS().text(
-            keywords=keyword.strip(),
-            region="ru-ru",
-            max_results=self.config.num_results,
-        )
-        articles = []
-        for item in results:
-            articles.append({
-                "title": item.get("title", ""),
-                "snippet": item.get("body", item.get("snippet", "")),
-                "source": item.get("source", ""),
-                "link": item.get("url", item.get("href", "")),
-                "date": item.get("date", ""),
-            })
-        return articles
+        for attempt in range(3):
+            try:
+                results = DDGS().text(
+                    keywords=keyword.strip(),
+                    region="ru-ru",
+                    max_results=self.config.num_results,
+                )
+                articles = []
+                for item in results:
+                    articles.append({
+                        "title": item.get("title", ""),
+                        "snippet": item.get("body", item.get("snippet", "")),
+                        "source": item.get("source", ""),
+                        "link": item.get("url", item.get("href", "")),
+                        "date": item.get("date", ""),
+                    })
+                return articles
+            except Exception as e:
+                if attempt < 2:
+                    wait = 2 ** (attempt + 1)
+                    print(f"  [DDG] Попытка {attempt+1}/3 неудачна: {e}. Ожидание {wait} сек...")
+                    time.sleep(wait)
+                else:
+                    print(f"  [DDG] Все 3 попытки неудачны: {e}")
+                    return []
 
     def search_keyword(self, keyword: str, web_mode: bool = False) -> List[Dict[str, str]]:
         """Поиск с кэшем, rate limiting и fallback.
@@ -190,14 +202,10 @@ class FactCheckSearcher:
                 print(f"  [SerpAPI] Переключаюсь на DuckDuckGo для всех запросов")
                 self._serpapi_failed = True
 
-        # DuckDuckGo (fallback)
-        try:
-            results = self._search_ddg(keyword, web_mode=web_mode)
-            self._cache.set(cache_key, results)
-            return results
-        except Exception as e:
-            print(f"  [DDG] Ошибка при поиске '{keyword}': {e}")
-            return []
+        # DuckDuckGo (fallback) — retry logic is inside _search_ddg
+        results = self._search_ddg(keyword, web_mode=web_mode)
+        self._cache.set(cache_key, results)
+        return results
 
     def search_all_keywords(
         self, keywords: List[str], claim: str = ""
@@ -290,7 +298,7 @@ class FactCheckSearcher:
             if article.get("date"):
                 parts.append(f"   Дата: {article['date']}")
             if article.get("snippet"):
-                snippet = article["snippet"][:300]
+                snippet = article["snippet"][:500]
                 parts.append(f"   {snippet}")
             lines.append("\n".join(parts))
 
