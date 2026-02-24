@@ -96,8 +96,13 @@ class FactCheckSearcher:
         except ImportError:
             print("Семантическое ранжирование: выключено (pip install sentence-transformers)")
 
-    def _search_serpapi(self, keyword: str) -> List[Dict[str, str]]:
-        """Поиск через SerpAPI (платный, основной)."""
+    def _search_serpapi(self, keyword: str, web_mode: bool = False) -> List[Dict[str, str]]:
+        """Поиск через SerpAPI (платный, основной).
+
+        Args:
+            web_mode: если True — ищем в общем вебе (Wikipedia, справочники),
+                      если False — только в новостях (tbm=nws).
+        """
         from serpapi import GoogleSearch
 
         params = {
@@ -105,14 +110,17 @@ class FactCheckSearcher:
             "engine": "google",
             "gl": self.config.gl,
             "hl": self.config.hl,
-            "tbm": self.config.tbm,
             "num": self.config.num_results,
             "api_key": self.config.api_key,
         }
+        if not web_mode:
+            params["tbm"] = self.config.tbm
+
         search = GoogleSearch(params)
         results = search.get_dict()
 
         articles = []
+        # Новостные результаты (tbm=nws)
         for item in results.get("news_results", []):
             articles.append({
                 "title": item.get("title", ""),
@@ -121,35 +129,56 @@ class FactCheckSearcher:
                 "link": item.get("link", ""),
                 "date": item.get("date", ""),
             })
+        # Общие веб-результаты (без tbm) — Wikipedia, справочники и т.д.
+        for item in results.get("organic_results", []):
+            articles.append({
+                "title": item.get("title", ""),
+                "snippet": item.get("snippet", ""),
+                "source": item.get("displayed_link", ""),
+                "link": item.get("link", ""),
+                "date": "",
+            })
         return articles
 
-    def _search_ddg(self, keyword: str) -> List[Dict[str, str]]:
+    def _search_ddg(self, keyword: str, web_mode: bool = False) -> List[Dict[str, str]]:
         """Поиск через DuckDuckGo (бесплатный fallback, без API-ключа)."""
         from duckduckgo_search import DDGS
 
-        results = DDGS().news(
-            keywords=keyword.strip(),
-            region="ru-ru",
-            max_results=self.config.num_results,
-        )
+        if web_mode:
+            results = DDGS().text(
+                keywords=keyword.strip(),
+                region="ru-ru",
+                max_results=self.config.num_results,
+            )
+        else:
+            results = DDGS().news(
+                keywords=keyword.strip(),
+                region="ru-ru",
+                max_results=self.config.num_results,
+            )
         articles = []
         for item in results:
             articles.append({
                 "title": item.get("title", ""),
-                "snippet": item.get("body", ""),
+                "snippet": item.get("body", item.get("snippet", "")),
                 "source": item.get("source", ""),
-                "link": item.get("url", ""),
+                "link": item.get("url", item.get("href", "")),
                 "date": item.get("date", ""),
             })
         return articles
 
-    def search_keyword(self, keyword: str) -> List[Dict[str, str]]:
-        """Поиск новостей с кэшем, rate limiting и fallback.
+    def search_keyword(self, keyword: str, web_mode: bool = False) -> List[Dict[str, str]]:
+        """Поиск с кэшем, rate limiting и fallback.
+
+        Args:
+            web_mode: если True — общий веб (Wikipedia, справочники),
+                      если False — только новости.
 
         Порядок: кэш → SerpAPI → DuckDuckGo.
         """
-        # Кэш
-        cached = self._cache.get(keyword)
+        # Кэш (разные ключи для news и web)
+        cache_key = f"{'web' if web_mode else 'news'}:{keyword}"
+        cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
 
@@ -159,8 +188,8 @@ class FactCheckSearcher:
         # SerpAPI (если ключ есть и API не упал)
         if self.config.api_key and not self._serpapi_failed:
             try:
-                results = self._search_serpapi(keyword)
-                self._cache.set(keyword, results)
+                results = self._search_serpapi(keyword, web_mode=web_mode)
+                self._cache.set(cache_key, results)
                 return results
             except Exception as e:
                 print(f"  [SerpAPI] Ошибка: {e}")
@@ -169,8 +198,8 @@ class FactCheckSearcher:
 
         # DuckDuckGo (fallback)
         try:
-            results = self._search_ddg(keyword)
-            self._cache.set(keyword, results)
+            results = self._search_ddg(keyword, web_mode=web_mode)
+            self._cache.set(cache_key, results)
             return results
         except Exception as e:
             print(f"  [DDG] Ошибка при поиске '{keyword}': {e}")
@@ -179,12 +208,13 @@ class FactCheckSearcher:
     def search_all_keywords(
         self, keywords: List[str], claim: str = ""
     ) -> List[Dict[str, str]]:
-        """Поиск по всем ключевым словам + комбинированный запрос + прямой поиск.
+        """Поиск по всем ключевым словам + общий веб + прямой поиск.
 
-        Стратегия поиска (три уровня для максимального recall):
-        1. Комбинированный запрос: все ключевые слова вместе
-        2. Прямой поиск: первые 120 символов утверждения целиком
-        3. Поиск по отдельным ключевым словам
+        Стратегия поиска (4 уровня для максимального recall):
+        1. Общий веб-поиск утверждения (Wikipedia, справочники — для фактов)
+        2. Комбинированный запрос в новостях (все ключевые слова вместе)
+        3. Прямой поиск утверждения в новостях (первые 120 символов)
+        4. Поиск по отдельным ключевым словам в новостях
         """
         seen_urls = set()
         all_results = []
@@ -196,18 +226,22 @@ class FactCheckSearcher:
                     seen_urls.add(url)
                     all_results.append(article)
 
-        # 1. Комбинированный запрос (все ключевые слова вместе — лучший recall)
+        # 1. Общий веб-поиск (Wikipedia, справочники — критично для фактов)
+        if claim.strip():
+            _add_articles(self.search_keyword(claim.strip()[:120], web_mode=True))
+
+        # 2. Комбинированный запрос в новостях
         combined_query = " ".join(kw.strip() for kw in keywords if kw.strip())
         if combined_query:
             _add_articles(self.search_keyword(combined_query))
 
-        # 2. Прямой поиск утверждения (первые 120 символов)
+        # 3. Прямой поиск утверждения в новостях
         if claim.strip():
             direct_query = claim.strip()[:120]
             if direct_query != combined_query:
                 _add_articles(self.search_keyword(direct_query))
 
-        # 3. Поиск по отдельным ключевым словам
+        # 4. Поиск по отдельным ключевым словам в новостях
         for keyword in keywords:
             if not keyword.strip():
                 continue
