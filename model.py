@@ -44,7 +44,7 @@ def load_base_model(config: ModelConfig = None):
     if config is None:
         config = ModelConfig()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -53,22 +53,15 @@ def load_base_model(config: ModelConfig = None):
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(True)
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-
-    print(f"  Загрузка base модели: {config.inference_model_name}")
+    base_model = config.base_model_name
+    print(f"  Загрузка base модели: {base_model}")
     model = AutoModelForCausalLM.from_pretrained(
-        config.inference_model_name,
-        quantization_config=bnb_config,
+        base_model,
         device_map="auto",
-        torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
+        dtype=torch.bfloat16,
     )
-    tokenizer = AutoTokenizer.from_pretrained(config.inference_model_name)
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
 
     model.eval()
     return model, tokenizer
@@ -91,7 +84,7 @@ def load_finetuned_model(adapter_path: str, config: ModelConfig = None):
     if config is None:
         config = ModelConfig()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
 
     # Очистка VRAM перед загрузкой
@@ -103,26 +96,17 @@ def load_finetuned_model(adapter_path: str, config: ModelConfig = None):
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(True)
 
-    # 4-bit NF4 квантизация через bitsandbytes (как при обучении)
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-
-    # Загрузка ОРИГИНАЛЬНОЙ модели через plain transformers (без Unsloth/Triton)
-    # ВАЖНО: используем inference_model_name, НЕ base_model_name (Unsloth 4-bit)
-    # Двойная квантизация уже квантованной модели → деградация весов
-    print(f"  Загрузка base модели: {config.inference_model_name}")
+    # Используем ту же pre-quantized модель что и при обучении (bnb-4bit).
+    # Адаптеры обучены на ней → 100% совместимость весов.
+    base_model = config.base_model_name
+    print(f"  Загрузка base модели: {base_model}")
     model = AutoModelForCausalLM.from_pretrained(
-        config.inference_model_name,
-        quantization_config=bnb_config,
+        base_model,
         device_map="auto",
-        torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
+        dtype=torch.bfloat16,
     )
-    tokenizer = AutoTokenizer.from_pretrained(config.inference_model_name)
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
 
     # GRPO адаптеры уже содержат SFT-веса (GRPO дообучает SFT LoRA напрямую),
     # поэтому загрузка одноэтапная — как и для SFT адаптеров.
