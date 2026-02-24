@@ -67,7 +67,7 @@ class SearchConfig:
     gl: str = "ru"
     hl: str = "ru"
     tbm: str = "nws"
-    num_results: int = 5
+    num_results: int = 8
 
 
 @dataclass
@@ -75,7 +75,7 @@ class PipelineConfig:
     keyword_max_new_tokens: int = 128
     verdict_max_new_tokens: int = 1500  # увеличено для Chain-of-Thought рассуждений
     critique_max_new_tokens: int = 512  # для post-verdict self-critique
-    temperature: float = 0.1
+    temperature: float = 0.0            # детерминистичный вывод (do_sample=False)
     repetition_penalty: float = 1.15
     enable_self_critique: bool = False  # отключен: LLM проверяет сам себя — бесполезно
     enable_nli: bool = True

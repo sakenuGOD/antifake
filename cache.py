@@ -14,7 +14,7 @@ from typing import Optional, List, Dict
 class SearchCache:
     """Простой файловый кэш для результатов поиска."""
 
-    def __init__(self, cache_dir: str = ".cache/searches", ttl: int = 3600):
+    def __init__(self, cache_dir: str = ".cache/searches", ttl: int = 86400):  # 24h TTL
         self.cache_dir = cache_dir
         self.ttl = ttl
         os.makedirs(cache_dir, exist_ok=True)

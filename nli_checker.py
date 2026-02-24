@@ -43,9 +43,21 @@ class NLIChecker:
 
     @staticmethod
     def _split_sentences(text: str) -> List[str]:
-        """Split text into sentences for fine-grained NLI scoring."""
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        return [s.strip() for s in sentences if len(s.strip()) > 10]
+        """Split text into sentences for fine-grained NLI scoring.
+
+        Improved Russian sentence splitting:
+        - Split on sentence-ending punctuation followed by space + uppercase/digit
+        - Also split on semicolons and long dashes (common in Russian news)
+        - Filter out very short fragments (< 15 chars) for better NLI signal
+        """
+        # Split on .!? followed by space, also on ; and — (Russian style)
+        sentences = re.split(r'(?<=[.!?;])\s+|(?<=\.)\s*\n|(?:\s+[—–]\s+)', text)
+        # Additional split: numbered items "1) ...", "2. ..."
+        expanded = []
+        for s in sentences:
+            parts = re.split(r'(?:^|\s)\d+[.)]\s+', s)
+            expanded.extend(parts)
+        return [s.strip() for s in expanded if len(s.strip()) > 15]
 
     @torch.no_grad()
     def check_pair(self, claim: str, evidence: str) -> Dict[str, float]:

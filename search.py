@@ -144,15 +144,16 @@ class FactCheckSearcher:
         """Поиск через DuckDuckGo (бесплатный fallback, без API-ключа).
 
         Retry 3 попытки с exponential backoff (2/4/8 сек).
+        Использует новый пакет `ddgs` (замена устаревшего `duckduckgo_search`).
         """
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
 
         for attempt in range(3):
             try:
                 results = DDGS().text(
-                    keywords=keyword.strip(),
-                    region="ru-ru",
+                    keyword.strip(),
                     max_results=self.config.num_results,
+                    backend="html",  # детерминистичный бэкенд (auto = рандомный)
                 )
                 articles = []
                 for item in results:
@@ -228,6 +229,18 @@ class FactCheckSearcher:
                     seen_urls.add(url)
                     all_results.append(article)
 
+        # 0. Контрастивный поиск: для утверждений "X — Y" ищем только "X"
+        # Находит РЕАЛЬНЫЙ ответ (не тот что в claim), ловит подмены деталей
+        # "Столица Австралии — Сидней" → ищем "Столица Австралии" → находим "Канберра"
+        if claim.strip():
+            import re as _re
+            for sep in [" — ", " - ", " является ", " это ", " составляет "]:
+                if sep in claim:
+                    question_part = claim.split(sep)[0].strip()
+                    if question_part and len(question_part) >= 10:
+                        _add_articles(self.search_keyword(question_part, web_mode=True))
+                    break
+
         # 1. Общий веб-поиск (Wikipedia, справочники — критично для фактов)
         if claim.strip():
             _add_articles(self.search_keyword(claim.strip()[:120], web_mode=True))
@@ -255,8 +268,14 @@ class FactCheckSearcher:
         self,
         claim: str,
         results: List[Dict[str, str]],
+        min_semantic_score: float = 0.35,
     ) -> List[Dict[str, str]]:
-        """Ранжирование результатов: семантическое (если доступно) или bag-of-words."""
+        """Ранжирование результатов: семантическое (если доступно) или bag-of-words.
+
+        ВАЖНО: отсекаем результаты с semantic_score < min_semantic_score.
+        Это предотвращает попадание мусора в pipeline (пример: рестораны ТОКИО-CITY
+        вместо Олимпийских игр 2024, когда DuckDuckGo цепляется за слово "Токио").
+        """
         if not results:
             return []
 
@@ -264,7 +283,17 @@ class FactCheckSearcher:
         if self._semantic_ranker is not None:
             results = self._semantic_ranker.rank_results(claim, results, top_k=10)
             results = boost_by_credibility(results)
-            return results
+            # Фильтрация по минимальной релевантности, но ВСЕГДА оставляем минимум 3
+            # (results уже отсортированы по final_score после boost_by_credibility)
+            before = len(results)
+            filtered = [r for r in results if r.get("semantic_score", 0) >= min_semantic_score]
+            if len(filtered) < 3 and before >= 3:
+                # Порог слишком строгий — оставляем топ-3 по final_score
+                filtered = results[:3]
+            elif len(filtered) < before:
+                dropped = before - len(filtered)
+                print(f"  Отфильтровано нерелевантных: {dropped}/{before} (порог {min_semantic_score})")
+            return filtered if filtered else results[:3]
 
         # Fallback: bag-of-words cosine similarity
         for article in results:
