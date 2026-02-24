@@ -7,11 +7,18 @@ lyrics_mixer/
 .cache/
 *.log
 .env
-antifake/
 unsloth_compiled_cache/
-adapters/
-data/
-*.md
 .vscode/
 *.bak
 .gitattributes
+
+# Model weights (too large for git)
+adapters/**/*.bin
+adapters/**/*.safetensors
+adapters/**/*.pt
+adapters/**/*.msgpack
+adapters/_sft_merged_temp/
+adapters/checkpoint-*/
+
+# Eval logs (generated)
+eval_log*.txt
