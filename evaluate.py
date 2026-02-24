@@ -122,13 +122,14 @@ def compute_metrics(predictions: List[int], labels: List[int]) -> Dict[str, floa
     }
 
 
-def evaluate_rag(pipeline) -> Dict:
+def evaluate_rag(pipeline, collect_features: bool = True) -> Dict:
     """Этап Б: Тестирование с RAG-конвейером (с поиском)."""
     predictions = []
     labels = []
     latencies = []
     verdicts = []
     unverified_count = 0
+    feature_records = []
 
     for i, sample in enumerate(TEST_DATASET):
         claim = sample["claim"]
@@ -151,7 +152,8 @@ def evaluate_rag(pipeline) -> Dict:
         elif verdict in ("ПРАВДА", "TRUE"):
             predicted = 1  # real
         else:
-            # НЕ ПОДТВЕРЖДЕНО → conservative: treat as suspicious (fake)
+            # НЕ ПОДТВЕРЖДЕНО → система НЕ нашла пруфов → fake (0)
+            # Модель должна УВЕРЕННО сказать ПРАВДА или ЛОЖЬ, а не сомневаться
             predicted = 0
 
         is_unverified = "НЕ ПОДТВЕРЖДЕНО" in verdict
@@ -161,6 +163,19 @@ def evaluate_rag(pipeline) -> Dict:
         predictions.append(predicted)
         labels.append(true_label)
 
+        # Собираем фичи для meta-классификатора
+        if collect_features:
+            features = result.get("_ensemble_features", {})
+            if features:
+                feature_records.append({
+                    "claim": claim,
+                    "label": true_label,
+                    "type": sample.get("type", "unknown"),
+                    "predicted_verdict": result.get("verdict", ""),
+                    "features": features,
+                    "latency": round(latency, 2),
+                })
+
         status = "OK" if predicted == true_label else "MISS"
         uv_tag = " [UV]" if is_unverified else ""
         print(f"  -> {verdict} (score={score}) | predicted={predicted}, true={true_label} [{status}]{uv_tag}")
@@ -169,6 +184,11 @@ def evaluate_rag(pipeline) -> Dict:
     metrics["avg_latency"] = round(sum(latencies) / len(latencies), 2)
     metrics["unverified_count"] = unverified_count
     metrics["unverified_rate"] = round(unverified_count / len(TEST_DATASET), 3)
+
+    # Verdict distribution
+    from collections import Counter
+    verdict_dist = Counter(verdicts)
+    metrics["verdict_distribution"] = dict(verdict_dist)
 
     # Per-type breakdown
     type_results = {}
@@ -187,6 +207,14 @@ def evaluate_rag(pipeline) -> Dict:
             "f1_macro": type_metrics["f1_macro"],
             "count": len(data["labels"]),
         }
+
+    # Сохраняем фичи для meta-классификатора
+    if collect_features and feature_records:
+        features_path = os.path.join("data", "meta_features.jsonl")
+        with open(features_path, "w", encoding="utf-8") as f:
+            for record in feature_records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"\nФичи для meta-classifier сохранены в {features_path} ({len(feature_records)} записей)")
 
     return metrics
 
