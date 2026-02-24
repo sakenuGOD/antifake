@@ -77,4 +77,7 @@ class PipelineConfig:
     critique_max_new_tokens: int = 512  # для post-verdict self-critique
     temperature: float = 0.1
     repetition_penalty: float = 1.15
-    enable_self_critique: bool = True   # вторичный анализ для перепроверки
+    enable_self_critique: bool = False  # отключен: LLM проверяет сам себя — бесполезно
+    enable_nli: bool = True
+    nli_model_name: str = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+    nli_device: str = "cpu"

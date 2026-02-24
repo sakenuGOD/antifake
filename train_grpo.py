@@ -39,14 +39,14 @@ SYSTEM_PROMPT = """\
 
 ФОРМАТ ОТВЕТА (строго!):
 <reasoning>
-Шаг 1: Для каждого источника — описывает ли он ТО ЖЕ событие?
-Шаг 2: Из релевантных источников выпиши конкретные цитаты.
-Шаг 3: Числовая проверка — совпадают ли цифры?
-Шаг 4: Тройная самопроверка + адвокат дьявола:
-  А) Источник про ТО ЖЕ событие или только тему?
-  Б) "Не найдено" ≠ "опровергнуто"?
-  В) Аргументы ПРОТИВ моего вердикта?
-  Г) Мой вердикт логичен?
+Шаг 1 — ИДЕНТИФИКАЦИЯ: Какое событие? Кто, что, где, когда, какие числа?
+Для каждого источника: описывает ли он ТО ЖЕ событие с ТЕМИ ЖЕ деталями?
+Шаг 2 — ФАКТЫ: Из релевантных источников выпиши цитаты.
+Совпадающие: "[Источник] сообщает: ..."
+Противоречащие: "[Источник] утверждает обратное: ..."
+Шаг 3 — ВЫВОД: NLI и числовые данные проверены автоматически. Учитывай их как факт.
+Если NLI contradiction — объясни почему утверждение ложно.
+Если числа расходятся — это расхождение с реальностью.
 </reasoning>
 <answer>
 ДОСТОВЕРНОСТЬ: [0-100]
@@ -249,7 +249,7 @@ def correctness_reward(completions: list, **kwargs) -> list:
         if predicted == expected_upper:
             scores.append(1.0)
         elif "НЕ ПОДТВЕРЖДЕНО" in predicted:
-            scores.append(-0.2)
+            scores.append(0.0)  # не штрафуем за осторожность
         else:
             scores.append(-1.0)
 
@@ -616,6 +616,7 @@ def train_grpo(
         max_grad_norm=0.3,            # менее жёсткий клиппинг
         temperature=1.0,              # разнообразие генераций для GRPO exploration
         bf16=False,                   # native bfloat16 (Accelerator dtype fix)
+        mask_truncated_completions=True,
         report_to="none",
         log_completions=True,
         use_vllm=False,
@@ -629,13 +630,14 @@ def train_grpo(
         model=model,
         processing_class=tokenizer,
         reward_funcs=[
-            format_reward,
-            reasoning_quality_reward,
-            verdict_consistency_reward,
-            correctness_reward,
-            devils_advocate_reward,
-            numerical_accuracy_reward,
+            format_reward,               # weight 0.1
+            reasoning_quality_reward,     # weight 0.1
+            verdict_consistency_reward,   # weight 0.1
+            correctness_reward,           # weight 3.0 — dominates
+            devils_advocate_reward,       # weight 0.0 — disabled (reward hacking)
+            numerical_accuracy_reward,    # weight 0.2
         ],
+        reward_weights=[0.1, 0.1, 0.1, 3.0, 0.0, 0.2],
         args=training_args,
         train_dataset=dataset,
         callbacks=[time_limit_cb],

@@ -22,3 +22,6 @@ adapters/checkpoint-*/
 
 # Eval logs (generated)
 eval_log*.txt
+
+# Markdown files (documentation, reports)
+*.md
