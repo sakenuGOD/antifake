@@ -2,7 +2,6 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
-adapters/
 *.egg-info/
 lyrics_mixer/
 .cache/
@@ -10,4 +9,9 @@ lyrics_mixer/
 .env
 antifake/
 unsloth_compiled_cache/
+adapters/
 data/
+*.md
+.vscode/
+*.bak
+.gitattributes
