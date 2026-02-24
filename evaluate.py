@@ -140,19 +140,21 @@ def evaluate_rag(pipeline) -> Dict:
         latencies.append(latency)
 
         # Маппинг вердикта в label
+        # Приоритет: явный вердикт модели > score > дефолт
         verdict = result.get("verdict", "").upper()
         score = result.get("credibility_score", 50)
 
-        if verdict in ("ЛОЖЬ", "FALSE") or score < 30:
-            predicted = 0  # fake
-        elif verdict in ("ПРАВДА", "TRUE") or score >= 70:
-            predicted = 1  # real
-        elif score >= 50:
-            # НЕ ПОДТВЕРЖДЕНО (50-69): score выше среднего — скорее правда
-            predicted = 1
+        if verdict in ("ЛОЖЬ", "FALSE"):
+            predicted = 0  # fake — модель уверена
+        elif verdict in ("ПРАВДА", "TRUE"):
+            predicted = 1  # real — модель уверена
+        elif score >= 70:
+            predicted = 1  # высокий score — скорее правда
+        elif score < 30:
+            predicted = 0  # низкий score — скорее фейк
         else:
-            # НЕ ПОДТВЕРЖДЕНО (30-49): score ниже среднего — скорее фейк
-            predicted = 0
+            # НЕ ПОДТВЕРЖДЕНО (30-69): серая зона — используем score 50 как порог
+            predicted = 1 if score >= 50 else 0
 
         predictions.append(predicted)
         labels.append(true_label)
