@@ -1,0 +1,47 @@
+{
+  "accuracy": 0.592,
+  "precision_fake": 0.667,
+  "recall_fake": 0.333,
+  "f1_fake": 0.444,
+  "precision_real": 0.568,
+  "recall_real": 0.84,
+  "f1_real": 0.677,
+  "f1_macro": 0.561,
+  "tp": 8,
+  "fp": 4,
+  "fn": 16,
+  "tn": 21,
+  "avg_latency": 102.63,
+  "per_type": {
+    "numerical": {
+      "accuracy": 0.6,
+      "f1_macro": 0.583,
+      "count": 10
+    },
+    "date": {
+      "accuracy": 0.4,
+      "f1_macro": 0.286,
+      "count": 10
+    },
+    "person": {
+      "accuracy": 0.333,
+      "f1_macro": 0.25,
+      "count": 6
+    },
+    "institutional": {
+      "accuracy": 0.556,
+      "f1_macro": 0.5,
+      "count": 9
+    },
+    "event": {
+      "accuracy": 0.75,
+      "f1_macro": 0.667,
+      "count": 8
+    },
+    "general": {
+      "accuracy": 1.0,
+      "f1_macro": 0.5,
+      "count": 6
+    }
+  }
+}
