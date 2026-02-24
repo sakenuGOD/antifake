@@ -198,15 +198,16 @@ def main():
                         help="Путь для сохранения результатов")
     args = parser.parse_args()
 
-    if not os.environ.get("SERPAPI_API_KEY"):
-        print("Ошибка: SERPAPI_API_KEY не установлен.")
-        return
-
     from pipeline import FactCheckPipeline
     from config import SearchConfig
     from model import find_best_adapter
 
-    search_config = SearchConfig(api_key=os.environ["SERPAPI_API_KEY"])
+    serpapi_key = os.environ.get("SERPAPI_API_KEY", "")
+    search_config = SearchConfig(api_key=serpapi_key)
+    if serpapi_key:
+        print(f"SerpAPI ключ: установлен (DDG как fallback)")
+    else:
+        print("SerpAPI ключ не установлен — используем DuckDuckGo")
     adapter_path = find_best_adapter()
     if adapter_path:
         print(f"Используются адаптеры: {adapter_path}")

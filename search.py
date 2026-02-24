@@ -144,18 +144,12 @@ class FactCheckSearcher:
         """Поиск через DuckDuckGo (бесплатный fallback, без API-ключа)."""
         from duckduckgo_search import DDGS
 
-        if web_mode:
-            results = DDGS().text(
-                keywords=keyword.strip(),
-                region="ru-ru",
-                max_results=self.config.num_results,
-            )
-        else:
-            results = DDGS().news(
-                keywords=keyword.strip(),
-                region="ru-ru",
-                max_results=self.config.num_results,
-            )
+        # Всегда используем text search — news для русского языка возвращает 0
+        results = DDGS().text(
+            keywords=keyword.strip(),
+            region="ru-ru",
+            max_results=self.config.num_results,
+        )
         articles = []
         for item in results:
             articles.append({
