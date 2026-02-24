@@ -147,9 +147,11 @@ def evaluate_rag(pipeline) -> Dict:
             predicted = 0  # fake
         elif verdict in ("ПРАВДА", "TRUE") or score >= 70:
             predicted = 1  # real
+        elif score >= 50:
+            # НЕ ПОДТВЕРЖДЕНО (50-69): score выше среднего — скорее правда
+            predicted = 1
         else:
-            # НЕ ПОДТВЕРЖДЕНО (30-69): консервативный подход для fact-checker —
-            # при неопределённости НЕ подтверждаем (предполагаем fake)
+            # НЕ ПОДТВЕРЖДЕНО (30-49): score ниже среднего — скорее фейк
             predicted = 0
 
         predictions.append(predicted)
