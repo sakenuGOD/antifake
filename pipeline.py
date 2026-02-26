@@ -19,13 +19,43 @@ from prompts import (
     KEYWORD_EXTRACTION_TEMPLATE,
     CREDIBILITY_ASSESSMENT_TEMPLATE,
     CREDIBILITY_ASSESSMENT_REASONING_TEMPLATE,
+    CREDIBILITY_ASSESSMENT_AUDIT_TEMPLATE,
+    CREDIBILITY_ASSESSMENT_AUDIT_REASONING_TEMPLATE,
     SELF_CRITIQUE_TEMPLATE,
 )
 from model import load_base_model, load_finetuned_model, build_langchain_llm, is_grpo_adapter
-from search import FactCheckSearcher
+from search import FactCheckSearcher, boost_factcheck_scores, validate_context_entities
 from claim_parser import classify_claim, format_verification_hints, extract_numbers, compare_numbers
 
 logger = logging.getLogger("fact_checker")
+
+# Промпт для декомпозиции составных утверждений (Проблема 1)
+_DECOMPOSE_TEMPLATE = """\
+Если утверждение содержит несколько отдельных фактов через союзы "и", "а", "а также", "при этом", "однако", "но", "кроме того", "где" — выпиши каждый факт ОТДЕЛЬНО, каждый с новой строки.
+ВАЖНО: восстанавливай подлежащее в каждом предложении (если написано "а её столица — X" → пиши "Официальная столица страны — X").
+Если факт один — верни только его.
+
+Утверждение: Норвегия входит в ЕС и использует евро
+Факты:
+Норвегия входит в ЕС
+Норвегия использует евро
+
+Утверждение: Страна входит в Содружество наций, а её официальная столица — Сидней
+Факты:
+Страна входит в Содружество наций
+Официальная столица страны — Сидней
+
+Утверждение: Tesla отозвала 2 млн авто, при этом акции компании упали на 5%
+Факты:
+Tesla отозвала 2 млн автомобилей
+Акции Tesla упали на 5%
+
+Утверждение: Путин подписал закон о повышении пенсий
+Факты:
+Путин подписал закон о повышении пенсий
+
+Утверждение: {claim}
+Факты:"""
 
 # Месяцы и общие слова для программной очистки ключевых слов
 _MONTHS_RU = {
@@ -98,6 +128,16 @@ class FactCheckPipeline:
             except Exception as e:
                 print(f"Meta-classifier не загружен: {e}")
 
+        # Cross-encoder re-ranker (CPU, улучшает отбор источников для NLI)
+        self._reranker = None
+        if pipeline_config.enable_cross_encoder:
+            try:
+                from embeddings import ReRanker
+                print("Загрузка CrossEncoder re-ranker...")
+                self._reranker = ReRanker()
+            except Exception as e:
+                print(f"CrossEncoder не загружен: {e}")
+
         # NLI checker (CPU, не занимает GPU)
         self.nli_checker = None
         if pipeline_config.enable_nli:
@@ -138,6 +178,18 @@ class FactCheckPipeline:
             pipeline_config=pipeline_config,
         )
 
+        # Лог: какой адаптер и какой шаблон используется
+        adapter_type = "GRPO" if self._use_reasoning_template else ("SFT" if adapter_path else "Base")
+        template_name = "CREDIBILITY_ASSESSMENT_REASONING_TEMPLATE (<reasoning>/<answer>)" if self._use_reasoning_template else "CREDIBILITY_ASSESSMENT_TEMPLATE (стандартный)"
+        print(f"  [Pipeline] Адаптер: {adapter_type}")
+        print(f"  [Pipeline] Шаблон: {template_name}")
+        if not self._use_reasoning_template:
+            print("  [Pipeline] ВНИМАНИЕ: GRPO адаптер не найден — Chain-of-Thought отключён")
+
+        # Подключаем Mistral к маршрутизатору запросов (QueryClassifier)
+        # keyword_llm уже загружен → передаём как generate_fn для 1-токенной классификации
+        self.searcher.set_generate_fn(lambda p: self.keyword_llm.invoke(p))
+
         # Сборка цепочки
         self.chain = self._build_chain()
 
@@ -160,7 +212,7 @@ class FactCheckPipeline:
         )
         verdict_prompt = PromptTemplate(
             template=verdict_template,
-            input_variables=["claim", "search_results", "search_hint",
+            input_variables=["claim_structured", "search_results", "search_hint",
                              "verification_hints", "nli_hint", "number_comparison"],
         )
 
@@ -174,11 +226,81 @@ class FactCheckPipeline:
             keywords = self._validate_keywords(keywords, claim)
             print(f"  Ключевые слова: {keywords}")
             results = self.searcher.search_all_keywords(keywords, claim=claim)
-            print(f"  Найдено новостей: {len(results)}")
+            wiki_cnt = sum(1 for r in results if 'wikipedia.org' in r.get('link', ''))
+            print(f"  Найдено новостей: {len(results)} (Wikipedia: {wiki_cnt})")
 
-            # Ранжирование по релевантности
+            # Сохраняем Wikipedia ДО ранжирования — semantic ranker может их отсечь
+            self._shared["wiki_results"] = [r for r in results if 'wikipedia.org' in r.get('link', '')]
+
+            # Дополнительный поиск для каждого под-утверждения (Проблема 1)
+            sub_claims = self._shared.get("sub_claims", [])
+            if len(sub_claims) > 1:
+                existing_urls = {r.get("link", "") for r in results}
+                for sc in sub_claims:
+                    sc_results = self.searcher.search_all_keywords([sc], claim=sc)
+                    for r in sc_results:
+                        url = r.get("link", "")
+                        if url and url not in existing_urls:
+                            results.append(r)
+                            existing_urls.add(url)
+                print(f"  + под-утверждения: {len(results)} источников итого")
+
+            # Ранжирование по релевантности (bi-encoder)
             results = self.searcher.rank_by_relevance(claim, results)
-            print(f"  После ранжирования: {len(results)} релевантных (топ-7 → модели)")
+            wiki_in_top = sum(1 for r in results if 'wikipedia.org' in r.get('link', ''))
+            print(f"  После ранжирования: {len(results)} релевантных (Wikipedia в топ: {wiki_in_top}, топ-7 → модели)")
+
+            # Cross-encoder re-ranking поверх bi-encoder кандидатов (Проблема 3)
+            if self._reranker is not None and results:
+                results = self._reranker.rerank(claim, results, top_k=min(7, len(results)))
+
+                # Direction 1: бустинг фактчек/debunk-источников (post-CrossEncoder).
+                # Гарантирует, что статьи-разоблачения вытесняют лайфстайл-новости на Топ-1.
+                results = boost_factcheck_scores(results)
+
+                # Direction 2: entity-match penalty + filter.
+                # Решает Semantic Overgeneralization: если из факта пропало ключевое слово
+                # («математика») в контексте (только «вступительные экзамены») —
+                # сначала снижаем скор пропорционально, затем фильтруем если penalty > порога.
+                ENTITY_PENALTY_WEIGHT = 1.5   # снижение скора * penalty (0.0–1.0)
+                ENTITY_FILTER_THRESHOLD = 0.35  # >35% ключевых слов факта отсутствует → кандидат на дроп
+                MIN_DOCS_AFTER_FILTER = 3       # не фильтруем если остаётся < N документов
+
+                any_penalized = False
+                for r in results:
+                    ctx = r.get("title", "") + " " + r.get("snippet", "")
+                    penalty = validate_context_entities(claim, ctx)
+                    r["_entity_penalty"] = penalty  # кэшируем для фильтрации ниже
+                    if penalty > 0.0:
+                        r["cross_encoder_score"] = (
+                            r.get("cross_encoder_score", r.get("semantic_score", 0.0))
+                            - penalty * ENTITY_PENALTY_WEIGHT
+                        )
+                        any_penalized = True
+
+                if any_penalized:
+                    # Пересортировка после entity-штрафа (Dir1 boost уже применён)
+                    results.sort(
+                        key=lambda x: x.get("cross_encoder_score", x.get("semantic_score", 0.0)),
+                        reverse=True,
+                    )
+                    # Фильтрация: удаляем документы с высоким entity-штрафом,
+                    # если у нас достаточно альтернатив с лучшим покрытием.
+                    _good = [r for r in results if r.get("_entity_penalty", 0) <= ENTITY_FILTER_THRESHOLD]
+                    if len(_good) >= MIN_DOCS_AFTER_FILTER:
+                        _dropped = len(results) - len(_good)
+                        if _dropped:
+                            print(f"  [EntityFilter] Отфильтровано {_dropped} контекстов "
+                                  f"(entity_penalty > {ENTITY_FILTER_THRESHOLD})")
+                        results = _good
+
+                # Убираем внутреннее поле перед передачей дальше
+                for r in results:
+                    r.pop("_entity_penalty", None)
+
+                for r in results:
+                    r["final_score"] = r.get("cross_encoder_score", r.get("semantic_score", 0))
+                print(f"  После cross-encoder: {len(results)} источников")
 
             # Нейтральная подсказка — НЕ предрешаем за модель
             total = len(results)
@@ -208,13 +330,52 @@ class FactCheckPipeline:
 
         # Шаг 2.6: Классификация утверждения и генерация подсказок для проверки
         def get_verification_hints(state: dict) -> str:
+            from claim_parser import detect_scam_patterns
             claim = state.get("claim", "")
             claim_info = classify_claim(claim)
-            self._shared["claim_info"] =claim_info
+            self._shared["claim_info"] = claim_info
+            self._shared["claim_locations"] = claim_info.get("locations", [])
+            self._shared["is_scam"] = claim_info.get("is_scam", False)
             hints = format_verification_hints(claim_info)
-            if hints:
+            
+            # Проверяем локации из claim в уже найденных источниках
+            raw_results = self._shared.get("raw_results", [])
+            claim_locs = claim_info.get("locations", [])
+            if claim_locs and raw_results:
+                _trans_map = {
+                    'токио': ['tokyo', 'tokio'], 'париж': ['paris'],
+                    'берлин': ['berlin'], 'лондон': ['london'],
+                    'катар': ['qatar'], 'японии': ['japan'],
+                    'германии': ['germany'], 'австралии': ['australia'],
+                    'китае': ['china'], 'сочи': ['sochi'],
+                    'пекин': ['beijing'], 'москва': ['moscow'],
+                }
+                src_text = " ".join(
+                    (r.get("snippet", "") + " " + r.get("title", "")).lower()
+                    for r in raw_results[:10]
+                )
+                confirmed = []
+                missing_loc = []
+                for loc in claim_locs:
+                    ll = loc.lower()
+                    found = ll in src_text or any(t in src_text for t in _trans_map.get(ll, []))
+                    (confirmed if found else missing_loc).append(loc)
+                
+                if confirmed and not missing_loc:
+                    conf_str = ", ".join(confirmed)
+                    hints += (f"\nПОДТВЕРЖДЕНИЕ: ключевая локация [{conf_str}] "
+                             f"ПРИСУТСТВУЕТ в источниках — место указано верно. "
+                             f"Не доверяй NLI если он слабо противоречит.")
+                elif missing_loc and not confirmed:
+                    miss_str = ", ".join(missing_loc)
+                    hints += (f"\nПРЕДУПРЕЖДЕНИЕ: локация [{miss_str}] "
+                             f"НЕ НАЙДЕНА в источниках — место, возможно, неверно.")
+
+            if claim_info["type"] or hints:
                 print(f"  Тип утверждения: {claim_info['type']}, "
-                      f"чисел: {len(claim_info['numbers'])}, дат: {len(claim_info['dates'])}")
+                      f"чисел: {len(claim_info['numbers'])}, дат: {len(claim_info['dates'])}, "
+                      f"локаций: {len(claim_locs)}, скам: {claim_info.get('is_scam', False)}")
+
             return hints
 
         # Шаг 2.7: NLI анализ — DeBERTa классифицирует claim vs TOP релевантных sources
@@ -234,11 +395,70 @@ class FactCheckPipeline:
 
             # ВАЖНО: передаём в NLI только TOP-5 по semantic_score.
             # 7 вредит: шумные 6-7 источники создают ложные contradiction для TRUE claims.
-            nli_sources = sorted(
-                raw_results,
-                key=lambda x: x.get("final_score", x.get("semantic_score", 0)),
-                reverse=True,
-            )[:5]
+            # Pre-filter: отбрасываем источники без overlap с claim (спам: Facebook, otto, etc.)
+            # Метод: извлекаем 5-char стемы из claim, требуем хотя бы 1 совпадение
+            claim_stems = set()
+            for _w in re.findall(r"[а-яёА-ЯЁa-zA-Z]{5,}", state.get("claim", "")):
+                claim_stems.add(_w.lower()[:5])
+            # Транслитерация для топонимов в стемах
+            _stem_trans = {
+                "париж": ["paris"], "токио": ["tokyo"], "лондо": ["londo"],
+                "берли": ["berli"], "пекин": ["beiji", "pekin"], "катар": ["qatar"],
+                "сидне": ["sydne"], "канбе": ["canbe"], "вашин": ["washi"],
+            }
+            _expanded_stems = set(claim_stems)
+            for _s, _alts in _stem_trans.items():
+                if _s in claim_stems:
+                    _expanded_stems.update(_alts)
+
+            def _has_claim_overlap(r: dict) -> bool:
+                _txt = (r.get("snippet", "") + " " + r.get("title", "")).lower()
+                return any(_st in _txt for _st in _expanded_stems)
+
+            _relevant = [r for r in raw_results if _has_claim_overlap(r)]
+            # Если релевантных достаточно — используем их, иначе fallback на всё
+            _pool = _relevant if len(_relevant) >= 3 else raw_results
+
+            # Wikipedia в NLI — ТОЛЬКО для локационных утверждений с явным подтверждением
+            # года И локации в сниппете/заголовке. Это предотвращает:
+            # 1) Ложные entailment для поддельных дат (Токио 2024 vs реальная статья о Париже 2024)
+            # 2) Нарушение KEY_DETAIL_MISSING для PERSON-type (Цукерберг/Tesla)
+            _wiki_all = self._shared.get("wiki_results", [])
+            _wiki_relevant = []
+            _claim_type = self._shared.get("claim_info", {}).get("type", "general") if self._shared.get("claim_info") else "general"
+            _claim_locations = self._shared.get("claim_locations", [])
+            if _claim_locations and _claim_type in ("date", "date_loc"):
+                # Строгий фильтр: год И локация должны быть в тексте статьи
+                _claim_years = re.findall(r'\b(?:19|20)\d{2}\b', state.get("claim", ""))
+                _loc_stems_strict = set()
+                for _loc in _claim_locations:
+                    for _w in re.findall(r"[а-яёА-ЯЁa-zA-Z]{4,}", _loc):
+                        _loc_stems_strict.add(_w.lower()[:5])
+                for _s, _alts in _stem_trans.items():
+                    if _s in _loc_stems_strict:
+                        _loc_stems_strict.update(_alts)
+                def _wiki_year_loc_match(r: dict) -> bool:
+                    _t = (r.get("title", "") + " " + r.get("snippet", "")).lower()
+                    _year_ok = (not _claim_years) or any(_yr in _t for _yr in _claim_years)
+                    _loc_ok = any(_ls in _t for _ls in _loc_stems_strict)
+                    return _year_ok and _loc_ok
+                _wiki_relevant = [r for r in _wiki_all if _wiki_year_loc_match(r)]
+
+            if _wiki_relevant:
+                _non_wiki = [r for r in _pool if 'wikipedia.org' not in r.get('link', '')]
+                _non_wiki_sorted = sorted(
+                    _non_wiki,
+                    key=lambda x: x.get("final_score", x.get("semantic_score", 0)),
+                    reverse=True,
+                )[:max(2, 5 - len(_wiki_relevant[:3]))]
+                nli_sources = _wiki_relevant[:3] + _non_wiki_sorted
+                print(f"  NLI: Wikipedia с подтверждением года+локации ({len(_wiki_relevant[:3])} ст.)")
+            else:
+                nli_sources = sorted(
+                    _pool,
+                    key=lambda x: x.get("final_score", x.get("semantic_score", 0)),
+                    reverse=True,
+                )[:5]
 
             claim = state.get("claim", "")
             nli_result = self.nli_checker.check_claim(claim, nli_sources, snippet_key="snippet")
@@ -249,28 +469,106 @@ class FactCheckPipeline:
             ent_c = nli_result["entailment_count"]
             con_c = nli_result["contradiction_count"]
             print(f"  NLI: entailment={ent:.2f} ({ent_c} src), contradiction={con:.2f} ({con_c} src)")
+            # DEBUG: показываем TOP-5 источники и их NLI-оценки
+            for _i, _src in enumerate(nli_sources):
+                _sc = _src.get("final_score", _src.get("semantic_score", 0))
+                print(f"    NLI src {_i+1}: [{_sc:.2f}] {_src.get('source','')} | {_src.get('title','')[:60]}")
 
-            if con >= 0.60:
-                return (f"NLI АНАЛИЗ: {con_c} источник(ов) ОПРОВЕРГАЮТ утверждение "
-                        f"(contradiction={con:.2f}). Есть прямое противоречие с фактами.")
-            elif ent >= 0.60:
-                return (f"NLI АНАЛИЗ: {ent_c} источник(ов) подтверждают утверждение "
-                        f"(entailment={ent:.2f}).")
-            else:
-                return (f"NLI АНАЛИЗ: источники не дают чёткого сигнала "
+            if con >= 0.80 and ent < 0.35:
+                # Чёткое противоречие: высокий con + очень низкий ent
+                return (f"NLI АНАЛИЗ: {con_c} источник(ов) ПРОТИВОРЕЧАТ утверждению "
+                        f"(contradiction={con:.2f}, entailment={ent:.2f}). "
+                        f"Возможно, утверждение содержит неверные детали. Проверь сам.")
+            elif ent >= 0.70 and con < 0.30:
+                # Чёткое подтверждение без противоречий
+                return (f"NLI АНАЛИЗ: {ent_c} источник(ов) ПОДТВЕРЖДАЮТ утверждение "
                         f"(entailment={ent:.2f}, contradiction={con:.2f}).")
+            elif con >= 0.60 or ent >= 0.60:
+                # Смешанный или умеренный сигнал — не делаем сильных выводов
+                return (f"NLI АНАЛИЗ: смешанные сигналы "
+                        f"(entailment={ent:.2f}×{ent_c}, contradiction={con:.2f}×{con_c}). "
+                        f"Полагайся на контент источников, не только на NLI.")
+            else:
+                return (f"NLI АНАЛИЗ: слабые сигналы "
+                        f"(entailment={ent:.2f}, contradiction={con:.2f}). "
+                        f"Источники не дают чёткого сигнала.")
 
-        # Шаг 2.8: Детерминистическая проверка чисел — claim vs sources
+        # Шаг 2.8: Детерминистическая проверка чисел И дат — claim vs sources
         def number_check_step(state: dict) -> str:
+            from claim_parser import extract_dates
             claim = state.get("claim", "")
             claim_numbers = extract_numbers(claim)
             # Фильтр: маленькие числа (< 10) типа "number" — это шум
             # ("1 января" → 1, "2 раза" → 2), не годятся для фактчекинга
             claim_numbers = [n for n in claim_numbers
                             if not (n["type"] == "number" and n["value"] < 10)]
+            
+            # Также проверяем даты из claim
+            claim_dates = extract_dates(claim)
+            claim_years = [d["year"] for d in claim_dates if "year" in d]
+            
+            raw_results = self._shared.get("raw_results", [])
+            date_hint = ""
+            
+            if claim_years and raw_results:
+                # Собираем все годы из источников
+                source_text_all = " ".join(
+                    (r.get("snippet", "") + " " + r.get("title", ""))
+                    for r in raw_results[:7]
+                )
+                source_dates = extract_dates(source_text_all)
+                source_years = set(d["year"] for d in source_dates if "year" in d)
+                
+                for cy in claim_years:
+                    if 1900 <= cy <= 2100:
+                        if cy not in source_years and source_years:
+                            near_years = [y for y in source_years if abs(y - cy) <= 5]
+                            if near_years:
+                                date_hint = (
+                                    f"ПРОВЕРКА ДАТ: утверждение упоминает {cy} год, "
+                                    f"но источники говорят о {sorted(near_years)[:3]} — "
+                                    f"возможное расхождение в дате."
+                                )
+                                self._shared["date_mismatch"] = True
+                                print(f"  Дата: claim={cy}, sources={sorted(near_years)[:3]} — РАСХОЖДЕНИЕ")
+                            else:
+                                self._shared["date_mismatch"] = False
+                        else:
+                            self._shared["date_mismatch"] = False
+            
             if not claim_numbers:
-                self._shared["num_comparisons"] =[]
-                return ""
+                self._shared["num_comparisons"] = []
+                
+                # Добавляем location confirmation hint если локации найдены в источниках
+                claim_locations = self._shared.get("claim_locations", [])
+                if claim_locations and raw_results:
+                    transliteration_map = {
+                        'токио': ['tokyo', 'tokio'], 'париж': ['paris'],
+                        'берлин': ['berlin'], 'лондон': ['london'],
+                        'катар': ['qatar'], 'японии': ['japan', 'japanese'],
+                        'японии': ['japan'], 'германии': ['germany'],
+                        'австралии': ['australia'], 'китае': ['china'],
+                    }
+                    source_text_all = " ".join(
+                        (r.get("snippet", "") + " " + r.get("title", "")).lower()
+                        for r in raw_results[:10]
+                    )
+                    confirmed_locs = []
+                    for loc in claim_locations:
+                        loc_lower = loc.lower()
+                        found = loc_lower in source_text_all
+                        if not found:
+                            trans = transliteration_map.get(loc_lower, [])
+                            found = any(t in source_text_all for t in trans)
+                        if found:
+                            confirmed_locs.append(loc)
+                    
+                    if confirmed_locs and len(confirmed_locs) == len(claim_locations):
+                        loc_hint = (f"ПОДТВЕРЖДЕНИЕ ЛОКАЦИИ: место «{', '.join(confirmed_locs)}» "
+                                   f"из утверждения найдено в источниках — это сигнал достоверности. "
+                                   f"Если источники описывают это место в контексте события — склоняйся к ПРАВДА.")
+                        return (date_hint + " " + loc_hint).strip() if date_hint else loc_hint       
+                return date_hint
 
             raw_results = self._shared.get("raw_results", [])
             all_comparisons = []
@@ -312,8 +610,59 @@ class FactCheckPipeline:
             else:
                 return ""
 
+        # Шаг 2.9: Формирование claim для финального промпта (Проблема 1 — основной фикс)
+        # Когда утверждение декомпозировано на N под-утверждений — передаём их модели
+        # в виде нумерованного списка вместо исходного монолитного предложения.
+        def build_claim_for_verdict(state: dict) -> str:
+            sub_claims = self._shared.get("sub_claims", [])
+            claim = state["claim"]
+            if len(sub_claims) > 1:
+                lines = "\n".join(f"{i}. {sc}" for i, sc in enumerate(sub_claims, 1))
+                return (
+                    f"СОСТАВНОЕ УТВЕРЖДЕНИЕ из {len(sub_claims)} независимых фактов "
+                    f"(оцени каждый пункт ОТДЕЛЬНО):\n{lines}\n\n"
+                    "Правило итогового вердикта: если хотя бы один пункт ЛОЖЬ — "
+                    "весь вердикт ЛОЖЬ / ФЕЙК."
+                )
+            return claim
+
         # Шаг 3: Оценка достоверности
-        verdict_chain = verdict_prompt | self.verdict_llm | StrOutputParser()
+        # Для составных утверждений (sub_claims > 1) — аудиторский шаблон (матрица фактов).
+        # Для простых — стандартный шаблон Chain-of-Thought.
+        # Выбор происходит динамически на основе self._shared["sub_claims"].
+
+        # Аудиторские промпты: base/SFT и GRPO версии
+        audit_template = (
+            CREDIBILITY_ASSESSMENT_AUDIT_REASONING_TEMPLATE
+            if self._use_reasoning_template
+            else CREDIBILITY_ASSESSMENT_AUDIT_TEMPLATE
+        )
+        audit_prompt = PromptTemplate(
+            template=audit_template,
+            input_variables=["claim_structured", "search_results", "search_hint",
+                             "verification_hints", "nli_hint", "number_comparison"],
+        )
+
+        _verdict_prompt = verdict_prompt      # захватываем в closure
+        _audit_prompt = audit_prompt
+
+        def verdict_step(state: dict) -> str:
+            """Динамически выбирает шаблон: аудиторский (N>1 фактов) или стандартный."""
+            sub_claims = self._shared.get("sub_claims", [])
+            if len(sub_claims) > 1:
+                filled = _audit_prompt.format(**{
+                    k: state.get(k, "") for k in _audit_prompt.input_variables
+                })
+                print(f"  [Verdict] Аудиторский шаблон ({len(sub_claims)} фактов)")
+            else:
+                filled = _verdict_prompt.format(**{
+                    k: state.get(k, "") for k in _verdict_prompt.input_variables
+                })
+                print("  [Verdict] Стандартный шаблон")
+            result = self.verdict_llm.invoke(filled)
+            return StrOutputParser().invoke(result)
+
+        verdict_chain = RunnableLambda(verdict_step)
 
         # Полная цепочка
         chain = (
@@ -332,6 +681,9 @@ class FactCheckPipeline:
                 number_comparison=RunnableLambda(number_check_step),
             )
             | RunnablePassthrough.assign(
+                claim_structured=RunnableLambda(build_claim_for_verdict),
+            )
+            | RunnablePassthrough.assign(
                 verdict=verdict_chain,
             )
         )
@@ -348,6 +700,36 @@ class FactCheckPipeline:
             )
 
         return chain
+
+    def _decompose_claim(self, claim: str) -> List[str]:
+        """LLM-декомпозиция составного утверждения на независимые под-утверждения.
+
+        Пример: "Норвегия входит в ЕС и использует евро"
+             → ["Норвегия входит в ЕС", "Норвегия использует евро"]
+        Возвращает [claim] если утверждение уже простое или декомпозиция не удалась.
+        """
+        try:
+            prompt = _DECOMPOSE_TEMPLATE.format(claim=claim)
+            raw = self.keyword_llm.invoke(prompt)
+            lines = [
+                l.strip().lstrip("•-–—1234567890.)").strip()
+                for l in raw.strip().split("\n")
+                if l.strip()
+            ]
+            sub_claims = [
+                l for l in lines
+                if len(l) > 15
+                and not l.lower().startswith(("факты:", "утверждение:", "ответ:", "пример"))
+            ]
+            if not sub_claims or len(sub_claims) > 5:
+                return [claim]
+            # Если все под-утверждения == оригинальный claim — это не декомпозиция
+            if all(sc.strip().lower() == claim.strip().lower() for sc in sub_claims):
+                return [claim]
+            return sub_claims
+        except Exception as e:
+            logger.warning(f"_decompose_claim failed: {e}")
+            return [claim]
 
     @staticmethod
     def _parse_keywords(raw_output: str) -> List[str]:
@@ -466,9 +848,10 @@ class FactCheckPipeline:
     def parse_verdict(raw_verdict: str) -> Dict[str, Any]:
         """Парсинг структурированного вердикта из ответа модели.
 
-        Поддерживает два формата:
+        Поддерживает три формата:
         1. Стандартный: ДОСТОВЕРНОСТЬ: ... ВЕРДИКТ: ... (SFT модель)
         2. XML: <reasoning>...</reasoning><answer>...</answer> (GRPO модель)
+        3. Аудиторский: ПУНКТ N / ЦИТАТА / ИСТОЧНИК / СТАТУС (многофакторный)
         """
         result = {
             "credibility_score": 50,
@@ -477,6 +860,7 @@ class FactCheckPipeline:
             "reasoning": "",
             "chain_of_thought": "",
             "sources": "",
+            "sub_verdicts": [],   # список per-fact результатов из аудиторского шаблона
             "raw": raw_verdict,
         }
 
@@ -485,7 +869,76 @@ class FactCheckPipeline:
             r"<reasoning>(.*?)</reasoning>", raw_verdict, re.DOTALL
         )
         if cot_match:
-            result["chain_of_thought"] = cot_match.group(1).strip()
+            cot_content = cot_match.group(1).strip()
+            # Детектор: модель ничего не написала в reasoning.
+            # С новым шаблоном инструкции вынесены ДО <reasoning>,
+            # поэтому содержательным считается любой reasoning > 40 слов.
+            _has_citation = bool(re.search(r'\[(?!Источник\b)[^\]]{3,60}\]\s*сообщает', cot_content))
+            _has_real_content = _has_citation or len(cot_content.split()) > 40
+            if not _has_real_content:
+                print(f"  [WARNING:CoT] <reasoning> пустой или слишком короткий "
+                      f"({len(cot_content)} символов) — модель не сгенерировала анализ")
+                result["chain_of_thought"] = ""
+            else:
+                print(f"  [CoT] <reasoning> заполнен ({len(cot_content)} символов)")
+                result["chain_of_thought"] = cot_content
+
+        # Парсинг аудиторского протокола: ПУНКТ N / ЦИТАТА / ИСТОЧНИК / СТАТУС
+        # Работает как с <reasoning> блоком (GRPO), так и с plain-текстом (base/SFT).
+        # Ищем весь текст ответа, включая <reasoning> содержимое.
+        _audit_search_text = raw_verdict
+        _fact_block_pattern = re.compile(
+            r"ПУНКТ\s+(\d+)[:\s]+(.+?)\n"
+            r"ЦИТАТА[:\s]+(.+?)\n"
+            r"ИСТОЧНИК[:\s]+(.+?)\n"
+            r"СТАТУС[:\s]+(ПРАВДА|ЛОЖЬ|НЕТ ДАННЫХ|НЕТ)",
+            re.DOTALL | re.IGNORECASE,
+        )
+        sub_verdicts = []
+        for m in _fact_block_pattern.finditer(_audit_search_text):
+            citation = m.group(3).strip()
+            sub_verdicts.append({
+                "index": int(m.group(1)),
+                "claim": m.group(2).strip(),
+                "citation": "" if "ЦИТАТА ОТСУТСТВУЕТ" in citation.upper() else citation,
+                "has_citation": "ЦИТАТА ОТСУТСТВУЕТ" not in citation.upper(),
+                "source": m.group(4).strip(),
+                "status": m.group(5).strip().upper(),
+            })
+        if sub_verdicts:
+            result["sub_verdicts"] = sub_verdicts
+            result["_raw_sub_verdicts_count"] = len(sub_verdicts)
+            statuses = [sv["status"] for sv in sub_verdicts]
+            print(f"  [Audit] Распарсено {len(sub_verdicts)} пунктов: "
+                  + ", ".join(f"П{sv['index']}={sv['status']}" for sv in sub_verdicts))
+            # Автовывод итогового вердикта: условная матрица (Fix 4)
+            count_true = sum(1 for s in statuses if s == "ПРАВДА")
+            count_false = sum(1 for s in statuses if s == "ЛОЖЬ")
+            count_nodata = sum(1 for s in statuses if s in ("НЕТ ДАННЫХ", "НЕТ"))
+            total = len(statuses)
+
+            if count_true == total:
+                # Все факты подтверждены
+                result["_audit_verdict"] = "ПРАВДА"
+                result["_audit_score"] = 85
+            elif count_false > 0 and count_true > 0:
+                # Смесь правды и лжи = МАНИПУЛЯЦИЯ
+                true_pct = int(count_true / total * 100)
+                result["_audit_verdict"] = "МАНИПУЛЯЦИЯ / ПОЛУПРАВДА"
+                result["_audit_score"] = true_pct
+                print(f"  [Audit] МАНИПУЛЯЦИЯ: {count_true} правда + {count_false} ложь из {total}")
+            elif count_false > 0 and count_true == 0:
+                # Только ложь (и, возможно, НЕТ ДАННЫХ)
+                result["_audit_verdict"] = "ЛОЖЬ"
+                result["_audit_score"] = max(5, int(count_nodata / total * 20))
+            elif count_nodata == total:
+                # Всё неизвестно
+                result["_audit_verdict"] = "НЕ ПОДТВЕРЖДЕНО"
+                result["_audit_score"] = 50
+            elif count_true > 0 and count_nodata > 0 and count_false == 0:
+                # Часть подтверждена, остальное неизвестно
+                result["_audit_verdict"] = "ЧАСТИЧНО ПОДТВЕРЖДЕНО"
+                result["_audit_score"] = int(count_true / total * 70 + 15)
 
         # Парсинг структурированных полей (ищем и в <answer> и в основном тексте)
         patterns = {
@@ -507,6 +960,20 @@ class FactCheckPipeline:
                     except ValueError:
                         continue
                 result[key] = value
+
+        # Fallback: если модель не написала ДОСТОВЕРНОСТЬ/ВЕРДИКТ (аудиторский формат
+        # иногда не дублирует их), берём _audit_verdict вычисленный из СТАТУС-пунктов.
+        if result["verdict"] == "НЕ ПОДТВЕРЖДЕНО" and result["credibility_score"] == 50:
+            audit_v = result.get("_audit_verdict")
+            audit_s = result.get("_audit_score")
+            if audit_v:
+                result["verdict"] = audit_v
+                result["credibility_score"] = audit_s
+                print(f"  [Audit:Fallback] Вердикт из протокола: {audit_v} (score={audit_s})")
+
+        # Убираем внутренние ключи перед возвратом
+        result.pop("_audit_verdict", None)
+        result.pop("_audit_score", None)
 
         return result
 
@@ -568,6 +1035,15 @@ class FactCheckPipeline:
                 is_consistent = True
             elif rec_verdict == "НЕ ПОДТВЕРЖДЕНО" and 30 <= rec_score <= 69:
                 is_consistent = True
+            # Fix: разрешить score 0-29 когда критик рекомендует снижение до ЛОЖЬ/НЕ ПОДТВЕРЖДЕНО
+            elif rec_verdict == "НЕ ПОДТВЕРЖДЕНО" and 0 <= rec_score <= 29:
+                # Критик рекомендует "НЕ ПОДТВЕРЖДЕНО" с очень низким score — маппируем в ЛОЖЬ
+                rec_verdict = "ЛОЖЬ"
+                is_consistent = True
+            elif rec_verdict == "ЛОЖЬ" and 30 <= rec_score <= 69:
+                # Критик говорит ЛОЖЬ, но score в зоне НЕ ПОДТВЕРЖДЕНО — доверяем вердикту
+                rec_score = min(rec_score, 25)
+                is_consistent = True
 
             if is_consistent:
                 parsed_verdict["credibility_score"] = rec_score
@@ -623,6 +1099,10 @@ class FactCheckPipeline:
         raw_results: List[Dict],
         claim: str = "",
     ) -> Dict[str, Any]:
+        # Определяем тип утверждения для адаптации весов
+        claim_info = self._shared.get("claim_info", {})
+        claim_type = claim_info.get("type", "general") if claim_info else "general"
+
         """Ensemble verdict v5 — простой, робастный, универсальный.
 
         Принцип: NLI score — это голоса. Суммируем голоса и принимаем решение.
@@ -681,15 +1161,21 @@ class FactCheckPipeline:
             logger.info(f"Vote: NUMS_MATCH ({match_count}/{total_with_source}) → +3")
 
         # --- ГОЛОС 2: NLI (вес ±3 — может перебить LLM при сильном сигнале) ---
-        # NLI score = (ent * ent_count - con * con_count), clamped to [-3, +3]
+        # Для PERSON-типа снижаем вес NLI: модель путает "упоминаются вместе" с "роль подтверждена"
+        # (Статья "Маск vs Цукерберг" упоминает обоих → NLI даёт entailment для "Цукерберг CEO Tesla")
+        # NLI weight: снижаем для всех типов (NLI ненадёжен при смешанных сигналах)
+        if claim_type == "person":
+            nli_max_weight = 1.5  # Меньше для персон (co-occurrence ≠ role)
+        else:
+            nli_max_weight = 2.0  # Снижено с 3.0 для более осторожного голосования
+        logger.info(f"Vote: NLI max_weight={nli_max_weight} (type={claim_type})")
+
         if has_sources and not nli_mixed:
-            # Чистый сигнал (не mixed) — полный вес
             nli_score = (nli_ent * max(nli_ent_count, 1) - nli_con * max(nli_con_count, 1))
-            nli_vote = max(-3.0, min(3.0, nli_score))
+            nli_vote = max(-nli_max_weight, min(nli_max_weight, nli_score))
             vote += nli_vote
             logger.info(f"Vote: NLI ent={nli_ent:.2f}×{nli_ent_count} con={nli_con:.2f}×{nli_con_count} → {nli_vote:+.2f}")
         elif has_sources and nli_mixed:
-            # Mixed signal — NLI ненадёжен, только count-based с малым весом
             nli_vote = (nli_ent_count - nli_con_count) * 0.3
             nli_vote = max(-1.0, min(1.0, nli_vote))
             vote += nli_vote
@@ -721,9 +1207,23 @@ class FactCheckPipeline:
             }
             if claim_detail_words:
                 unique_details = claim_detail_words - common_words
-                missing = unique_details - source_words
-                found = unique_details & source_words
-                # Ключевые детали отсутствуют в sources → подмена
+                
+                # Исключаем подтверждённые локации из проверки деталей:
+                # они проверяются отдельно через транслитерацию (голос 6).
+                # Используем 5-символьный стем для русских падежных форм:
+                # "Париж"→стем "париж", "Париже" (локатив)→стем "париж" → совпадают
+                confirmed_loc_stems = set()
+                for loc in self._shared.get("claim_locations", []):
+                    for w in re.findall(r"[а-яёА-ЯЁa-zA-Z]{4,}", loc):
+                        confirmed_loc_stems.add(w.lower()[:5])
+                # Исключаем слова чей 5-char стем совпадает со стемом локации
+                unique_details_filtered = {
+                    w for w in unique_details if w[:5] not in confirmed_loc_stems
+                }
+                
+                missing = unique_details_filtered - source_words
+                found = unique_details_filtered & source_words
+                # Ключевые детали (без локаций) отсутствуют в sources → подмена
                 if missing and len(missing) <= 3 and len(found) >= 2:
                     vote -= 2.0
                     logger.info(f"Vote: KEY_DETAIL_MISSING — '{', '.join(missing)}' "
@@ -751,6 +1251,112 @@ class FactCheckPipeline:
             logger.info(f"Vote: LLM ЛОЖЬ (score={score}) → {llm_vote:+.2f}")
         else:
             logger.info("Vote: LLM uncertain → 0")
+
+        # --- ГОЛОС 5: Скам-паттерны (если обнаружены — сильный сигнал ЛОЖЬ) ---
+        is_scam = self._shared.get("is_scam", False)
+        if is_scam:
+            vote -= 4.0
+            logger.info("Vote: SCAM_PATTERN → -4.0 (мошеннический паттерн)")
+        
+        # --- ГОЛОС 5.5: Date mismatch (год в claim ≠ годам в источниках) ---
+        date_mismatch = self._shared.get("date_mismatch", False)
+        if date_mismatch:
+            vote -= 2.0
+            logger.info("Vote: DATE_YEAR_MISMATCH → -2.0")
+
+        # --- ГОЛОС 6: Детекция несовпадения локаций (claim vs sources) ---
+        # ВАЖНО: Не применяем если NLI entailment высокий (>= 0.50) — 
+        # это означает что источники ПОДТВЕРЖДАЮТ claim, просто локация в другом языке
+        # (напр: "Париж" в claim, но источник содержит "Paris" на английском)
+        claim_locations = self._shared.get("claim_locations", [])
+        # Только пропускаем location check при ЧЁТКОМ подтверждении (ent>=0.70, con<0.30)
+        loc_guard_active = (nli_ent >= 0.70 and nli_con < 0.30)
+        if claim_locations and has_sources and not loc_guard_active:
+            source_text_all = " ".join(
+                (r.get("snippet", "") + " " + r.get("title", "")).lower()
+                for r in raw_results[:7]
+            )
+            # Транслитерация для основных топонимов (Рус → Лат)
+            transliteration_map = {
+                'токио': ['tokyo', 'tokio'],
+                'париж': ['paris'],
+                'берлин': ['berlin'],
+                'лондон': ['london'],
+                'москва': ['moscow', 'moskva'],
+                'пекин': ['beijing', 'peking'],
+                'катар': ['qatar'],
+                'япония': ['japan', 'japanese'],
+                'японии': ['japan', 'japanese'],
+                'германии': ['germany', 'german'],
+                'австралии': ['australia', 'australian'],
+                'канада': ['canada', 'canadian'],
+                'бразилия': ['brazil', 'brazilian'],
+                'аргентина': ['argentina'],
+                'китай': ['china', 'chinese'],
+                'китае': ['china', 'chinese'],
+                'корея': ['korea', 'korean'],
+                'корее': ['korea', 'korean'],
+            }
+
+            # Для date/date_loc утверждений с явным годом — требуем
+            # совместного появления года + локации в ОДНОМ сниппете.
+            # Это исключает ложные "LOCATION_CONFIRMED" когда год и
+            # локация упоминаются в разных источниках (напр: токио 2020 ≠ 2024).
+            claim_years = re.findall(r'\b(?:19|20)\d{2}\b', claim)
+            use_cooccurrence = bool(
+                claim_years and claim_type in ("date", "date_loc")
+            )
+            # Список снипетов для поиска совместного вхождения
+            source_snippets = [
+                (r.get("snippet", "") + " " + r.get("title", "")).lower()
+                for r in raw_results[:10]
+            ]
+
+            def _loc_found(loc_lower: str) -> bool:
+                """Проверяет наличие локации (с транслитерацией) в источниках.
+
+                Для date/date_loc утверждений требует HOSTING-контекст:
+                "в {location}" рядом с годом, а не просто любое упоминание.
+                Это исключает ложные срабатывания для команд-участников
+                (напр: "Сборная Японии на ЧМ 2022" ≠ "прошёл в Японии 2022").
+                """
+                trans = transliteration_map.get(loc_lower, [])
+                loc_variants = [loc_lower] + trans
+                if not use_cooccurrence:
+                    return any(v in source_text_all for v in loc_variants)
+                # В контексте hosting: ищем "в {location}" рядом с годом
+                # ("в Париже 2024", "2024 в Японии") — исключает роль участника
+                hosting_pattern = f"в {loc_lower}"
+                for snippet in source_snippets:
+                    for yr in claim_years:
+                        if yr not in snippet:
+                            continue
+                        yr_idx = snippet.index(yr)
+                        window = snippet[max(0, yr_idx - 200): yr_idx + 200]
+                        if hosting_pattern in window:
+                            return True
+                        # Транслитерации (для англоязычных источников: "in Tokyo")
+                        for t in trans:
+                            if f"in {t}" in window or f"в {t}" in window:
+                                return True
+                return False
+
+            missing_locs = []
+            for loc in claim_locations:
+                loc_lower = loc.lower()
+                found_in_sources = _loc_found(loc_lower)
+                if not found_in_sources and len(loc_lower) > 3:
+                    missing_locs.append(loc)
+            if missing_locs and len(missing_locs) == len(claim_locations):
+                vote -= 2.5
+                logger.info(f"Vote: LOCATION_MISMATCH — локации {missing_locs} не в sources → -2.5")
+            elif missing_locs:
+                vote -= 1.0
+                logger.info(f"Vote: LOCATION_PARTIAL_MISS — часть локаций не в sources → -1.0")
+            else:
+                # Все локации из claim найдены в sources → слабое подтверждение
+                vote += 0.5
+                logger.info(f"Vote: LOCATION_CONFIRMED — локации {claim_locations} найдены → +0.5")
 
         # --- ИТОГОВОЕ РЕШЕНИЕ ---
         logger.info(f"Vote TOTAL: {vote:+.2f}")
@@ -782,10 +1388,23 @@ class FactCheckPipeline:
         print(f"\nПроверка: {claim}")
 
         # Сброс промежуточного состояния (thread-local)
-        self._shared["search_hint"] =""
-        self._shared["raw_results"] =[]
-        self._shared["nli_result"] =None
-        self._shared["num_comparisons"] =[]
+        self._shared["search_hint"] = ""
+        self._shared["raw_results"] = []
+        self._shared["nli_result"] = None
+        self._shared["num_comparisons"] = []
+        self._shared["claim_locations"] = []
+        self._shared["is_scam"] = False
+        self._shared["date_mismatch"] = False
+        self._shared["sub_claims"] = []
+
+        # Декомпозиция составных утверждений (Проблема 1)
+        if self.pipeline_config.enable_claim_decomposition:
+            sub_claims = self._decompose_claim(claim)
+            if len(sub_claims) > 1:
+                print(f"  Декомпозиция: {len(sub_claims)} под-утверждений")
+                for i, sc in enumerate(sub_claims, 1):
+                    print(f"    {i}. {sc}")
+                self._shared["sub_claims"] = sub_claims
 
         state = {"claim": claim}
 
@@ -794,6 +1413,9 @@ class FactCheckPipeline:
             total_start = time.time()
             raw_result = self.chain.invoke(state)
             total_time = time.time() - total_start
+            # Лог сырого ответа модели (первые 300 символов)
+            raw_v = raw_result.get("verdict", "")
+            print(f"  [Model:raw] {len(raw_v)} символов | превью: {raw_v[:200].replace(chr(10), ' ')!r}")
         except Exception as e:
             logger.error(f"Pipeline error: {e}", exc_info=True)
             return {
@@ -815,10 +1437,52 @@ class FactCheckPipeline:
         raw_results = self._shared.get("raw_results", [])
         nli_result = self._shared.get("nli_result", None)
         num_comparisons = self._shared.get("num_comparisons", [])
+        trusted_cnt = sum(1 for r in raw_results if not r.get("_unverified"))
+        print(f"  [Sources] Итого после фильтра: {len(raw_results)} "
+              f"(доверенных: {trusted_cnt})")
         parsed = self.parse_verdict(raw_result.get("verdict", ""))
 
+        # Fix 3: Ограничение парсера — обрезаем sub_verdicts до количества входных фактов
+        sub_claims = self._shared.get("sub_claims", [])
+        _has_audit_matrix = False
+        if sub_claims and parsed.get("sub_verdicts"):
+            n_facts = len(sub_claims)
+            raw_count = parsed.get("_raw_sub_verdicts_count", len(parsed["sub_verdicts"]))
+            if len(parsed["sub_verdicts"]) > n_facts:
+                print(f"  [Audit:Trim] Обрезка: {raw_count} распарсено → {n_facts} фактов на входе")
+                parsed["sub_verdicts"] = parsed["sub_verdicts"][:n_facts]
+            # Fix 4: Пересчитываем verdict по условной матрице
+            statuses = [sv["status"] for sv in parsed["sub_verdicts"]]
+            count_true = sum(1 for s in statuses if s == "ПРАВДА")
+            count_false = sum(1 for s in statuses if s == "ЛОЖЬ")
+            count_nodata = sum(1 for s in statuses if s in ("НЕТ ДАННЫХ", "НЕТ"))
+            total = len(statuses)
+
+            if count_true == total:
+                parsed["verdict"] = "ПРАВДА"
+                parsed["credibility_score"] = 85
+            elif count_false > 0 and count_true > 0:
+                true_pct = int(count_true / total * 100)
+                parsed["verdict"] = "МАНИПУЛЯЦИЯ / ПОЛУПРАВДА"
+                parsed["credibility_score"] = true_pct
+                print(f"  [Audit:Matrix] МАНИПУЛЯЦИЯ: {count_true} правда + {count_false} ложь из {total}")
+            elif count_false > 0 and count_true == 0:
+                parsed["verdict"] = "ЛОЖЬ"
+                parsed["credibility_score"] = max(5, int(count_nodata / total * 20))
+            elif count_nodata == total:
+                parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
+                parsed["credibility_score"] = 50
+            elif count_true > 0 and count_nodata > 0:
+                parsed["verdict"] = "ЧАСТИЧНО ПОДТВЕРЖДЕНО"
+                parsed["credibility_score"] = int(count_true / total * 70 + 15)
+            _has_audit_matrix = True
+        parsed.pop("_raw_sub_verdicts_count", None)
+
         # NLI ensemble verdict (заменяет _apply_safety_net)
-        parsed = self._ensemble_verdict(parsed, nli_result, num_comparisons, raw_results, claim=claim)
+        # Для составных утверждений с audit матрицей — НЕ перезаписываем verdict через ensemble,
+        # т.к. audit-verdict уже вычислен по per-fact результатам и более надёжен.
+        if not _has_audit_matrix:
+            parsed = self._ensemble_verdict(parsed, nli_result, num_comparisons, raw_results, claim=claim)
         print(f"  Ensemble verdict: {parsed['verdict']} (score={parsed['credibility_score']})")
 
         # Post-verdict self-critique
@@ -845,11 +1509,13 @@ class FactCheckPipeline:
 
         return {
             "claim": claim,
+            "sub_claims": self._shared.get("sub_claims", []),
             "credibility_score": parsed["credibility_score"],
             "verdict": parsed["verdict"],
             "confidence": parsed["confidence"],
             "reasoning": parsed["reasoning"],
             "chain_of_thought": parsed.get("chain_of_thought", ""),
+            "sub_verdicts": parsed.get("sub_verdicts", []),
             "sources": sources,
             "sources_text": parsed["sources"],
             "keywords": keywords,
