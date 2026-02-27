@@ -87,3 +87,7 @@ class PipelineConfig:
     translator_model: str = "facebook/nllb-200-distilled-600M"  # NLLB-200 (fallback: MarianMT)
     enable_adversarial_debate: bool = True  # Адвокат дьявола для mixed NLI
     enable_fact_cache: bool = True  # Redis кэш вердиктов
+    enable_minicheck: bool = True  # MiniCheck-FT5 дополнительная верификация (CPU)
+    enable_self_consistency: bool = True  # Self-consistency: 3 прогона LLM, majority vote
+    self_consistency_n: int = 3  # количество прогонов для self-consistency
+    self_consistency_temperature: float = 0.3  # температура для дополнительных прогонов

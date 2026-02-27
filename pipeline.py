@@ -36,13 +36,28 @@ from source_credibility import get_credibility
 from satire_detector import satire_penalty
 from adversarial import AdversarialDebate
 
+# V8: Natasha NER + pymorphy2 для русской морфологии
+try:
+    from nlp_russian import (
+        extract_entities, extract_entity_names, lemmatize,
+        lemmatize_text, extract_keywords_lemmatized, stems_match,
+        words_overlap_lemmatized,
+    )
+    _HAS_NATASHA = True
+except ImportError:
+    _HAS_NATASHA = False
+    print("[WARNING] natasha/pymorphy2 не установлены — используем fallback regex")
+
 logger = logging.getLogger("fact_checker")
 
 # Промпт для декомпозиции составных утверждений (Проблема 1)
 _DECOMPOSE_TEMPLATE = """\
-Если утверждение содержит несколько отдельных фактов через союзы "и", "а", "а также", "при этом", "однако", "но", "кроме того", "где" — выпиши каждый факт ОТДЕЛЬНО, каждый с новой строки.
-ВАЖНО: восстанавливай подлежащее в каждом предложении (если написано "а её столица — X" → пиши "Официальная столица страны — X").
-НИКОГДА не исправляй факты, даты, места, имена или числа из оригинала. Сохраняй ВСЕ детали дословно, даже если они кажутся ошибочными. Твоя задача — РАЗДЕЛИТЬ, а не ИСПРАВИТЬ.
+Разбей утверждение на атомарные факты. Каждый факт должен:
+1. Содержать ровно ОДНО проверяемое утверждение
+2. Быть понятным без оригинального контекста (восстанавливай подлежащее)
+3. СОХРАНЯТЬ все отрицания ТОЧНО как в оригинале — НЕ добавлять "не"/"нет"/"без" если их нет в оригинале
+4. НЕ менять смысл на противоположный
+5. НЕ исправлять факты, даты, места, имена или числа — сохранять дословно
 Если факт один — верни только его.
 
 Утверждение: Норвегия входит в ЕС и использует евро
@@ -116,6 +131,7 @@ class PipelineContext:
     sub_claims: List[str] = field(default_factory=list)
     wikidata_result: Dict = field(default_factory=dict)
     sub_nli_results: List[Dict] = field(default_factory=list)  # V5: per-sub-claim NLI
+    minicheck_result: Optional[Dict] = None  # V9: MiniCheck-FT5 verification
 
 
 class FactCheckPipeline:
@@ -170,6 +186,16 @@ class FactCheckPipeline:
                 self._reranker = ReRanker(model_name=_ce_model) if _ce_model else ReRanker()
             except Exception as e:
                 print(f"CrossEncoder не загружен: {e}")
+
+        # MiniCheck-FT5 (CPU, ~1.7GB RAM — не занимает GPU)
+        self.minicheck = None
+        if getattr(pipeline_config, 'enable_minicheck', False):
+            try:
+                from minicheck_verifier import MiniCheckVerifier
+                print("Загрузка MiniCheck-FT5 на CPU...")
+                self.minicheck = MiniCheckVerifier(device="cpu")
+            except Exception as e:
+                print(f"MiniCheck не загружен: {e}")
 
         # NLI checker (CPU, не занимает GPU)
         self.nli_checker = None
@@ -236,14 +262,22 @@ class FactCheckPipeline:
     def _extract_claim_entities(self, claim: str, keywords: List[str] = None) -> List[str]:
         """Extract key named entities from claim text and/or parsed keywords.
 
-        Works with both capitalized and all-lowercase input by combining:
-        1. Capitalized words from claim (if any)
-        2. Multi-word entities from LLM-extracted keywords (full phrases)
-        3. Quoted terms from claim
-        4. Distinctive words from claim (ALWAYS, not just fallback)
+        V8: Uses Natasha NER as primary source (PER, LOC, ORG),
+        falls back to regex for non-Russian text.
         Returns lowercased entity strings for matching.
         """
         entities = []
+
+        # V8: Natasha NER — primary source for Russian entities
+        if _HAS_NATASHA:
+            try:
+                ner_entities = extract_entities(claim)
+                for ent in ner_entities:
+                    entities.append(ent["normal"])
+                    # Also add original text form for exact matching
+                    entities.append(ent["text"].lower())
+            except Exception:
+                pass  # fallback to regex below
 
         # 1. Capitalized words from claim (works when user types properly)
         for m in re.finditer(r'[А-ЯЁA-Z][а-яёa-zA-Z]{2,}', claim):
@@ -414,29 +448,43 @@ class FactCheckPipeline:
             keywords = self._validate_keywords(keywords, claim)
             print(f"  Ключевые слова: {keywords}")
 
-            # --- V5: Wikipedia entity direct lookup (Task 2) ---
-            # Ищем статьи Wikipedia по КАЖДОЙ сущности отдельно ПЕРЕД DDG.
-            # Даёт энциклопедические определения для фактов типа "Луна — спутник Земли".
+            # V8: Wikipedia as PRIMARY source (before DDG)
+            # Энциклопедические факты проверяются через Wikipedia ПЕРВЫМИ.
+            # DDG — только для новостей и актуальных событий.
             claim_entities_for_wiki = self._extract_claim_entities(claim, keywords=keywords)
+
+            # V8: Natasha NER entities — более точные имена для Wikipedia lookup
+            _wiki_entities = list(claim_entities_for_wiki)
+            if _HAS_NATASHA:
+                try:
+                    ner_names = extract_entity_names(claim)
+                    for name in ner_names:
+                        if name.lower() not in [e.lower() for e in _wiki_entities]:
+                            _wiki_entities.insert(0, name)
+                except Exception:
+                    pass
+
             wiki_entity_results = self.searcher.wiki_entity_lookup(
-                claim_entities_for_wiki + keywords[:3]
+                _wiki_entities + keywords[:3]
             )
 
-            results = self.searcher.search_all_keywords(keywords, claim=claim)
-
-            # Merge wiki entity results (high priority, prepend)
+            # V8: Wikipedia PRIMARY — начинаем с Wikipedia, DDG дополняет
+            results = list(wiki_entity_results)  # Wikipedia первая
             existing_urls = {r.get("link", "") for r in results}
-            for wr in wiki_entity_results:
-                url = wr.get("link", "")
+
+            # DDG дополняет (новости, актуальные события)
+            ddg_results = self.searcher.search_all_keywords(keywords, claim=claim)
+            for dr in ddg_results:
+                url = dr.get("link", "")
                 if url and url not in existing_urls:
-                    results.insert(0, wr)  # Prepend — высокий приоритет
+                    results.append(dr)
                     existing_urls.add(url)
                 elif url in existing_urls:
-                    # Обновляем snippet если wiki entity дал более полный текст
+                    # Обновляем snippet если DDG дал более полный текст
                     for ex in results:
                         if ex.get("link") == url:
-                            if len(wr.get("snippet", "")) > len(ex.get("snippet", "")):
-                                ex["snippet"] = wr["snippet"]
+                            if len(dr.get("snippet", "")) > len(ex.get("snippet", "")):
+                                ex["snippet"] = dr["snippet"]
                             break
 
             # --- V5: Verification query search (Task 4) ---
@@ -477,7 +525,8 @@ class FactCheckPipeline:
 
             def _is_trivial_subclaim(sc: str) -> bool:
                 """Отсеивает неверифицируемые под-утверждения."""
-                words = re.findall(r'[а-яёa-z]{4,}', sc.lower())
+                # V8: {3,} вместо {4,} — не отсекать 3-буквенные слова (мёд, рак, мяч, рис)
+                words = re.findall(r'[а-яёa-z]{3,}', sc.lower())
                 if len(words) < 3:
                     return True
                 # Нет именованных сущностей (заглавные буквы) и нет кавычек
@@ -1042,19 +1091,16 @@ class FactCheckPipeline:
                 })
                 print("  [Verdict] Стандартный шаблон")
 
-            # B2: Dynamic max_new_tokens based on claim complexity
+            # V8: Минимум 1200 tokens для ВСЕХ шаблонов
             claim = state.get("claim", "")
             n_sub = len(sub_claims)
             claim_len = len(claim)
             if n_sub >= 3 or claim_len > 200:
                 dyn_tokens = 1500  # complex
             elif n_sub == 2 or claim_len > 100:
-                dyn_tokens = 800   # medium
+                dyn_tokens = 1200  # medium (was 800)
             else:
-                # V7: Increased from 400 to 1000 — reasoning template needs space
-                # for <reasoning>...</reasoning><answer>...</answer>
-                # Model cites sources verbosely in <reasoning>, consuming ~200 chars/source
-                dyn_tokens = 1000  # simple
+                dyn_tokens = 1200  # simple (was 1000) — модель всегда заканчивает мысль
             try:
                 self.verdict_llm.pipeline._forward_params["max_new_tokens"] = dyn_tokens
             except (AttributeError, TypeError):
@@ -1141,6 +1187,25 @@ class FactCheckPipeline:
                     validated.append(sc)
                 else:
                     logger.warning(f"Sub-claim rejected (overlap={overlap:.0%}): {sc[:60]}")
+
+            # V8: Negation guard — reject sub-claims that invert meaning
+            # If sub-claim contains negation words ("не", "нет", "без", "никогда")
+            # that are NOT in the original claim → decomposer hallucinated a negation
+            _NEGATION_WORDS = {"не", "нет", "без", "никогда", "ни", "нельзя", "невозможно", "никто", "ничто", "нигде"}
+            claim_words_lower = set(re.findall(r'[а-яё]+', claim.lower()))
+            negation_checked = []
+            for sc in validated:
+                sc_words_lower = set(re.findall(r'[а-яё]+', sc.lower()))
+                added_negations = (sc_words_lower & _NEGATION_WORDS) - (claim_words_lower & _NEGATION_WORDS)
+                if added_negations:
+                    logger.warning(
+                        f"Negation guard: sub-claim '{sc[:60]}' adds negation "
+                        f"{added_negations} not in original → rejected"
+                    )
+                    print(f"  [NegGuard] Отклонён sub-claim с добавленным отрицанием: {added_negations}")
+                    continue
+                negation_checked.append(sc)
+            validated = negation_checked if negation_checked else [claim]
 
             # Post-decomposition fidelity check:
             # If sub-claims introduce 3+ significant new words not in original → fallback
@@ -1603,18 +1668,16 @@ class FactCheckPipeline:
         raw_results: List[Dict],
         claim: str = "",
     ) -> Dict[str, Any]:
-        # Определяем тип утверждения для адаптации весов
+        """Ensemble verdict v8 — упрощённый, 5 надёжных сигналов.
+
+        Принцип: Wikidata(±3), Числа(±3), LLM(±2), NLI(±1.5), Скам(-4).
+        Меньше конфликтов. Меньше багов. Доверяем модели.
+        """
         claim_info = self._ctx.claim_info or {}
         claim_type = claim_info.get("type", "general")
 
-        """Ensemble verdict v5 — простой, робастный, универсальный.
-
-        Принцип: NLI score — это голоса. Суммируем голоса и принимаем решение.
-        Никаких хрупких порогов. Три сигнала голосуют: числа, NLI, LLM.
-        """
         verdict = parsed["verdict"].upper().strip()
         score = parsed["credibility_score"]
-
         has_sources = len(raw_results) > 0
 
         # --- Извлечение сигналов ---
@@ -1623,26 +1686,24 @@ class FactCheckPipeline:
             any(c for c in num_comparisons if c["source_number"] and not c["match"])
             and not nums_match
         )
-        match_count = sum(1 for c in num_comparisons if c["source_number"] and c["match"])
-        total_with_source = sum(1 for c in num_comparisons if c["source_number"])
 
         nli_ent = nli_result.get("max_entailment", 0.0) if nli_result else 0.0
         nli_con = nli_result.get("max_contradiction", 0.0) if nli_result else 0.0
         nli_ent_count = nli_result.get("entailment_count", 0) if nli_result else 0
         nli_con_count = nli_result.get("contradiction_count", 0) if nli_result else 0
 
-        # NLI purity filtering: пересчитываем counts по "чистым" источникам
+        # NLI purity filtering
         if nli_result and nli_result.get("pairs"):
             clean_pairs = [p for p in nli_result["pairs"] if p.get("purity", 0) > 0.3]
             if len(clean_pairs) >= 2:
                 nli_ent_count = sum(1 for p in clean_pairs if p["label"] == "entailment")
                 nli_con_count = sum(1 for p in clean_pairs if p["label"] == "contradiction")
 
-        # --- Feature vector (для логирования и будущего meta-classifier) ---
+        # Feature vector
+        match_count = sum(1 for c in num_comparisons if c["source_number"] and c["match"])
+        total_with_source = sum(1 for c in num_comparisons if c["source_number"])
         match_ratio = match_count / total_with_source if total_with_source > 0 else 0.0
         nli_mixed = nli_ent >= 0.40 and nli_con >= 0.40
-        nli_clean_ent = nli_ent >= 0.50 and nli_con < 0.35
-        nli_clean_con = nli_con >= 0.50 and nli_ent < 0.35
         parsed["_ensemble_features"] = {
             "nli_ent": nli_ent, "nli_con": nli_con,
             "nli_ent_count": nli_ent_count, "nli_con_count": nli_con_count,
@@ -1650,22 +1711,21 @@ class FactCheckPipeline:
             "llm_score": score, "nums_match": int(nums_match),
             "nums_mismatch": int(nums_mismatch), "match_ratio": match_ratio,
             "num_sources": len(raw_results), "nli_mixed": int(nli_mixed),
-            "nli_clean_ent": int(nli_clean_ent), "nli_clean_con": int(nli_clean_con),
+            "nli_clean_ent": int(nli_ent >= 0.50 and nli_con < 0.35),
+            "nli_clean_con": int(nli_con >= 0.50 and nli_ent < 0.35),
         }
 
-        # --- META-CLASSIFIER (если обучен — заменяет всю логику ниже) ---
+        # META-CLASSIFIER (если обучен)
         if hasattr(self, '_meta_classifier') and self._meta_classifier is not None:
             return self._meta_classify(parsed, parsed["_ensemble_features"])
 
         # ============================================================
-        # SCORING SYSTEM: каждый сигнал голосует за ПРАВДА (+) или ЛОЖЬ (-)
-        # Итоговый score определяет вердикт
+        # V8: SIMPLIFIED ENSEMBLE — 5 надёжных сигналов
         # ============================================================
-        # A5: Evidence sufficiency gating
-        # If evidence is too weak, return НЕ ПОДТВЕРЖДЕНО without voting
+
+        # Evidence sufficiency gating
         claim_entities = self._ctx.claim_entities or []
         if has_sources and claim_entities:
-            # Entity coverage: what fraction of claim entities appear in sources
             src_text_all = " ".join(
                 (r.get("snippet", "") + " " + r.get("title", "")).lower()
                 for r in raw_results[:7]
@@ -1676,327 +1736,124 @@ class FactCheckPipeline:
         nli_decisiveness = max(nli_ent, nli_con)
         source_count_norm = min(len(raw_results) / 5.0, 1.0)
         sufficiency = entity_coverage * 0.3 + nli_decisiveness * 0.4 + source_count_norm * 0.3
-        sufficiency_threshold = 0.25 if claim_type == "person" else 0.35
-        if sufficiency < sufficiency_threshold and not self._ctx.is_scam:
+        if sufficiency < 0.30 and not self._ctx.is_scam:
             parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
             parsed["credibility_score"] = 50
-            logger.info(f"A5: Evidence insufficient (sufficiency={sufficiency:.2f}, "
-                        f"entity_cov={entity_coverage:.2f}, nli_dec={nli_decisiveness:.2f}, "
-                        f"src_count={len(raw_results)}) → НЕ ПОДТВЕРЖДЕНО")
+            logger.info(f"V8: Evidence insufficient (sufficiency={sufficiency:.2f}) → НЕ ПОДТВЕРЖДЕНО")
             return parsed
 
-        vote = 0.0  # положительный = ПРАВДА, отрицательный = ЛОЖЬ
+        vote = 0.0
 
-        # --- ГОЛОС 1: Числа (самый надёжный, вес 3) ---
-        if nums_mismatch:
-            vote -= 3.0
-            logger.info("Vote: NUMS_MISMATCH → -3")
-        elif nums_match:
-            vote += 3.0
-            logger.info(f"Vote: NUMS_MATCH ({match_count}/{total_with_source}) → +3")
-
-        # --- ГОЛОС 2: NLI (вес ±3 — может перебить LLM при сильном сигнале) ---
-        # Для PERSON-типа снижаем вес NLI: модель путает "упоминаются вместе" с "роль подтверждена"
-        # (Статья "Маск vs Цукерберг" упоминает обоих → NLI даёт entailment для "Цукерберг CEO Tesla")
-        # NLI weight: снижаем для всех типов (NLI ненадёжен при смешанных сигналах)
-        if claim_type == "person":
-            nli_max_weight = 1.5  # Меньше для персон (co-occurrence ≠ role)
-        else:
-            nli_max_weight = 2.0  # Снижено с 3.0 для более осторожного голосования
-        logger.info(f"Vote: NLI max_weight={nli_max_weight} (type={claim_type})")
-
-        if has_sources and not nli_mixed:
-            nli_score = (nli_ent * max(nli_ent_count, 1) - nli_con * max(nli_con_count, 1))
-            nli_vote = max(-nli_max_weight, min(nli_max_weight, nli_score))
-            vote += nli_vote
-            logger.info(f"Vote: NLI ent={nli_ent:.2f}×{nli_ent_count} con={nli_con:.2f}×{nli_con_count} → {nli_vote:+.2f}")
-        elif has_sources and nli_mixed:
-            nli_vote = (nli_ent_count - nli_con_count) * 0.3
-            nli_vote = max(-1.0, min(1.0, nli_vote))
-            vote += nli_vote
-            logger.info(f"Vote: NLI_MIXED ent_cnt={nli_ent_count} con_cnt={nli_con_count} → {nli_vote:+.2f}")
-
-        # --- ГОЛОС 3: Detail matching (ключевые детали claim в источниках) ---
-        # Проверяет что КОНКРЕТНЫЕ слова из claim упоминаются в source snippets.
-        # Ловит подмену деталей: "юань" vs "иена", "Google" vs "OpenAI"
-        if has_sources:
-            # Извлекаем уникальные значимые слова из claim (> 3 символов)
-            claim_detail_words = set(
-                w.lower() for w in re.findall(r'[а-яёa-z]{4,}', claim)
-            )
-            # Собираем все слова из source snippets
-            source_text = " ".join(
-                (r.get("snippet", "") + " " + r.get("title", "")).lower()
-                for r in raw_results[:7]
-            )
-            source_words = set(re.findall(r'[а-яёa-z]{4,}', source_text))
-
-            if claim_detail_words:
-                unique_details = claim_detail_words - COMMON_DETAIL_WORDS
-                
-                # Исключаем подтверждённые локации из проверки деталей:
-                # они проверяются отдельно через транслитерацию (голос 6).
-                # Используем 5-символьный стем для русских падежных форм:
-                # "Париж"→стем "париж", "Париже" (локатив)→стем "париж" → совпадают
-                confirmed_loc_stems = set()
-                for loc in self._ctx.claim_locations:
-                    for w in re.findall(r"[а-яёА-ЯЁa-zA-Z]{4,}", loc):
-                        confirmed_loc_stems.add(w.lower()[:5])
-                # Исключаем слова чей 5-char стем совпадает со стемом локации
-                unique_details_filtered = {
-                    w for w in unique_details if w[:5] not in confirmed_loc_stems
-                }
-                
-                # V7: Use 4-char stem matching for Russian morphology
-                # "спутником" → stem "спут" matches "спутник" → "спут"
-                source_stems = set(w[:4] for w in source_words if len(w) >= 4)
-                missing = set()
-                found = set()
-                for w in unique_details_filtered:
-                    w_stem = w[:4] if len(w) >= 4 else w
-                    if w in source_words or w_stem in source_stems:
-                        found.add(w)
-                    else:
-                        missing.add(w)
-                # Ключевые детали (без локаций) отсутствуют в sources → подмена
-                if missing and len(missing) <= 3 and len(found) >= 2:
-                    vote -= 2.0
-                    logger.info(f"Vote: KEY_DETAIL_MISSING — '{', '.join(missing)}' "
-                                f"not found in sources → -2.0")
-                else:
-                    # V7: Also use stem matching for overlap ratio
-                    overlap_count = sum(1 for w in claim_detail_words
-                                        if w in source_words or (len(w) >= 4 and w[:4] in source_stems))
-                    overlap_ratio = overlap_count / len(claim_detail_words)
-                    if overlap_ratio < 0.40:
-                        vote -= 1.0
-                        logger.info(f"Vote: DETAIL_MISMATCH — {len(overlap)}/{len(claim_detail_words)} "
-                                    f"claim words in sources → -1.0")
-
-        # --- ГОЛОС 3.5: Source entity saturation ---
-        claim_entities = self._ctx.claim_entities
-        if has_sources and claim_entities:
-            def _any_entity_in_text_ens(entities, r):
-                _t = (r.get("title", "") + " " + r.get("snippet", "")).lower()
-                return any(e in _t for e in entities)
-            entity_hits = sum(1 for r in raw_results[:7]
-                              if _any_entity_in_text_ens(claim_entities, r))
-            if entity_hits >= 3 and verdict != "ЛОЖЬ":
-                vote += 1.0
-                logger.info(f"Vote: ENTITY_SATURATION — {entity_hits}/7 sources match entities → +1.0")
-
-        # --- ГОЛОС 4: LLM (вес зависит от уверенности) ---
-        if verdict == "ПРАВДА":
-            # score 50-100 → вес 0-2
-            llm_vote = (score - 50) / 25.0  # score=75 → +1, score=100 → +2
-            llm_vote = max(0.0, min(2.0, llm_vote))
-            vote += llm_vote
-            logger.info(f"Vote: LLM ПРАВДА (score={score}) → +{llm_vote:.2f}")
-        elif verdict == "ЛОЖЬ":
-            # score 0-50 → вес -2 .. 0
-            llm_vote = (score - 50) / 25.0  # score=25 → -1, score=0 → -2
-            llm_vote = max(-2.0, min(0.0, llm_vote))
-            vote += llm_vote
-            logger.info(f"Vote: LLM ЛОЖЬ (score={score}) → {llm_vote:+.2f}")
-        else:
-            logger.info("Vote: LLM uncertain → 0")
-
-        # --- ГОЛОС 4.5: Wikidata structured facts confirmation ---
+        # --- СИГНАЛ 1: Wikidata (±3) — самый надёжный ---
         wikidata = self._ctx.wikidata_result
         if wikidata and wikidata.get("found"):
             wd_facts = wikidata.get("facts", [])
             wd_confirmed = sum(1 for f in wd_facts if f.get("match") is True)
             wd_contradicted = sum(1 for f in wd_facts if f.get("match") is False)
             wd_neutral = sum(1 for f in wd_facts if f.get("match") is None)
-            # Even neutral facts (match=None) are a confirmation signal when the
-            # Wikidata property values appear in the claim text
-            # Use stem matching (first 4 chars) to handle Russian declension:
-            # "Земля" (nominative) should match "Земли" (genitive)
+
+            # Neutral facts matching claim text = implicit confirmation
             if wd_neutral > 0 and wd_contradicted == 0:
                 claim_lower = claim.lower()
-                claim_stems = set(w[:4] for w in re.findall(r'[а-яёa-z]{4,}', claim_lower))
+                if _HAS_NATASHA:
+                    claim_lemmas = set(lemmatize(w) for w in re.findall(r'[а-яёa-z]{3,}', claim_lower))
+                else:
+                    claim_lemmas = set(w[:4] for w in re.findall(r'[а-яёa-z]{4,}', claim_lower))
                 for f in wd_facts:
                     if f.get("match") is None:
-                        vals = f.get("wikidata_values", [])
-                        for v in vals:
-                            v_stem = v.lower()[:4] if len(v) >= 4 else v.lower()
-                            if v_stem in claim_stems or v.lower() in claim_lower:
-                                wd_confirmed += 1
-                                break
+                        for v in f.get("wikidata_values", []):
+                            if _HAS_NATASHA:
+                                if lemmatize(v) in claim_lemmas or v.lower() in claim_lower:
+                                    wd_confirmed += 1
+                                    break
+                            else:
+                                v_stem = v.lower()[:4] if len(v) >= 4 else v.lower()
+                                if v_stem in claim_lemmas or v.lower() in claim_lower:
+                                    wd_confirmed += 1
+                                    break
+
             if wd_confirmed > 0 and wd_contradicted == 0:
-                wd_vote = min(2.0, wd_confirmed * 1.0)
+                wd_vote = min(3.0, wd_confirmed * 1.0)
                 vote += wd_vote
-                print(f"  [Vote:Wikidata] +{wd_vote:.1f} ({wd_confirmed} confirmed facts)")
-                logger.info(f"Vote: WIKIDATA_CONFIRMED — {wd_confirmed} facts → +{wd_vote:.1f}")
+                logger.info(f"Vote: WIKIDATA_CONFIRMED → +{wd_vote:.1f}")
             elif wd_contradicted > 0:
                 wd_vote = min(3.0, wd_contradicted * 1.5)
                 vote -= wd_vote
-                print(f"  [Vote:Wikidata] -{wd_vote:.1f} ({wd_contradicted} contradicted facts)")
-                logger.info(f"Vote: WIKIDATA_CONTRADICTED — {wd_contradicted} facts → -{wd_vote:.1f}")
+                logger.info(f"Vote: WIKIDATA_CONTRADICTED → -{wd_vote:.1f}")
 
-        # --- ГОЛОС 5: Скам-паттерны (если обнаружены — сильный сигнал ЛОЖЬ) ---
-        is_scam = self._ctx.is_scam
-        if is_scam:
-            vote -= 4.0
-            logger.info("Vote: SCAM_PATTERN → -4.0 (мошеннический паттерн)")
+        # --- СИГНАЛ 2: Числа (±3) — детерминистический ---
+        if nums_mismatch:
+            vote -= 3.0
+            logger.info("Vote: NUMS_MISMATCH → -3")
+        elif nums_match:
+            vote += 3.0
+            logger.info("Vote: NUMS_MATCH → +3")
 
-        # --- ГОЛОС 5.5: Date mismatch (год в claim ≠ годам в источниках) ---
-        date_mismatch = self._ctx.date_mismatch
-        if date_mismatch:
-            vote -= 2.0
-            logger.info("Vote: DATE_YEAR_MISMATCH → -2.0")
+        # --- СИГНАЛ 3: LLM вердикт (±2) ---
+        if verdict == "ПРАВДА":
+            llm_vote = max(0.0, min(2.0, (score - 50) / 25.0))
+            vote += llm_vote
+            logger.info(f"Vote: LLM ПРАВДА (score={score}) → +{llm_vote:.2f}")
+        elif verdict == "ЛОЖЬ":
+            llm_vote = max(-2.0, min(0.0, (score - 50) / 25.0))
+            vote += llm_vote
+            logger.info(f"Vote: LLM ЛОЖЬ (score={score}) → {llm_vote:+.2f}")
 
-        # --- ГОЛОС 5.7: Temporal mismatch (утверждение "свежее", источники старые) ---
-        temporal = self._ctx.temporal_check
-        if temporal.get("temporal_mismatch"):
-            vote -= 2.0
-            logger.info(f"Vote: TEMPORAL_MISMATCH → -2.0 (источники от {temporal.get('median_source_date', '?')})")
-
-        # --- ГОЛОС 6: Детекция несовпадения локаций (claim vs sources) ---
-        # ВАЖНО: Не применяем если NLI entailment высокий (>= 0.50) — 
-        # это означает что источники ПОДТВЕРЖДАЮТ claim, просто локация в другом языке
-        # (напр: "Париж" в claim, но источник содержит "Paris" на английском)
-        claim_locations = self._ctx.claim_locations
-        # Только пропускаем location check при ЧЁТКОМ подтверждении (ent>=0.70, con<0.30)
-        loc_guard_active = (nli_ent >= 0.70 and nli_con < 0.30)
-        if claim_locations and has_sources and not loc_guard_active:
-            source_text_all = " ".join(
-                (r.get("snippet", "") + " " + r.get("title", "")).lower()
-                for r in raw_results[:7]
-            )
-            # Для date/date_loc утверждений с явным годом — требуем
-            # совместного появления года + локации в ОДНОМ сниппете.
-            claim_years = re.findall(r'\b(?:19|20)\d{2}\b', claim)
-            use_cooccurrence = bool(
-                claim_years and claim_type in ("date", "date_loc")
-            )
-            source_snippets = [
-                (r.get("snippet", "") + " " + r.get("title", "")).lower()
-                for r in raw_results[:10]
-            ]
-
-            def _loc_found(loc_lower: str) -> bool:
-                """Проверяет наличие локации в источниках с учётом co-occurrence."""
-                trans = TRANSLITERATION_MAP.get(loc_lower, [])
-                loc_variants = [loc_lower] + trans
-                if not use_cooccurrence:
-                    return any(v in source_text_all for v in loc_variants)
-                hosting_pattern = f"в {loc_lower}"
-                for snippet in source_snippets:
-                    for yr in claim_years:
-                        if yr not in snippet:
-                            continue
-                        yr_idx = snippet.index(yr)
-                        window = snippet[max(0, yr_idx - 200): yr_idx + 200]
-                        if hosting_pattern in window:
-                            return True
-                        for t in trans:
-                            if f"in {t}" in window or f"в {t}" in window:
-                                return True
-                return False
-
-            missing_locs = []
-            for loc in claim_locations:
-                loc_lower = loc.lower()
-                found_in_sources = _loc_found(loc_lower)
-                if not found_in_sources and len(loc_lower) > 3:
-                    missing_locs.append(loc)
-            if missing_locs and len(missing_locs) == len(claim_locations):
-                vote -= 2.5
-                logger.info(f"Vote: LOCATION_MISMATCH — локации {missing_locs} не в sources → -2.5")
-            elif missing_locs:
-                vote -= 1.0
-                logger.info(f"Vote: LOCATION_PARTIAL_MISS — часть локаций не в sources → -1.0")
-            else:
-                # Все локации из claim найдены в sources → слабое подтверждение
-                vote += 0.5
-                logger.info(f"Vote: LOCATION_CONFIRMED — локации {claim_locations} найдены → +0.5")
-
-        # --- ГОЛОС 7: Zero-evidence override для скам-claims ---
-        if self._check_zero_evidence(claim, nli_result):
-            vote -= 5.0
-            logger.info("Vote: ZERO_EVIDENCE_SCAM → -5.0 (скам-тема без подтверждения)")
-
-        # --- ГОЛОС 8 (A3): Role-attribution half-truth detection ---
-        _half_truth = False
+        # --- СИГНАЛ 4: NLI (±1.5) — только при сильном сигнале ---
         if has_sources:
-            from claim_parser import detect_counter_evidence
-            ce = detect_counter_evidence(claim, raw_results)
-            if ce["half_truth"]:
-                vote -= 1.0
-                _half_truth = True
-                logger.info(f"Vote: HALF_TRUTH_ROLE → -1.0 ({ce['signal']})")
+            # NLI только при сильном сигнале (>0.65) и не mixed
+            if nli_ent >= 0.65 and nli_con < 0.35:
+                nli_vote = min(1.5, nli_ent * 1.5)
+                vote += nli_vote
+                logger.info(f"Vote: NLI entailment={nli_ent:.2f} → +{nli_vote:.2f}")
+            elif nli_con >= 0.65 and nli_ent < 0.35:
+                nli_vote = min(1.5, nli_con * 1.5)
+                vote -= nli_vote
+                logger.info(f"Vote: NLI contradiction={nli_con:.2f} → -{nli_vote:.2f}")
+            elif nli_mixed:
+                logger.info(f"Vote: NLI mixed (ent={nli_ent:.2f}, con={nli_con:.2f}) → 0")
 
-        # --- ГОЛОС 8.5: Person-entity mismatch (founder substitution) ---
-        if has_sources and claim_type == "person":
-            from claim_parser import detect_person_entity_mismatch
-            pem = detect_person_entity_mismatch(claim, raw_results)
-            if pem["mismatch"]:
-                vote -= 3.0
-                logger.info(f"Vote: PERSON_ENTITY_MISMATCH → -3.0 ({pem['signal']})")
+        # --- СИГНАЛ 5: Скам-паттерн (-4) ---
+        if self._ctx.is_scam:
+            vote -= 4.0
+            logger.info("Vote: SCAM_PATTERN → -4.0")
+        if self._check_zero_evidence(claim, nli_result):
+            vote -= 3.0
+            logger.info("Vote: ZERO_EVIDENCE_SCAM → -3.0")
+
+        # --- СИГНАЛ 6: MiniCheck-FT5 (±1.5) — кросс-модельная верификация ---
+        mc_result = self._ctx.minicheck_result
+        if mc_result and mc_result.get("per_source"):
+            mc_signal = mc_result.get("signal", 0)
+            if mc_signal != 0:
+                mc_vote = mc_signal * 0.75  # scale: ±2 → ±1.5
+                vote += mc_vote
+                mc_sup = mc_result["max_support"]
+                logger.info(f"Vote: MINICHECK (support={mc_sup:.2f}) → {mc_vote:+.2f}")
+
+        # --- Date mismatch (бонусный сигнал, -2) ---
+        if self._ctx.date_mismatch:
+            vote -= 2.0
+            logger.info("Vote: DATE_MISMATCH → -2.0")
 
         # --- ИТОГОВОЕ РЕШЕНИЕ ---
-        logger.info(f"Vote TOTAL: {vote:+.2f}")
+        logger.info(f"V9 Vote TOTAL: {vote:+.2f}")
+        print(f"  [V8:Ensemble] vote={vote:+.2f}")
 
-        # A3: MANIPULATION zone — mixed NLI signals + uncertain vote
-        # V6: Reduced deadzone from ±1.5 to ±1.0 for more decisive verdicts
         VOTE_THRESHOLD = 1.0
+
         if nli_mixed and -VOTE_THRESHOLD < vote < VOTE_THRESHOLD:
             parsed["verdict"] = "МАНИПУЛЯЦИЯ / ПОЛУПРАВДА"
             parsed["credibility_score"] = max(30, min(45, int(50 + vote * 5)))
-            logger.info(f"Ensemble: МАНИПУЛЯЦИЯ (nli_mixed + vote={vote:+.2f})")
-        elif _half_truth and -VOTE_THRESHOLD < vote < VOTE_THRESHOLD:
-            parsed["verdict"] = "МАНИПУЛЯЦИЯ / ПОЛУПРАВДА"
-            parsed["credibility_score"] = max(30, min(45, int(50 + vote * 5)))
-            logger.info(f"Ensemble: МАНИПУЛЯЦИЯ (half_truth + vote={vote:+.2f})")
         elif vote >= VOTE_THRESHOLD:
             parsed["verdict"] = "ПРАВДА"
             parsed["credibility_score"] = min(95, int(50 + vote * 10))
-            logger.info(f"Ensemble: ПРАВДА (vote={vote:+.2f})")
         elif vote <= -VOTE_THRESHOLD:
             parsed["verdict"] = "ЛОЖЬ"
             parsed["credibility_score"] = max(5, int(50 + vote * 10))
-            logger.info(f"Ensemble: ЛОЖЬ (vote={vote:+.2f})")
         else:
-            # A1: Adversarial debate for uncertain claims — defeats confirmation bias
-            # Skip debate for high-confidence simple facts (lowered from 75 to 70)
-            _skip_debate = (
-                verdict == "ПРАВДА" and score >= 70
-                and claim_type in ("general", "event", "science")
-            )
-            if _skip_debate:
-                logger.info(f"Debate SKIPPED: high-confidence {verdict} (score={score}, type={claim_type})")
-            if self.pipeline_config.enable_adversarial_debate and -VOTE_THRESHOLD < vote < VOTE_THRESHOLD and not _skip_debate:
-                try:
-                    debate = AdversarialDebate(self.searcher)
-                    debate_result = debate.debate(claim)
-                    jv = debate_result.get("judge_verdict", "")
-                    dc = debate_result.get("defender_count", 0)
-                    pc = debate_result.get("prosecutor_count", 0)
-                    if "ПРАВДА" in jv and dc > pc * 1.2:
-                        vote += 1.0
-                        logger.info(f"Vote: ADVERSARIAL_DEBATE → +1.0 (defender={dc}, prosecutor={pc})")
-                    elif "ЛОЖЬ" in jv and pc > dc * 1.2:
-                        vote -= 1.0
-                        logger.info(f"Vote: ADVERSARIAL_DEBATE → -1.0 (defender={dc}, prosecutor={pc})")
-                    else:
-                        logger.info(f"Vote: ADVERSARIAL_DEBATE → 0 (inconclusive: d={dc}, p={pc})")
-                    print(f"  [Adversarial] {jv[:60]} (d={dc}, p={pc})")
-                except Exception as e:
-                    logger.warning(f"Adversarial debate failed: {e}")
-
-            # Зона неопределённости — доверяем LLM, но с пониженной уверенностью
-            if vote >= VOTE_THRESHOLD:
-                # Debate may have pushed vote above threshold
-                parsed["verdict"] = "ПРАВДА"
-                parsed["credibility_score"] = min(95, int(50 + vote * 10))
-                logger.info(f"Ensemble: ПРАВДА after debate (vote={vote:+.2f})")
-            elif vote <= -VOTE_THRESHOLD:
-                parsed["verdict"] = "ЛОЖЬ"
-                parsed["credibility_score"] = max(5, int(50 + vote * 10))
-                logger.info(f"Ensemble: ЛОЖЬ after debate (vote={vote:+.2f})")
-            elif verdict == "ПРАВДА":
-                # V6: Trust LLM more — use score directly (capped at 75)
+            # V8: В зоне неопределённости — доверяем LLM с cap
+            if verdict == "ПРАВДА":
                 parsed["verdict"] = "ПРАВДА"
                 parsed["credibility_score"] = min(score, 75)
             elif verdict == "ЛОЖЬ":
@@ -2005,9 +1862,79 @@ class FactCheckPipeline:
             else:
                 parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
                 parsed["credibility_score"] = 50
-            logger.info(f"Ensemble: UNCERTAIN (vote={vote:+.2f}) → LLM fallback: {parsed['verdict']}")
+            logger.info(f"V8: Uncertain (vote={vote:+.2f}) → LLM fallback: {parsed['verdict']}")
 
         return parsed
+
+    def _self_consistency_vote(self, state: dict, first_parsed: Dict) -> Dict:
+        """V9: Self-consistency — N прогонов LLM с temperature>0, majority vote.
+
+        Если модель не уверена в себе (разные вердикты при разных прогонах),
+        это сигнал неопределённости → НЕ ПОДТВЕРЖДЕНО.
+        """
+        n_runs = getattr(self.pipeline_config, 'self_consistency_n', 3)
+        sc_temp = getattr(self.pipeline_config, 'self_consistency_temperature', 0.3)
+
+        # First verdict already parsed
+        verdicts = [first_parsed["verdict"]]
+
+        # Temporarily enable sampling with temperature
+        try:
+            orig_do_sample = self.verdict_llm.pipeline._forward_params.get("do_sample", False)
+            orig_temp = self.verdict_llm.pipeline._forward_params.get("temperature", None)
+            self.verdict_llm.pipeline._forward_params["do_sample"] = True
+            self.verdict_llm.pipeline._forward_params["temperature"] = sc_temp
+        except (AttributeError, TypeError):
+            print("  [SC] Cannot set temperature — skipping self-consistency")
+            return first_parsed
+
+        try:
+            for i in range(n_runs - 1):
+                try:
+                    sc_result = self.chain.invoke(state)
+                    sc_parsed = self.parse_verdict(sc_result.get("verdict", ""))
+                    sc_verdict = sc_parsed["verdict"].upper().strip()
+                    verdicts.append(sc_verdict)
+                except Exception as e:
+                    logger.warning(f"SC run {i+2} failed: {e}")
+                    verdicts.append("НЕ ПОДТВЕРЖДЕНО")
+        finally:
+            # Restore original settings
+            try:
+                self.verdict_llm.pipeline._forward_params["do_sample"] = orig_do_sample
+                if orig_temp is not None:
+                    self.verdict_llm.pipeline._forward_params["temperature"] = orig_temp
+                else:
+                    self.verdict_llm.pipeline._forward_params.pop("temperature", None)
+            except (AttributeError, TypeError):
+                pass
+
+        # Majority vote
+        from collections import Counter
+        vote_counts = Counter(verdicts)
+        majority_verdict, majority_count = vote_counts.most_common(1)[0]
+
+        print(f"  [SC] Verdicts: {verdicts} → majority: {majority_verdict} ({majority_count}/{len(verdicts)})")
+
+        # If no majority (all different) → uncertainty
+        if majority_count <= len(verdicts) // 2:
+            first_parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
+            first_parsed["credibility_score"] = 50
+            first_parsed["_sc_disagreement"] = True
+            print(f"  [SC] No majority → НЕ ПОДТВЕРЖДЕНО")
+        elif majority_verdict != first_parsed["verdict"]:
+            # Majority disagrees with first run → use majority
+            first_parsed["verdict"] = majority_verdict
+            # Adjust score based on majority direction
+            if majority_verdict == "ПРАВДА":
+                first_parsed["credibility_score"] = max(first_parsed["credibility_score"], 70)
+            elif majority_verdict == "ЛОЖЬ":
+                first_parsed["credibility_score"] = min(first_parsed["credibility_score"], 30)
+            print(f"  [SC] Majority override: {first_parsed['verdict']}")
+
+        first_parsed["_sc_verdicts"] = verdicts
+        first_parsed["_sc_agreement"] = majority_count / len(verdicts)
+        return first_parsed
 
     def _detect_fallacy(self, claim: str, confirmed_facts: List[str]) -> Dict:
         """Проверяет логическую связность факт→вывод."""
@@ -2085,19 +2012,46 @@ class FactCheckPipeline:
               f"(доверенных: {trusted_cnt})")
         parsed = self.parse_verdict(raw_result.get("verdict", ""))
 
-        # Retry при пустом reasoning (GRPO модель не сгенерировала анализ)
-        if parsed.get("_empty_reasoning") and self._use_reasoning_template:
-            print("  [Retry] Пустой reasoning — повторяем генерацию")
+        # V8: Retry при пустом/обрезанном reasoning
+        _needs_retry = parsed.get("_empty_reasoning")
+        # Также retry если reasoning обрезан (нет </reasoning>)
+        raw_v = raw_result.get("verdict", "")
+        if not _needs_retry and "<reasoning>" in raw_v and "</reasoning>" not in raw_v:
+            _needs_retry = True
+            print("  [V8:Truncated] Reasoning обрезан — retry с увеличенными токенами")
+
+        if _needs_retry and self._use_reasoning_template:
+            print("  [V8:Retry] Повторяем генерацию (1500 tokens)")
             try:
+                # V8: Увеличиваем токены для retry
+                try:
+                    self.verdict_llm.pipeline._forward_params["max_new_tokens"] = 1500
+                except (AttributeError, TypeError):
+                    pass
                 retry_result = self.chain.invoke(state)
                 retry_parsed = self.parse_verdict(retry_result.get("verdict", ""))
                 if not retry_parsed.get("_empty_reasoning"):
                     parsed = retry_parsed
                     raw_result = retry_result
-                    print("  [Retry] Успешно — reasoning заполнен")
+                    print("  [V8:Retry] Успешно — reasoning заполнен")
+                else:
+                    print("  [V8:Retry] Повторно пустой — используем truncated extraction")
             except Exception as e:
                 logger.warning(f"Retry failed: {e}")
         parsed.pop("_empty_reasoning", None)
+
+        # V9: MiniCheck-FT5 verification (CPU, параллельно с парсингом)
+        if self.minicheck and raw_results:
+            try:
+                mc_result = self.minicheck.verify_claim(
+                    claim, raw_results[:5], snippet_key="snippet"
+                )
+                self._ctx.minicheck_result = mc_result
+                print(f"  [MiniCheck] support={mc_result['max_support']:.2f}, "
+                      f"signal={mc_result['signal']:+d}")
+            except Exception as e:
+                print(f"  [MiniCheck] Ошибка: {e}")
+                self._ctx.minicheck_result = None
 
         # Claim-drift detection: if model restated a different claim in reasoning,
         # its verdict is unreliable. Check word overlap between original claim
@@ -2199,52 +2153,64 @@ class FactCheckPipeline:
             count_nodata = sum(1 for s in statuses if s in ("НЕТ ДАННЫХ", "НЕТ"))
             total = len(statuses)
 
-            # A4: Weighted composite score instead of binary
+            # V9: FActScore-style metric — % подтверждённых атомарных фактов
+            # Вместо бинарной матрицы используем непрерывный FActScore
             if total > 0:
+                factscore = count_true / total  # 0.0 - 1.0
                 composite_score = int(
                     (count_true * 100 + count_nodata * 50 + count_false * 0) / total
                 )
             else:
+                factscore = 0.0
                 composite_score = 50
 
-            if count_true == total:
+            parsed["_factscore"] = round(factscore, 2)
+            print(f"  [FActScore] {count_true}/{total} confirmed = {factscore:.0%}")
+
+            # Core fact detection for severity assessment
+            _core_fact_keywords = (
+                'океан', 'море', 'город', 'стран', 'контин', 'планет',
+                'основа', 'создал', 'родил', 'столиц', 'президент',
+                'река', 'озеро', 'гора', 'остров',
+            )
+            _is_core_false = False
+            for sv in parsed["sub_verdicts"]:
+                if sv["status"] == "ЛОЖЬ":
+                    sv_text = sv.get("claim", sv.get("text", "")).lower()
+                    if any(kw in sv_text for kw in _core_fact_keywords):
+                        _is_core_false = True
+                        break
+
+            # V9: Three-zone FActScore verdict
+            if factscore >= 0.80:
+                # >80% confirmed → ПРАВДА
                 parsed["verdict"] = "ПРАВДА"
                 parsed["credibility_score"] = max(80, composite_score)
-            elif count_false > 0 and count_true > 0:
-                # Determine if this is factual error (→ЛОЖЬ) or manipulation (→МАНИПУЛЯЦИЯ)
-                _core_fact_keywords = (
-                    'океан', 'море', 'город', 'стран', 'контин', 'планет',
-                    'основа', 'создал', 'родил', 'столиц', 'президент',
-                    'река', 'озеро', 'гора', 'остров',
-                )
-                if count_false >= count_true or composite_score < 40:
-                    parsed["verdict"] = "ЛОЖЬ"
-                    parsed["credibility_score"] = max(5, composite_score)
-                    print(f"  [Audit:Matrix] ЛОЖЬ: {count_false} ложь >= {count_true} правда из {total}")
-                else:
-                    # Check if false sub-claim contains a core fact
-                    _is_core_false = False
-                    for sv in parsed["sub_verdicts"]:
-                        if sv["status"] == "ЛОЖЬ":
-                            sv_text = sv.get("claim", sv.get("text", "")).lower()
-                            if any(kw in sv_text for kw in _core_fact_keywords):
-                                _is_core_false = True
-                                break
-                    if _is_core_false:
-                        parsed["verdict"] = "ЛОЖЬ"
-                        parsed["credibility_score"] = max(5, composite_score)
-                        print(f"  [Audit:Matrix] ЛОЖЬ (core fact false): {count_true} правда + {count_false} ложь из {total}")
-                    else:
-                        parsed["verdict"] = "МАНИПУЛЯЦИЯ / ПОЛУПРАВДА"
-                        parsed["credibility_score"] = composite_score
-                        print(f"  [Audit:Matrix] МАНИПУЛЯЦИЯ: {count_true} правда + {count_false} ложь из {total}")
-            elif count_false > 0 and count_true == 0:
+            elif factscore <= 0.30:
+                # <30% confirmed → ЛОЖЬ
                 parsed["verdict"] = "ЛОЖЬ"
                 parsed["credibility_score"] = max(5, composite_score)
+                print(f"  [FActScore] ЛОЖЬ: {factscore:.0%} < 30%")
+            elif _is_core_false:
+                # Core fact false → ЛОЖЬ regardless of FActScore
+                parsed["verdict"] = "ЛОЖЬ"
+                parsed["credibility_score"] = max(5, composite_score)
+                print(f"  [FActScore] ЛОЖЬ (core fact false): {count_true}/{total}")
+            elif count_false > 0 and count_false >= count_true:
+                # More false than true → ЛОЖЬ
+                parsed["verdict"] = "ЛОЖЬ"
+                parsed["credibility_score"] = max(5, composite_score)
+                print(f"  [FActScore] ЛОЖЬ: {count_false} ложь >= {count_true} правда")
+            elif count_false > 0 and count_true > count_false:
+                # 30-80% confirmed, some false → ЧАСТИЧНО ВЕРНО / МАНИПУЛЯЦИЯ
+                parsed["verdict"] = "МАНИПУЛЯЦИЯ / ПОЛУПРАВДА"
+                parsed["credibility_score"] = composite_score
+                print(f"  [FActScore] МАНИПУЛЯЦИЯ: {factscore:.0%} ({count_true} правда + {count_false} ложь)")
             elif count_nodata == total:
                 parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
                 parsed["credibility_score"] = 50
             elif count_true > 0 and count_nodata > 0:
+                # Some confirmed, rest unknown → ЧАСТИЧНО ПОДТВЕРЖДЕНО
                 parsed["verdict"] = "ЧАСТИЧНО ПОДТВЕРЖДЕНО"
                 parsed["credibility_score"] = composite_score
             _has_audit_matrix = True
@@ -2271,10 +2237,99 @@ class FactCheckPipeline:
             parsed["verdict"] = "ЛОЖЬ"
             parsed["credibility_score"] = max(5, min(parsed.get("credibility_score", 15), 20))
             print("  [Scam Override] is_scam=True → вердикт принудительно ЛОЖЬ")
-        elif not _has_audit_matrix and not parsed.get("_claim_drift"):
+        elif _has_audit_matrix and not parsed.get("_claim_drift"):
+            # V8: Audit matrix + ensemble = единая система
+            # Audit matrix дал вердикт, но проверяем Wikidata/числа/NLI — они могут override
+            _audit_verdict = parsed["verdict"]
+            _audit_score = parsed["credibility_score"]
+
+            # Wikidata override: если Wikidata явно противоречит audit-вердикту
+            wikidata = self._ctx.wikidata_result
+            wd_contradicted = 0
+            wd_confirmed = 0
+            if wikidata and wikidata.get("found"):
+                wd_facts = wikidata.get("facts", [])
+                wd_contradicted = sum(1 for f in wd_facts if f.get("match") is False)
+                wd_confirmed = sum(1 for f in wd_facts if f.get("match") is True)
+                # Check neutral facts that actually match claim text
+                claim_lower = claim.lower()
+                claim_stems = set(w[:4] for w in re.findall(r'[а-яёa-z]{4,}', claim_lower))
+                for f in wd_facts:
+                    if f.get("match") is None:
+                        for v in f.get("wikidata_values", []):
+                            v_stem = v.lower()[:4] if len(v) >= 4 else v.lower()
+                            if v_stem in claim_stems or v.lower() in claim_lower:
+                                wd_confirmed += 1
+                                break
+
+            # Числа override
+            nums_mismatch = (
+                any(c for c in num_comparisons if c["source_number"] and not c["match"])
+                and not any(c for c in num_comparisons if c["source_number"] and c["match"])
+            )
+            nums_match = any(c for c in num_comparisons if c["source_number"] and c["match"])
+
+            # NLI override
+            nli_ent = nli_result.get("max_entailment", 0.0) if nli_result else 0.0
+            nli_con = nli_result.get("max_contradiction", 0.0) if nli_result else 0.0
+
+            # MiniCheck override
+            mc_result = self._ctx.minicheck_result
+            mc_signal = mc_result.get("signal", 0) if mc_result else 0
+
+            _overridden = False
+            # Если audit говорит ПРАВДА но Wikidata/числа/NLI/MiniCheck противоречат
+            if _audit_verdict == "ПРАВДА":
+                override_signals = []
+                if wd_contradicted > 0:
+                    override_signals.append(f"Wikidata противоречит ({wd_contradicted})")
+                if nums_mismatch:
+                    override_signals.append("Числа расходятся")
+                if nli_con >= 0.70 and nli_ent < 0.35:
+                    override_signals.append(f"NLI contradiction={nli_con:.2f}")
+                if mc_signal <= -2:
+                    override_signals.append(f"MiniCheck не подтверждает (signal={mc_signal})")
+                if override_signals:
+                    parsed["verdict"] = "ЛОЖЬ"
+                    parsed["credibility_score"] = max(5, min(35, _audit_score))
+                    _overridden = True
+                    print(f"  [V8:AuditOverride] Audit=ПРАВДА, но {'; '.join(override_signals)} → ЛОЖЬ")
+
+            # Если audit говорит ЛОЖЬ/НЕ ПОДТВЕРЖДЕНО но Wikidata/числа подтверждают
+            elif _audit_verdict in ("НЕ ПОДТВЕРЖДЕНО", "ЧАСТИЧНО ПОДТВЕРЖДЕНО"):
+                confirm_signals = []
+                if wd_confirmed > 0 and wd_contradicted == 0:
+                    confirm_signals.append(f"Wikidata подтверждает ({wd_confirmed})")
+                if nums_match:
+                    confirm_signals.append("Числа совпадают")
+                if nli_ent >= 0.70 and nli_con < 0.30:
+                    confirm_signals.append(f"NLI entailment={nli_ent:.2f}")
+                if mc_signal >= 2:
+                    confirm_signals.append(f"MiniCheck подтверждает (signal={mc_signal})")
+                if len(confirm_signals) >= 2:
+                    parsed["verdict"] = "ПРАВДА"
+                    parsed["credibility_score"] = max(70, _audit_score)
+                    _overridden = True
+                    print(f"  [V8:AuditOverride] Audit={_audit_verdict}, но {'; '.join(confirm_signals)} → ПРАВДА")
+
+            if not _overridden:
+                print(f"  [V8:Audit] Audit verdict сохранён: {_audit_verdict} (score={_audit_score})")
+        elif not parsed.get("_claim_drift"):
             # NLI ensemble verdict (A5 sufficiency gating is inside _ensemble_verdict)
             parsed = self._ensemble_verdict(parsed, nli_result, num_comparisons, raw_results, claim=claim)
         print(f"  Ensemble verdict: {parsed['verdict']} (score={parsed['credibility_score']})")
+
+        # V9: Self-consistency — majority vote из N прогонов LLM
+        # Запускаем только когда вердикт не скам и не claim-drift
+        if (getattr(self.pipeline_config, 'enable_self_consistency', False)
+                and not self._ctx.is_scam
+                and not parsed.get("_claim_drift")):
+            try:
+                parsed = self._self_consistency_vote(state, parsed)
+                print(f"  SC verdict: {parsed['verdict']} "
+                      f"(agreement={parsed.get('_sc_agreement', 1.0):.0%})")
+            except Exception as e:
+                logger.warning(f"Self-consistency failed: {e}")
 
         # Post-verdict self-critique
         critique_info = {}
@@ -2295,6 +2350,35 @@ class FactCheckPipeline:
         # Ключевые слова
         keywords = self._parse_keywords(raw_result.get("keywords_raw", ""))
 
+        # V9: Three-zone confidence calibration
+        # Зона 1 (>75): высокая уверенность → вердикт остаётся
+        # Зона 2 (35-75): средняя уверенность → НЕ ПОДТВЕРЖДЕНО
+        # Зона 3 (<35): высокая уверенность в противоположном → вердикт остаётся
+        raw_score = parsed["credibility_score"]
+        sc_agreement = parsed.get("_sc_agreement", 1.0)
+        _calibrated = False
+
+        # Calibration only when self-consistency shows disagreement
+        if sc_agreement < 0.67:  # Less than 2/3 agree
+            if 35 <= raw_score <= 75:
+                parsed["verdict"] = "НЕ ПОДТВЕРЖДЕНО"
+                parsed["credibility_score"] = 50
+                _calibrated = True
+                print(f"  [Calibration] score={raw_score}, SC agreement={sc_agreement:.0%} "
+                      f"→ НЕ ПОДТВЕРЖДЕНО (zone 2)")
+
+        # Additional calibration: if NLI and LLM disagree, lower confidence
+        if not _calibrated and nli_result:
+            nli_ent = nli_result.get("max_entailment", 0.0)
+            nli_con = nli_result.get("max_contradiction", 0.0)
+            llm_verdict = parsed["verdict"]
+            if llm_verdict == "ПРАВДА" and nli_con > nli_ent and nli_con >= 0.5:
+                # LLM says true but NLI says contradiction
+                parsed["credibility_score"] = min(raw_score, 65)
+            elif llm_verdict == "ЛОЖЬ" and nli_ent > nli_con and nli_ent >= 0.5:
+                # LLM says false but NLI says entailment
+                parsed["credibility_score"] = max(raw_score, 35)
+
         logger.info(f"Вердикт: {parsed['verdict']} (score={parsed['credibility_score']})")
         logger.info(f"Источников: {len(sources)}, Ключевые слова: {keywords}")
 
@@ -2307,6 +2391,7 @@ class FactCheckPipeline:
             "reasoning": parsed["reasoning"],
             "chain_of_thought": parsed.get("chain_of_thought", ""),
             "sub_verdicts": parsed.get("sub_verdicts", []),
+            "factscore": parsed.get("_factscore"),
             "sources": sources,
             "sources_text": parsed["sources"],
             "keywords": keywords,
@@ -2315,6 +2400,8 @@ class FactCheckPipeline:
             "self_critique": critique_info.get("raw", ""),
             "self_critique_errors": critique_info.get("errors", ""),
             "_ensemble_features": parsed.get("_ensemble_features", {}),
+            "_sc_agreement": parsed.get("_sc_agreement"),
+            "_sc_verdicts": parsed.get("_sc_verdicts"),
             "total_time": round(total_time, 2),
         }
 

@@ -18,3 +18,5 @@ streamlit>=1.30.0
 sentence-transformers>=2.3.0
 ddgs>=9.0
 sacremoses>=0.0.53
+natasha>=1.4.0
+pymorphy2>=0.9.1
