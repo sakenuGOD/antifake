@@ -113,8 +113,10 @@ class NLIChecker:
         return scores
 
     # A2: Survey/misconception sentence filter patterns
+    # V8: расширенные паттерны для опросов/заблуждений
     _SURVEY_PATTERNS = re.compile(
         r'(?:считают\s+что|полагают\s+что|по\s+данным\s+опроса|'
+        r'верят\s+что|убеждены\s+что|думают\s+что|'
         r'%\s*респондентов|процент\w*\s+(?:россиян|людей|населения)\s+считают|'
         r'(?:миф|заблуждени[ея]|popular\s+misconception|urban\s+legend)\s+(?:что|о\s+том))',
         re.IGNORECASE,
