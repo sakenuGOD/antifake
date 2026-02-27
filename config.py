@@ -16,7 +16,7 @@ class ModelConfig:
     # Оригинальная модель для inference через plain transformers (без Unsloth)
     # Unsloth-версия уже 4-bit — нельзя квантовать повторно через BitsAndBytes
     inference_model_name: str = "mistralai/Mistral-7B-Instruct-v0.3"
-    max_seq_length: int = 2048           # 2048 для длинных источников + reasoning
+    max_seq_length: int = 4096           # 4096 — больше контекста для reasoning с источниками
     dtype: str = None  # auto-detect (bf16 на Blackwell)
     load_in_4bit: bool = True
 
@@ -81,3 +81,9 @@ class PipelineConfig:
     enable_nli: bool = True
     nli_model_name: str = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
     nli_device: str = "cpu"
+    enable_cross_encoder: bool = True   # Cross-encoder re-ranking поверх bi-encoder
+    cross_encoder_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    enable_claim_decomposition: bool = True  # Декомпозиция составных утверждений
+    translator_model: str = "facebook/nllb-200-distilled-600M"  # NLLB-200 (fallback: MarianMT)
+    enable_adversarial_debate: bool = True  # Адвокат дьявола для mixed NLI
+    enable_fact_cache: bool = True  # Redis кэш вердиктов

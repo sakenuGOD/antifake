@@ -19,7 +19,9 @@
 [DDG Search × 3]  ←  factcheckers | ru_sources | global_sources
     │                 site: операторы по матрице доверенных источников
     │   + Myth-buster:  "<claim> миф OR разоблачение OR debunk"
-    │   + Wikipedia API
+    │   + Wikipedia API (direct entity lookup)
+    │   + Verification queries (целевые проверочные вопросы)
+    │   + Multi-hop counter-entity search (ловит подмену персон)
     ▼
 [clean_results]  ←  URL-фильтр: blacklist → trusted TLD → TRUSTED_SOURCES → DROP
     │
@@ -35,6 +37,11 @@
             │                            фильтр при penalty > 0.35 (мин. 3 документа)
             ▼
 [NLI Analysis]  ←  mDeBERTa-v3-base-xnli (entailment / contradiction, CPU)
+    │                 + NLI per sub-claim (отдельный анализ каждого подпункта)
+    │
+    ▼
+[Wikidata SPARQL]  ←  Структурированные факты из Knowledge Graph
+    │                   основатель, столица, спутники, материк, дата основания
     │
     ▼
 [Числа / Даты / Локации]  ←  детерминистическая проверка claim vs sources
@@ -43,7 +50,7 @@
 [Mistral 7B Verdict]  ←  GRPO/SFT адаптер, Chain-of-Thought <reasoning>
     │
     ▼
-[Ensemble Vote]  ←  числа(±3) + NLI(±2) + детали(±2) + LLM(±2) + скам(−4)
+[Ensemble Vote]  ←  числа(±3) + NLI(±2) + Wikidata(±2) + детали(±2) + LLM(±2) + скам(−4)
     │
     ▼
 Вердикт + Скор + Источники
@@ -76,10 +83,13 @@ antifake/
 ├── source_credibility.py   # Бустинг по кредитности домена
 ├── model.py                # Загрузка Mistral, LoRA адаптеров, LangChain wrapper
 ├── prompts.py              # Шаблоны промптов (SFT / GRPO / аудиторский)
+├── wikidata.py             # Wikidata SPARQL — структурированная верификация фактов
+├── adversarial.py          # Adversarial debate (защитник vs обвинитель)
+├── satire_detector.py      # Детектор сатиры и юмора
+├── fact_cache.py           # Кэш проверенных фактов
+├── utils.py                # Стоп-слова, стемминг, транслитерация
 ├── config.py               # Конфигурация (ModelConfig, PipelineConfig, ...)
-├── cache.py                # Кэш поисковых запросов
 ├── train_grpo.py           # Обучение с GRPO (reward-based)
-├── evaluate.py             # Evaluation pipeline
 ├── data/                   # Датасеты для обучения и оценки
 └── adapters/               # LoRA/GRPO адаптеры (локально)
 ```
@@ -202,15 +212,20 @@ for src in result["sources"]:
 | Числа расходятся | −3.0 | несовпадение при отсутствии match |
 | NLI entailment | до +2.0 | mDeBERTa entailment × count |
 | NLI contradiction | до −2.0 | mDeBERTa contradiction × count |
-| KEY_DETAIL_MISSING | −2.0 | уникальные слова claim отсутствуют в sources |
+| KEY_DETAIL_MISSING | −2.0 | уникальные слова claim отсутствуют в sources (stem matching) |
+| ENTITY_SATURATION | +1.0 | ≥3 из 7 sources содержат сущности claim |
+| WIKIDATA_CONFIRMED | до +2.0 | Wikidata подтверждает факты из claim |
+| WIKIDATA_CONTRADICTED | до −3.0 | Wikidata опровергает факты из claim |
 | LLM ПРАВДА | до +2.0 | пропорционально credibility_score |
 | LLM ЛОЖЬ | до −2.0 | пропорционально credibility_score |
 | SCAM_PATTERN | −4.0 | обнаружены мошеннические паттерны |
 | DATE_YEAR_MISMATCH | −2.0 | год в claim ≠ годам в источниках |
 | LOCATION_MISMATCH | −2.5 | все локации из claim отсутствуют в источниках |
 | LOCATION_CONFIRMED | +0.5 | все локации найдены в источниках |
+| HALF_TRUTH_ROLE | −1.0 | роль персоны искажена (со-основатель → основатель) |
+| PERSON_ENTITY_MISMATCH | −3.0 | персона подменена (Джобс вместо Гейтса) |
 
-`vote ≥ +1.5` → ПРАВДА · `vote ≤ −1.5` → ЛОЖЬ · иначе → fallback на LLM
+`vote ≥ +1.0` → ПРАВДА · `vote ≤ −1.0` → ЛОЖЬ · иначе → adversarial debate → fallback на LLM
 
 ---
 
@@ -230,6 +245,38 @@ for src in result["sources"]:
 | Все НЕТ ДАННЫХ | НЕ ПОДТВЕРЖДЕНО |
 
 Пример: *«Эйнштейн получил Нобелевскую премию, однако в школе был двоечником и утверждал, что человек использует мозг на 10%»* → МАНИПУЛЯЦИЯ (3 ПРАВДА + 1 ЛОЖЬ из 4).
+
+---
+
+## Wikidata SPARQL — структурированная верификация
+
+Для фактов с именованными сущностями система обращается к Wikidata Knowledge Graph через SPARQL endpoint (без API-ключа):
+
+| Свойство | Wikidata ID | Пример |
+|----------|-------------|--------|
+| Основатель | P112 | Microsoft → Билл Гейтс, Пол Аллен |
+| Дата основания | P571 | Microsoft → 1975-04-04 |
+| Столица | P36 | Россия → Москва |
+| Материк | P30 | Амазонка → Южная Америка |
+| Спутник / орбита | P397, P398 | Луна → обращается вокруг Земли |
+| Местоположение | P276 | Титаник → Атлантический океан |
+| Страна | P17 | Амазонка → Бразилия, Перу, Колумбия |
+
+Wikidata-факты используются двояко:
+1. Как текстовая подсказка для LLM в промпте
+2. Как **голос в ансамбле** (до +2.0 за подтверждение, до −3.0 за противоречие)
+
+Stem matching (4-char) учитывает русскую морфологию: «Земля» (Wikidata) → «земл» ≈ «Земли» (claim).
+
+---
+
+## Расширенный поиск
+
+Помимо стандартного DDG Search × 3, система использует:
+
+- **Wikipedia entity lookup** — прямое обращение к Wikipedia API для каждой сущности из claim (до 2000 символов intro)
+- **Verification queries** — LLM генерирует целевые проверочные вопросы (напр. «кто основал Microsoft?»), по ним выполняется дополнительный поиск
+- **Multi-hop counter-entity search** — независимый поиск каждой сущности claim для обнаружения подмен (напр. «Стив Джобс основатель» → Apple, не Microsoft)
 
 ---
 
@@ -324,4 +371,4 @@ SearchConfig(
 | mDeBERTa-v3-base-xnli | ~280 MB | CPU | NLI entailment/contradiction |
 | multilingual-e5-base | ~278 MB | CPU | Семантическое ранжирование (bi-encoder) |
 | ms-marco-MiniLM-L-6-v2 | ~22 MB | CPU | CrossEncoder re-ranking |
-| opus-mt-ru-en (MarianMT) | ~300 MB | CPU | Перевод запросов RU→EN |
+| NLLB-200-distilled-600M | ~600 MB | CPU | Перевод запросов RU→EN |

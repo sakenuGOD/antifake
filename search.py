@@ -38,6 +38,13 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS as _DDGS  # type: ignore[no-redef]
 
+# Async DDG (опционально)
+_ASYNC_DDGS = None
+try:
+    from duckduckgo_search import AsyncDDGS as _ASYNC_DDGS
+except ImportError:
+    pass
+
 _DDG_TIMEOUT = 20  # секунд — достаточно для медленного Bing-бэкенда
 
 from cache import SearchCache
@@ -54,6 +61,7 @@ TRUSTED_SOURCES: Dict[str, List[str]] = {
         "wikipedia.org",
         "britannica.com",
         "wikimedia.org",
+        "merriam-webster.com",
     ],
     "factcheckers_global": [
         "snopes.com",
@@ -79,6 +87,10 @@ TRUSTED_SOURCES: Dict[str, List[str]] = {
         "aljazeera.com",
         "ft.com",
         "wsj.com",
+        "theguardian.com",
+        "dw.com",
+        "euronews.com",
+        "cnn.com",
     ],
     "news_agencies_ru": [
         "tass.ru",
@@ -89,6 +101,12 @@ TRUSTED_SOURCES: Dict[str, List[str]] = {
         "ria.ru",
         "rg.ru",
         "forbes.ru",
+        "lenta.ru",
+        "iz.ru",
+        "kp.ru",
+        "mk.ru",
+        "1tv.ru",
+        "gazeta.ru",
     ],
     "official_intl": [
         "european-union.europa.eu",
@@ -132,6 +150,32 @@ TRUSTED_SOURCES: Dict[str, List[str]] = {
         "3dnews.ru",
         "ixbt.com",
         "vc.ru",
+    ],
+    "art_culture_global": [
+        "theguardian.com",
+        "artsy.net",
+        "britannica.com",
+        "metmuseum.org",
+        "moma.org",
+        "tate.org.uk",
+        "theartnewspaper.com",
+    ],
+    "art_culture_ru": [
+        "culture.ru",
+        "tretyakovgallery.ru",
+        "hermitagemuseum.org",
+        "pushkinmuseum.art",
+    ],
+    "sports_global": [
+        "espn.com",
+        "goal.com",
+        "transfermarkt.com",
+        "olympics.com",
+    ],
+    "sports_ru": [
+        "sport-express.ru",
+        "championat.com",
+        "sports.ru",
     ],
 }
 
@@ -185,11 +229,13 @@ _FORUM_BLOG_PATH_PATTERNS: List[str] = [
 
 # Маппинг: категория → ключи в TRUSTED_SOURCES
 _CATEGORY_SOURCE_KEYS: Dict[str, List[str]] = {
-    "science":    ["science_med_global",   "science_med_ru"],
-    "politics":   ["news_agencies_global", "news_agencies_ru"],
-    "technology": ["tech_crypto_global",   "tech_crypto_ru"],
-    "crypto":     ["tech_crypto_global",   "tech_crypto_ru"],
-    "general":    ["news_agencies_global", "news_agencies_ru"],
+    "science":     ["science_med_global",   "science_med_ru"],
+    "politics":    ["news_agencies_global", "news_agencies_ru"],
+    "technology":  ["tech_crypto_global",   "tech_crypto_ru"],
+    "crypto":      ["tech_crypto_global",   "tech_crypto_ru"],
+    "art_culture": ["art_culture_global",   "art_culture_ru"],
+    "sports":      ["sports_global",        "sports_ru"],
+    "general":     ["news_agencies_global", "news_agencies_ru"],
 }
 
 
@@ -215,13 +261,56 @@ Topics:
 - science  (medicine, health, biology, physics, chemistry, vaccines, viruses)
 - politics (government, war, elections, military, sanctions, diplomacy)
 - technology (tech, crypto, AI, software, blockchain, space, gadgets)
-- general  (economy, culture, sport, celebrity, business, other)
+- art_culture (art, painting, sculpture, music, literature, theater, museum, artist)
+- sports (football, hockey, tennis, basketball, Olympics, championship)
+- general  (economy, celebrity, business, other)
 
 Claim: "{claim}"
 
 Topic:[/INST]"""
 
-_VALID_TOPICS = {"science", "politics", "technology", "general"}
+_VALID_TOPICS = {"science", "politics", "technology", "art_culture", "sports", "general"}
+
+# Словарь терминов, которые MarianMT переводит НЕПРАВИЛЬНО
+TRANSLATION_OVERRIDES = {
+    # Термины искусства/культуры
+    "муравьед": "anteater",
+    "муравьеда": "anteater",
+    "муравьедом": "anteater",
+    "постоянство памяти": "The Persistence of Memory",
+    "сюрреализм": "surrealism",
+    "сюрреалист": "surrealist",
+    "сюрреалистом": "surrealist",
+    "импрессионизм": "impressionism",
+    "кубизм": "cubism",
+    # Имена художников — не переводить
+    "дали": "Dalí",
+    "пикассо": "Picasso",
+    "малевич": "Malevich",
+    "кандинский": "Kandinsky",
+    "моне": "Monet",
+    "ван гог": "Van Gogh",
+    # Имена знаменитостей — защита от побуквенного перевода
+    "долина": "Dolina",
+    "долиной": "Dolina",
+    "долину": "Dolina",
+    "роналдо": "Ronaldo",
+    "криштиано": "Cristiano",
+    "месси": "Messi",
+    # Специфические термины
+    "безопасный счёт": "safe account",
+    "безопасный счет": "safe account",
+}
+
+
+def _apply_translation_overrides(text: str) -> str:
+    """Заменяет известные проблемные фразы/слова ДО отправки в MarianMT."""
+    result = text
+    # Сортируем по длине фразы (длинные первыми) — "постоянство памяти" до "памяти"
+    for ru, en in sorted(TRANSLATION_OVERRIDES.items(), key=lambda x: -len(x[0])):
+        pattern = re.compile(re.escape(ru), re.IGNORECASE)
+        result = pattern.sub(en, result)
+    return result
 
 
 class QueryClassifier:
@@ -240,12 +329,95 @@ class QueryClassifier:
     """
 
     _MARIAN_MODEL_NAME = "Helsinki-NLP/opus-mt-ru-en"
+    _NLLB_MODEL_NAME = "facebook/nllb-200-distilled-600M"
 
     def __init__(self):
         self._generate_fn  = None   # callable: str → str (Mistral)
         self._marian_tok   = None
         self._marian_model = None
         self._marian_ready = False
+        self._nllb_tok     = None
+        self._nllb_model   = None
+        self._nllb_ready   = False
+        self._use_nllb     = False  # True если NLLB загружен успешно
+
+    # ----------------------------------------------------------
+    # NER-защита имён собственных при переводе
+    # ----------------------------------------------------------
+
+    @staticmethod
+    def _protect_proper_nouns(text: str) -> tuple:
+        """Заменяет имена собственные на placeholder'ы перед переводом."""
+        placeholders = {}
+        counter = [0]
+
+        def replace_match(m):
+            key = f"PROPN{counter[0]}"
+            placeholders[key] = m.group(0)
+            counter[0] += 1
+            return key
+
+        # Слова с заглавной буквы НЕ в начале предложения = имена собственные
+        # Дефис включён для поддержки "Нью-Йорк", "Санкт-Петербург" и т.п.
+        protected = re.sub(
+            r'(?<=[а-яёa-z\s,])\b([А-ЯЁA-Z][а-яёa-z]+(?:[-\s]+[А-ЯЁA-Z][а-яёa-z]+)*)',
+            replace_match, text
+        )
+        # Также защищаем слова в кавычках (названия произведений)
+        def replace_quoted(m):
+            key = f"PROPN{counter[0]}"
+            placeholders[key] = m.group(1)
+            counter[0] += 1
+            return f'"{key}"'
+
+        protected = re.sub(r'«([^»]+)»', replace_quoted, protected)
+        protected = re.sub(r'"([^"]+)"', replace_quoted, protected)
+
+        return protected, placeholders
+
+    @staticmethod
+    def _restore_proper_nouns(text: str, placeholders: dict) -> str:
+        """Восстанавливает имена собственные после перевода."""
+        for key, value in placeholders.items():
+            text = text.replace(key, value)
+        # Очистка артефактов: остаточные PROPN0, corrupted tokens
+        text = re.sub(r'PROPN\d+', '', text)
+        text = re.sub(r'\b\w+\d+(?:í|ó|é)\b', '', text)
+        return text.strip()
+
+    # ----------------------------------------------------------
+    # Пост-обработка NLLB: удаление остаточной кириллицы
+    # ----------------------------------------------------------
+
+    _CYRILLIC_TRANSLIT = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e',
+        'ё': 'yo', 'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k',
+        'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r',
+        'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts',
+        'ч': 'ch', 'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '',
+        'э': 'e', 'ю': 'yu', 'я': 'ya',
+    }
+
+    @staticmethod
+    def _cleanup_residual_cyrillic(text: str) -> str:
+        """Remove any remaining Cyrillic words from NLLB English output.
+
+        1. Check TRANSLATION_OVERRIDES for known terms
+        2. Fall back to simple transliteration
+        """
+        def _replace_cyrillic(m: re.Match) -> str:
+            word = m.group(0)
+            word_lower = word.lower()
+            # Check overrides dict (handles inflected forms)
+            if word_lower in TRANSLATION_OVERRIDES:
+                return TRANSLATION_OVERRIDES[word_lower]
+            # Transliterate as last resort
+            result = []
+            for ch in word_lower:
+                result.append(QueryClassifier._CYRILLIC_TRANSLIT.get(ch, ch))
+            return "".join(result)
+
+        return re.sub(r'[а-яёА-ЯЁ]+', _replace_cyrillic, text)
 
     # ----------------------------------------------------------
     # Инъекция Mistral (вызывается из FactCheckSearcher)
@@ -266,7 +438,13 @@ class QueryClassifier:
 
     def classify(self, claim: str) -> Dict[str, str]:
         """Возвращает {"category": str, "ru_query": str, "en_query": str}."""
-        category = self._classify_topic(claim)
+        # Early scam return — не давать art_culture перебить скам
+        from claim_parser import detect_scam_concepts
+        concept = detect_scam_concepts(claim)
+        if concept.get("n_groups", 0) >= 2:
+            category = "general"  # пусть пройдёт через scam-детектор, а не art_culture
+        else:
+            category = self._classify_topic(claim)
         en_query = self._translate(claim)
         return {
             "category": category,
@@ -315,6 +493,23 @@ class QueryClassifier:
                 r"онколог\w*|фармацевт\w*|лекарств\w*|who|воз)\b",
                 re.IGNORECASE,
             )
+            self._re_art = re.compile(
+                r"\b(живопис\w*|картин\w*|художник\w*|скульптур\w*|музей\w*|"
+                r"сюрреализ\w*|импрессионизм|авангард\w*|биограф\w*|творчеств\w*|"
+                r"выставк\w*|галере\w*|искусств[оа]\w*|литератур\w*|поэт\w*|"
+                r"писател\w*|философ\w*|историч\w*|средневеков\w*|"
+                r"композитор\w*|симфони\w*|опер[аы]\w*|балет\w*|театр\w*|"
+                r"дали|пикассо|моне|рембрандт|"
+                r"renaissan|baroque|surreal|impressi)\b",
+                re.IGNORECASE,
+            )
+            self._re_sports = re.compile(
+                r"\b(футбол\w*|хоккей\w*|теннис\w*|баскетбол\w*|олимпи\w*|"
+                r"чемпионат\w*|лига\w*|матч\w*|турнир\w*|спортсмен\w*|"
+                r"роналдо|месси|нефтехимик\w*|забил\w*|гол\w*|"
+                r"трансфер\w*|тренер\w*|сборн\w*)\b",
+                re.IGNORECASE,
+            )
             self._re_tech = re.compile(
                 r"\b(биткоин|bitcoin|крипт\w*|crypto|ethereum|блокчейн|blockchain|"
                 r"spacex|tesla|apple|google|microsoft|технолог\w*|искусственн\w*|"
@@ -337,6 +532,11 @@ class QueryClassifier:
 
         if self._re_science.search(claim):
             return "science"
+        # art_culture ПЕРЕД technology чтобы "искусство" не попало в tech
+        if self._re_art.search(claim):
+            return "art_culture"
+        if self._re_sports.search(claim):
+            return "sports"
         if self._re_tech.search(claim):
             return "technology"
         if self._re_politics.search(claim):
@@ -344,8 +544,29 @@ class QueryClassifier:
         return "general"
 
     # ----------------------------------------------------------
-    # Перевод через Helsinki-NLP/opus-mt-ru-en (MarianMT, CPU)
+    # Перевод: NLLB-200 (primary) → MarianMT (fallback)
     # ----------------------------------------------------------
+
+    def _load_nllb(self):
+        """Попытка загрузки NLLB-200-distilled-600M. Если не удалось — fallback на Marian."""
+        if self._nllb_ready:
+            return
+        self._nllb_ready = True
+        try:
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+            import torch
+            print(f"  [Translator] Загрузка {self._NLLB_MODEL_NAME} (CPU)...")
+            self._nllb_tok = AutoTokenizer.from_pretrained(self._NLLB_MODEL_NAME)
+            self._nllb_model = AutoModelForSeq2SeqLM.from_pretrained(
+                self._NLLB_MODEL_NAME,
+                torch_dtype=torch.float32,
+            )
+            self._nllb_model.eval()
+            self._use_nllb = True
+            print(f"  [Translator] {self._NLLB_MODEL_NAME} загружен ✓")
+        except Exception as e:
+            print(f"  [Translator] NLLB не удалось загрузить: {e}, fallback на MarianMT")
+            self._load_marian()
 
     def _load_marian(self):
         """Lazy-загрузка MarianMT. Вызывается один раз."""
@@ -403,22 +624,51 @@ class QueryClassifier:
         return result
 
     def _translate(self, text: str) -> str:
-        """Переводит RU→EN. Ограничение входа: 120 символов (поисковый запрос).
+        """Переводит RU→EN. Пробует NLLB-200, затем MarianMT, затем оригинал.
         Раскрывает аббревиатуры перед переводом для лучшего качества.
         При ошибке возвращает оригинальный текст.
         """
-        self._load_marian()
+        # Пробуем NLLB-200 первым
+        self._load_nllb()
 
-        # Раскрываем аббревиатуры даже если MarianMT недоступен
+        # Раскрываем аббревиатуры даже если модель недоступна
         expanded = self._expand_abbreviations(text)
 
+        # NER-защита: имена → placeholder ПЕРЕД overrides и переводом
+        # Так "Сальвадор Дали" → PROPN0 ДО того, как overrides обработают "дали"
+        protected, placeholders = self._protect_proper_nouns(expanded)
+        protected = _apply_translation_overrides(protected)  # Словарь терминов
+
+        # Попытка перевода через NLLB-200
+        if self._use_nllb and self._nllb_model is not None:
+            try:
+                import torch
+                self._nllb_tok.src_lang = "rus_Cyrl"
+                inputs = self._nllb_tok(protected[:200], return_tensors="pt")
+                translated_tokens = self._nllb_model.generate(
+                    **inputs,
+                    forced_bos_token_id=self._nllb_tok.convert_tokens_to_ids("eng_Latn"),
+                    max_length=100,
+                )
+                translated = self._nllb_tok.batch_decode(
+                    translated_tokens, skip_special_tokens=True
+                )[0]
+                translated = self._cleanup_residual_cyrillic(translated)
+                return self._restore_proper_nouns(translated, placeholders)
+            except Exception as e:
+                print(f"  [Translator] NLLB ошибка: {e}, fallback на MarianMT")
+
+        # Fallback на MarianMT
+        if not self._marian_ready:
+            self._load_marian()
+
         if self._marian_model is None:
-            return expanded  # Хотя бы аббревиатуры раскрыты
+            return self._restore_proper_nouns(expanded, placeholders)
 
         try:
             import torch
             inputs = self._marian_tok(
-                [expanded[:120]],
+                [protected[:120]],
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
@@ -426,10 +676,13 @@ class QueryClassifier:
             )
             with torch.no_grad():
                 ids = self._marian_model.generate(**inputs, max_new_tokens=80, num_beams=4)
-            return self._marian_tok.decode(ids[0], skip_special_tokens=True).strip()
+            translated = self._marian_tok.decode(ids[0], skip_special_tokens=True).strip()
+
+            result = self._restore_proper_nouns(translated, placeholders)
+            return result
         except Exception as e:
             print(f"  [Translator] Ошибка перевода: {e}")
-            return expanded
+            return self._restore_proper_nouns(expanded, placeholders)
 
 
 # ============================================================
@@ -1149,6 +1402,17 @@ def validate_context_entities(
         if word[:5] in context_lower  # псевдо-стем 5 символов
     )
 
+    # Критические скам-сущности: если ни одна из них не найдена в source → max penalty
+    scam_keywords = ["выплат", "взнос", "бот", "телеграм", "telegram",
+                     "актив", "наследств", "верификац", "комисси", "страхов",
+                     "безоп", "кошел", "привяз", "облиг", "секрет",
+                     "проверочн", "регистрац", "платформ"]
+    critical_terms = [w for w in fact_words if any(sk in w for sk in scam_keywords)]
+    if critical_terms:
+        critical_covered = sum(1 for w in critical_terms if w[:5] in context_lower)
+        if critical_covered == 0:
+            return 1.0  # ни один критический скам-термин не найден → max penalty
+
     coverage = covered / len(significant)
     return max(0.0, 1.0 - coverage)
 
@@ -1204,6 +1468,39 @@ def cosine_similarity(text_a: str, text_b: str) -> float:
     if na == 0 or nb == 0:
         return 0.0
     return dot / (na * nb)
+
+
+# ============================================================
+# ASYNC DDG SEARCH (для параллельного выполнения запросов)
+# ============================================================
+
+import asyncio
+
+async def _search_ddg_async(query: str, max_results: int = 8) -> list:
+    """Асинхронный DDG-поиск (если AsyncDDGS доступен)."""
+    if _ASYNC_DDGS is None:
+        return []
+    try:
+        async with _ASYNC_DDGS(timeout=_DDG_TIMEOUT) as ddgs:
+            results = await ddgs.atext(query, max_results=max_results)
+            return [
+                {
+                    "title": r.get("title", ""),
+                    "snippet": r.get("body", r.get("snippet", "")),
+                    "source": r.get("source", ""),
+                    "link": r.get("url", r.get("href", "")),
+                    "date": r.get("date", ""),
+                }
+                for r in (results or [])
+            ]
+    except Exception:
+        return []
+
+
+async def search_all_async(queries: List[str], max_results: int = 8) -> List[List[Dict]]:
+    """Запуск всех DDG-запросов параллельно. Ожидаемое ускорение: 3-5x."""
+    tasks = [_search_ddg_async(q, max_results) for q in queries]
+    return await asyncio.gather(*tasks)
 
 
 # ============================================================
@@ -1279,6 +1576,30 @@ class FactCheckSearcher:
                     return []
         return []
 
+    def _search_ddg_parallel(self, queries: List[str], max_results: int = 8) -> List[List[Dict[str, str]]]:
+        """Run multiple DDG queries in parallel using asyncio. B3 optimization.
+
+        Falls back to sequential _search_ddg if async execution fails.
+        """
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Already in async context (e.g., Streamlit) — use thread pool
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(queries)) as executor:
+                    futures = [executor.submit(self._search_ddg, q, max_results) for q in queries]
+                    return [f.result(timeout=30) for f in futures]
+            else:
+                return loop.run_until_complete(search_all_async(queries, max_results))
+        except RuntimeError:
+            # No event loop — create one
+            try:
+                return asyncio.run(search_all_async(queries, max_results))
+            except Exception as e:
+                print(f"  [DDG-parallel] Async failed ({e}), falling back to sequential")
+                return [self._search_ddg(q, max_results) for q in queries]
+
     def _search_serpapi(self, keyword: str, web_mode: bool = False) -> List[Dict[str, str]]:
         """SerpAPI Google поиск (платный, основной при наличии API-ключа)."""
         from serpapi import GoogleSearch
@@ -1352,6 +1673,101 @@ class FactCheckSearcher:
             print(f"  [Wikipedia] Ошибка: {e}")
             return []
 
+    def _search_wikipedia_with_extract(self, keyword: str, lang: str = "ru") -> List[Dict[str, str]]:
+        """Wikipedia + полный вводный раздел (первые 10 предложений)."""
+        hits = self._search_wikipedia(keyword, lang)
+
+        for hit in hits[:2]:  # Топ-2 результата
+            title = hit.get("title", "")
+            try:
+                import requests
+                q = urllib.parse.quote(title)
+                extract_url = (
+                    f"https://{lang}.wikipedia.org/w/api.php"
+                    f"?action=query&titles={q}&prop=extracts"
+                    f"&exintro=1&explaintext=1&format=json&exsentences=10"
+                )
+                resp = requests.get(extract_url, timeout=5,
+                                    headers={"User-Agent": "AntifakeBot/3.0"})
+                data = resp.json()
+                pages = data.get("query", {}).get("pages", {})
+                for page in pages.values():
+                    extract = page.get("extract", "")
+                    if extract and len(extract) > len(hit.get("snippet", "")):
+                        hit["snippet"] = extract[:1500]  # Первые 1500 символов
+            except Exception:
+                pass  # Оставляем оригинальный snippet
+        return hits
+
+    def _search_arxiv(self, query: str, max_results: int = 3) -> List[Dict[str, str]]:
+        """ArXiv API для научных утверждений."""
+        try:
+            q = urllib.parse.quote(query[:100])
+            url = f"http://export.arxiv.org/api/query?search_query=all:{q}&max_results={max_results}"
+            req = urllib.request.Request(url, headers={"User-Agent": "AntifakeBot/3.0"})
+            resp = urllib.request.urlopen(req, timeout=8)
+            data = resp.read().decode("utf-8")
+
+            articles = []
+            # Простой парсинг Atom XML
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(data)
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+            for entry in root.findall("atom:entry", ns)[:max_results]:
+                title = entry.findtext("atom:title", "", ns).strip().replace("\n", " ")
+                summary = entry.findtext("atom:summary", "", ns).strip().replace("\n", " ")[:500]
+                link_el = entry.find("atom:id", ns)
+                link = link_el.text.strip() if link_el is not None else ""
+                articles.append({
+                    "title": title,
+                    "snippet": summary,
+                    "source": "arxiv.org",
+                    "link": link,
+                    "date": "",
+                })
+            return articles
+        except Exception as e:
+            print(f"  [ArXiv] Ошибка: {e}")
+            return []
+
+    def _search_google_news_rss(self, query: str, max_results: int = 3) -> List[Dict[str, str]]:
+        """Google News RSS для свежих новостей."""
+        try:
+            import feedparser
+        except ImportError:
+            return []
+        try:
+            url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query[:100])}&hl=ru&gl=RU"
+            feed = feedparser.parse(url)
+            articles = []
+            for entry in feed.entries[:max_results]:
+                articles.append({
+                    "title": entry.get("title", ""),
+                    "snippet": entry.get("summary", entry.get("description", ""))[:500],
+                    "source": entry.get("source", {}).get("title", "Google News"),
+                    "link": entry.get("link", ""),
+                    "date": entry.get("published", ""),
+                })
+            return articles
+        except Exception as e:
+            print(f"  [GoogleNews] Ошибка: {e}")
+            return []
+
+    def federated_search(self, claim: str, category: str, en_query: str) -> List[Dict[str, str]]:
+        """Федеративный поиск: разные API для разных категорий."""
+        results = []
+
+        # По категории — дополнительные источники
+        if category == "science":
+            results.extend(self._search_arxiv(en_query))
+        elif category in ("politics", "general"):
+            results.extend(self._search_google_news_rss(en_query))
+
+        # Всегда: Wikipedia (расширенный)
+        results.extend(self._search_wikipedia_with_extract(claim[:80]))
+
+        return results
+
     def set_generate_fn(self, generate_fn):
         """Подключает уже загруженный Mistral к маршрутизатору.
 
@@ -1385,23 +1801,54 @@ class FactCheckSearcher:
         )
 
         # Шаг 3: Генерация запросов и их выполнение
+        # B3: Try async parallel execution first, fallback to sequential
         queries = build_search_queries(classified)
         all_raw: List[Dict[str, str]] = []
         seen_urls: set = set()
+
+        # Separate cached vs uncached queries
+        _uncached_queries = []
+        _cached_results = {}
+        for q_info in queries:
+            cache_key = f"routed:{q_info['query']}"
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                _cached_results[q_info['query']] = cached
+            else:
+                _uncached_queries.append(q_info)
+
+        # B3: Async parallel DDG for uncached queries
+        _async_results = {}
+        if _uncached_queries and _ASYNC_DDGS is not None:
+            try:
+                _async_query_strs = [q["query"] for q in _uncached_queries]
+                _loop = asyncio.new_event_loop()
+                _raw_lists = _loop.run_until_complete(
+                    search_all_async(_async_query_strs, max_results=self.config.num_results)
+                )
+                _loop.close()
+                for q_info, raw in zip(_uncached_queries, _raw_lists):
+                    _async_results[q_info['query']] = raw
+                    self._cache.set(f"routed:{q_info['query']}", raw)
+                print(f"  [B3:Async] {len(_uncached_queries)} queries in parallel")
+            except Exception as _ae:
+                print(f"  [B3:Async] Failed ({_ae}), falling back to sequential")
+                _async_results = {}
 
         for q_info in queries:
             label = q_info["label"]
             query = q_info["query"]
             print(f"  [DDG:{label}] {query[:90]}...")
 
-            cache_key = f"routed:{query}"
-            cached = self._cache.get(cache_key)
-            if cached is not None:
-                raw = cached
+            if query in _cached_results:
+                raw = _cached_results[query]
+            elif query in _async_results:
+                raw = _async_results[query]
             else:
+                # Sequential fallback
                 self._rate_limiter.wait()
                 raw = self._search_ddg(query, max_results=self.config.num_results)
-                self._cache.set(cache_key, raw)
+                self._cache.set(f"routed:{query}", raw)
 
             print(f"  [DDG:{label}] Сырых результатов: {len(raw)}")
 
@@ -1498,21 +1945,29 @@ class FactCheckSearcher:
         if claim.strip():
             _add(clean_results(self.search_keyword(claim.strip()[:120], web_mode=True)))
 
-        # 2.5. Myth-buster запросы: ищем разоблачения и мифы
+        # 2.5. A6: Counter-search — negation queries for debunking + myth-buster
+        #       B3: Batch DDG queries in parallel instead of sequential loop
         if claim.strip():
             short_claim = claim.strip()[:80]
-            mythbuster_suffixes = [
+            counter_suffixes = [
+                "миф OR фейк OR разоблачение OR опровержение",
+                "fact check OR debunked OR false OR myth OR fake",
                 "миф OR разоблачение OR заблуждение",
-                "fact check OR debunk OR фейк",
             ]
+            mb_queries = [f"{short_claim} {suffix}" for suffix in counter_suffixes]
             mb_total_before = len(all_results)
-            for suffix in mythbuster_suffixes:
-                mb_query = f"{short_claim} {suffix}"
-                mb_cleaned = clean_results(self._search_ddg(mb_query, max_results=5))
+
+            # B3: parallel DDG search for all counter-suffix queries
+            mb_batch_results = self._search_ddg_parallel(mb_queries, max_results=5)
+
+            for mb_raw in mb_batch_results:
+                mb_cleaned = clean_results(mb_raw)
+
+                # A6: Mark counter-search results for downstream NLI
+                for r in mb_cleaned:
+                    r["is_counter_evidence"] = True
 
                 # Direction 3: резервируем минимум 2–3 слота для фактчекеров.
-                # Новостные сайты не должны вытеснять специализированные разоблачения
-                # на этапе первичного сбора ссылок — до CrossEncoder.
                 fc_hits = [
                     r for r in mb_cleaned
                     if _domain_in_factcheckers(_extract_base_domain(r.get("link", "")))
@@ -1522,7 +1977,7 @@ class FactCheckSearcher:
                 _add(fc_hits[:3] + non_fc)
 
             mb_added = len(all_results) - mb_total_before
-            print(f"  [Myth-buster] +{mb_added} результатов после myth-buster запросов")
+            print(f"  [Counter-search] +{mb_added} результатов после counter/myth-buster запросов")
 
         # 3. Контрастивный поиск: «X — Y» → ищем «X», находим реальный Y
         if claim.strip():
@@ -1564,6 +2019,301 @@ class FactCheckSearcher:
                 if kw.strip():
                     _add(clean_results(self.search_keyword(kw)))
 
+        # 5. Counter-search: ищем разоблачения / опровержения утверждения
+        #    B3: Batch RU + EN counter-queries in parallel
+        if claim.strip():
+            short_claim = claim.strip()[:80]
+            counter_before = len(all_results)
+
+            # Build list of counter-queries (RU always, EN if translation available)
+            counter_queries: List[str] = [
+                f'"{short_claim}" миф OR фейк OR разоблачение OR опровержение'
+            ]
+            try:
+                claim_en = self._classifier._translate(short_claim)
+                if claim_en and claim_en != short_claim:
+                    counter_queries.append(
+                        f'"{claim_en}" debunked OR false OR myth OR fake'
+                    )
+            except Exception as e:
+                print(f"  [Counter-search] EN перевод не удался: {e}")
+
+            # B3: parallel DDG search for RU (+EN) counter-queries
+            counter_batch = self._search_ddg_parallel(counter_queries, max_results=3)
+
+            for batch_raw in counter_batch:
+                batch_cleaned = clean_results(batch_raw)
+                for art in batch_cleaned:
+                    art["is_counter_evidence"] = True
+                _add(batch_cleaned)
+
+            counter_added = len(all_results) - counter_before
+            print(
+                f"  [Counter-search] +{counter_added} результатов "
+                f"контр-доказательств (разоблачения/опровержения)"
+            )
+
+        return all_results
+
+    # ----------------------------------------------------------
+    # V5: Wikipedia direct entity lookup (Task 2)
+    # ----------------------------------------------------------
+
+    def wiki_entity_lookup(self, entities: List[str], lang: str = "ru") -> List[Dict[str, str]]:
+        """Прямой поиск в Wikipedia по каждой сущности отдельно.
+
+        В отличие от _search_wikipedia (поиск по claim-тексту),
+        этот метод ищет КОНКРЕТНЫЕ страницы для каждой сущности:
+        - "Луна" → статья "Луна" с определением "естественный спутник Земли"
+        - "Microsoft" → статья "Microsoft" с именами основателей
+        - "Титаник" → статья "Титаник" с местом крушения
+
+        Возвращает результаты с полными intro-секциями (до 2000 символов).
+        """
+        results: List[Dict[str, str]] = []
+        seen_titles: set = set()
+
+        for entity in entities[:5]:  # Макс 5 сущностей
+            entity = entity.strip()
+            if not entity or len(entity) < 2:
+                continue
+            try:
+                # Шаг 1: Поиск страницы по точному названию
+                q = urllib.parse.quote(entity)
+                search_url = (
+                    f"https://{lang}.wikipedia.org/w/api.php"
+                    f"?action=query&list=search&srsearch={q}&format=json"
+                    f"&srlimit=2&srprop=snippet"
+                )
+                headers = {"User-Agent": "AntifakeBot/4.0 (fact-checking)"}
+                req = urllib.request.Request(search_url, headers=headers)
+                resp = urllib.request.urlopen(req, timeout=8)
+                data = json.loads(resp.read())
+                hits = data.get("query", {}).get("search", [])
+
+                if not hits:
+                    continue
+
+                # Шаг 2: Получаем полный intro для топ-1 результата
+                title = hits[0].get("title", "")
+                if title.lower() in seen_titles:
+                    continue
+                seen_titles.add(title.lower())
+
+                qt = urllib.parse.quote(title)
+                extract_url = (
+                    f"https://{lang}.wikipedia.org/w/api.php"
+                    f"?action=query&titles={qt}&prop=extracts"
+                    f"&exintro=1&explaintext=1&format=json&exsentences=20"
+                )
+                req2 = urllib.request.Request(extract_url, headers=headers)
+                resp2 = urllib.request.urlopen(req2, timeout=8)
+                data2 = json.loads(resp2.read())
+                pages = data2.get("query", {}).get("pages", {})
+
+                for page in pages.values():
+                    extract = page.get("extract", "")
+                    if extract and len(extract) > 50:
+                        link = (
+                            f"https://{lang}.wikipedia.org/wiki/"
+                            + urllib.parse.quote(title.replace(" ", "_"))
+                        )
+                        results.append({
+                            "title": f"{title} — Википедия",
+                            "snippet": extract[:2000],
+                            "source": f"{lang}.wikipedia.org",
+                            "link": link,
+                            "date": "",
+                            "source_credibility": 0.90,
+                        })
+                        break
+
+            except Exception as e:
+                print(f"  [WikiEntity] Ошибка для '{entity}': {e}")
+                continue
+
+        if results:
+            print(f"  [WikiEntity] Найдено {len(results)} статей для сущностей")
+        return results
+
+    # ----------------------------------------------------------
+    # V5: Verification query generation (Task 4)
+    # ----------------------------------------------------------
+
+    def generate_verification_queries(self, claim: str, entities: List[str],
+                                       generate_fn=None) -> List[str]:
+        """Генерация целевых верификационных запросов.
+
+        Вместо поиска по ключевым словам из claim, генерирует конкретные
+        вопросы для проверки каждого аспекта утверждения:
+        - "Microsoft основана Стивом Джобсом" → "кто основал Microsoft"
+        - "Титаник затонул в Тихом океане" → "где затонул Титаник"
+        """
+        queries = []
+
+        # Правило 1: Для каждой именованной сущности — прямой запрос "кто/что такое X"
+        for entity in entities[:3]:
+            if len(entity) > 3:
+                queries.append(entity)
+
+        # Правило 2: Паттерны для типичных проверяемых утверждений
+        claim_lower = claim.lower()
+
+        # Основатель / создатель
+        founder_patterns = [
+            (r'([\w\s]+?)\s+(?:основан[аоы]?|создан[аоы]?|учреждён[аоы]?)\s+(.+?)(?:\s+в\s+\d|$)',
+             lambda m: [f"кто основал {m.group(1).strip()}", f"{m.group(2).strip()} основатель"]),
+            (r'(.+?)\s+(?:основал[аи]?|создал[аи]?)\s+([\w\s]+)',
+             lambda m: [f"кто основал {m.group(2).strip()}", f"{m.group(1).strip()} что основал"]),
+        ]
+        for pattern, gen_fn in founder_patterns:
+            m = re.search(pattern, claim, re.IGNORECASE)
+            if m:
+                queries.extend(gen_fn(m))
+                break
+
+        # Место события
+        location_patterns = [
+            (r'(.+?)\s+(?:в|на)\s+([А-ЯЁ][\w]+(?:\s+[А-ЯЁ][\w]+)?)\s*(?:океан|мор|озер|город)',
+             lambda m: [f"где {m.group(1).strip()}"]),
+            (r'(?:затонул|произошл|случил|находит)\w*\s+.*?(?:в|на)\s+(\w+\s+\w+)',
+             lambda m: [f"где затонул {entities[0]}" if entities else ""]),
+        ]
+        for pattern, gen_fn in location_patterns:
+            m = re.search(pattern, claim, re.IGNORECASE)
+            if m:
+                qs = gen_fn(m)
+                queries.extend([q for q in qs if q])
+                break
+
+        # Спутники / свойства планет
+        if any(w in claim_lower for w in ['спутник', 'планета', 'орбит']):
+            for ent in entities[:2]:
+                queries.append(f"{ent} характеристики спутники")
+
+        # Числовые факты (скорость, температура, население)
+        if re.search(r'\d+\s*(?:м/с|км/ч|°[CС]|градус|метр|км|тыс|млн|млрд)', claim):
+            for ent in entities[:2]:
+                queries.append(f"{ent} точные данные характеристики")
+
+        # Правило 3: LLM-генерация (если доступна) для сложных случаев
+        if generate_fn and len(queries) < 3:
+            try:
+                prompt = (
+                    f"[INST]Сгенерируй 2 конкретных поисковых запроса для проверки утверждения. "
+                    f"Запросы должны искать ФАКТЫ, а не само утверждение. Только запросы через запятую.\n\n"
+                    f"Утверждение: \"{claim}\"\n"
+                    f"Запросы:[/INST]"
+                )
+                raw = generate_fn(prompt)
+                for q in raw.split(","):
+                    q = q.strip().strip('"').strip("'")
+                    if q and len(q) > 5 and q not in queries:
+                        queries.append(q)
+            except Exception:
+                pass
+
+        # Дедупликация
+        seen = set()
+        unique = []
+        for q in queries:
+            ql = q.lower().strip()
+            if ql and ql not in seen:
+                seen.add(ql)
+                unique.append(q)
+
+        return unique[:6]
+
+    def search_verification_queries(self, queries: List[str]) -> List[Dict[str, str]]:
+        """Выполняет поиск по верификационным запросам.
+
+        Возвращает отфильтрованные результаты из DDG + Wikipedia.
+        """
+        all_results: List[Dict[str, str]] = []
+        seen_urls: set = set()
+
+        # B3: Parallel DDG search
+        ddg_results = self._search_ddg_parallel(queries, max_results=5)
+
+        for batch in ddg_results:
+            cleaned = clean_results(batch)
+            for art in cleaned:
+                url = art.get("link", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    art["_verification_query"] = True
+                    all_results.append(art)
+
+        # Wikipedia по каждому запросу
+        for q in queries[:3]:
+            wiki = self._search_wikipedia_with_extract(q[:80])
+            for art in wiki:
+                url = art.get("link", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    art["_verification_query"] = True
+                    all_results.append(art)
+
+        if all_results:
+            print(f"  [VerifQuery] +{len(all_results)} результатов по верификационным запросам")
+        return all_results
+
+    # ----------------------------------------------------------
+    # V5: Multi-hop entity counter-search (Task 5)
+    # ----------------------------------------------------------
+
+    def search_counter_entities(self, claim: str, entities: List[str]) -> List[Dict[str, str]]:
+        """Multi-hop поиск: проверяет каждую сущность отдельно.
+
+        Для "Microsoft основана Стивом Джобсом":
+        - Ищет "Microsoft основатель" → находит Билла Гейтса
+        - Ищет "Стив Джобс основатель" → находит Apple
+        - Сравнение → противоречие
+
+        Для "Титаник затонул в Тихом океане":
+        - Ищет "Титаник место крушения" → находит Атлантический океан
+        """
+        all_results: List[Dict[str, str]] = []
+        seen_urls: set = set()
+
+        # Паттерны для генерации counter-запросов
+        claim_lower = claim.lower()
+
+        counter_queries = []
+        for entity in entities[:3]:
+            ent = entity.strip()
+            if len(ent) < 3:
+                continue
+
+            # Для каждой сущности — поиск её реальных свойств
+            if any(w in claim_lower for w in ['основан', 'создан', 'учрежд', 'основал', 'создал']):
+                counter_queries.append(f"{ent} основатель создатель кто")
+            if any(w in claim_lower for w in ['затону', 'крушен', 'авари', 'катастроф']):
+                counter_queries.append(f"{ent} место где произошло")
+            if any(w in claim_lower for w in ['спутник', 'планет']):
+                counter_queries.append(f"{ent} спутники список")
+            if any(w in claim_lower for w in ['протекает', 'впадает', 'река']):
+                counter_queries.append(f"{ent} где протекает материк")
+            if any(w in claim_lower for w in ['столиц', 'город']):
+                counter_queries.append(f"{ent} столица какой страны")
+
+        if not counter_queries:
+            return []
+
+        # B3: Parallel DDG search
+        ddg_batches = self._search_ddg_parallel(counter_queries[:4], max_results=3)
+
+        for batch in ddg_batches:
+            cleaned = clean_results(batch)
+            for art in cleaned:
+                url = art.get("link", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    art["_counter_entity"] = True
+                    all_results.append(art)
+
+        if all_results:
+            print(f"  [CounterEntity] +{len(all_results)} результатов multi-hop поиска")
         return all_results
 
     def rank_by_relevance(
@@ -1625,6 +2375,11 @@ class FactCheckSearcher:
                 parts.append(f"   Дата: {art['date']}")
             if art.get("snippet"):
                 parts.append(f"   {art['snippet'][:500]}")
+            if art.get("is_counter_evidence"):
+                parts.append(
+                    "   [КОНТР-ДОКАЗАТЕЛЬСТВО] — результат поиска разоблачений. "
+                    "Может указывать на то, что утверждение является фейком или мифом."
+                )
             if art.get("_unverified"):
                 parts.append(
                     "   ПРЕДУПРЕЖДЕНИЕ: [НЕПРОВЕРЕННЫЙ ИСТОЧНИК] — "

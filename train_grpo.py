@@ -393,7 +393,145 @@ def numerical_accuracy_reward(completions: list, **kwargs) -> list:
                 score += 0.2
 
         scores.append(max(-1.0, min(1.0, score)))
+
     return scores
+
+
+def scam_detection_reward(completions: list, **kwargs) -> list:
+    """Награда за правильное определение мошеннических схем.
+    
+    Если в промпте присутствуют скам-паттерны:
+    - Модель поставила ЛОЖЬ → +1.0 (правильно)
+    - Модель поставила НЕ ПОДТВЕРЖДЕНО → -0.5 (недостаточно решительно)
+    - Модель поставила ПРАВДА → -2.0 (опасная ошибка — приняла скам как факт)
+    """
+    scam_patterns = [
+        'безопасный счёт', 'безопасного счёта',
+        'перевести деньги', 'перевод денег',
+        'служба безопасности банка', 'банк звонит',
+        'ваша карта заблокирована', 'код из смс',
+        'назовите код', 'пин-код',
+        'следователь звонит', 'фсб звонит',
+        'гарантированная доходность', '100% доходность',
+        'финансовая пирамида',
+    ]
+    
+    contents = _extract_contents(completions)
+    prompts = kwargs.get("prompt", kwargs.get("prompts", []))
+    
+    if len(prompts) > 0 and len(contents) > len(prompts):
+        num_gen = len(contents) // len(prompts)
+        prompts = [p for p in prompts for _ in range(num_gen)]
+    
+    scores = []
+    for text, prompt in zip(contents, prompts if prompts else [''] * len(contents)):
+        prompt_text = " ".join(
+            msg.get("content", "") for msg in prompt if isinstance(msg, dict)
+        ) if isinstance(prompt, list) else str(prompt)
+        
+        prompt_lower = prompt_text.lower()
+        has_scam = any(p in prompt_lower for p in scam_patterns)
+        
+        if not has_scam:
+            scores.append(0.0)
+            continue
+        
+        # Есть скам-паттерн — проверяем вердикт
+        answer_match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+        if not answer_match:
+            scores.append(-0.5)
+            continue
+        
+        verdict_match = re.search(r"ВЕРДИКТ:\s*(.+?)(?:\n|$)", answer_match.group(1))
+        if not verdict_match:
+            scores.append(-0.5)
+            continue
+        
+        predicted = verdict_match.group(1).upper().strip()
+        if predicted == "ЛОЖЬ":
+            scores.append(1.0)   # Правильно! Скам = ЛОЖЬ
+        elif "НЕ ПОДТВЕРЖДЕНО" in predicted:
+            scores.append(-0.5)  # Слишком осторожно
+        else:
+            scores.append(-2.0)  # Опасная ошибка
+    
+    return scores
+
+
+def location_date_accuracy_reward(completions: list, **kwargs) -> list:
+    """Награда за точную проверку дат и локаций.
+    
+    Если в reasoning есть явное сравнение год/место утверждения с источниками → reward.
+    Если вердикт ЛОЖЬ когда источники говорят другую локацию/год → reward.
+    """
+    contents = _extract_contents(completions)
+    
+    location_comparison_patterns = [
+        r"в токио.*?в париж|в париж.*?в токио",
+        r"в катар.*?в япони|в япони.*?в катар",
+        r"в \d{4}.*?а не в \d{4}|не в \d{4}.*?в \d{4}",
+        r"город.*?другой|другой.*?город",
+        r"прошл.*?в другом|другой стран",
+        r"не \d{4} год|\d{4}.*?неверн|неверн.*?год",
+        r"принимал.*?\d{4}|\d{4}.*?принимал",
+        r"вышла.*?\d{4}|\d{4}.*?вышла",
+        r"запущена в \d{4}|\d{4}.*?запущена",
+    ]
+    
+    scores = []
+    for text in contents:
+        reasoning_match = re.search(r"<reasoning>(.*?)</reasoning>", text, re.DOTALL)
+        if not reasoning_match:
+            scores.append(0.0)
+            continue
+        
+        reasoning = reasoning_match.group(1).lower()
+        score = 0.0
+        
+        # Проверяем наличие явного сравнения дат/мест
+        comparison_count = sum(
+            1 for pat in location_comparison_patterns
+            if re.search(pat, reasoning)
+        )
+        score += min(comparison_count * 0.3, 0.9)
+        
+        # Бонус если reasoning содержит конкретные годы и сравнение
+        years = re.findall(r'\b(19|20)\d{2}\b', reasoning)
+        if len(years) >= 2:
+            score += 0.3  # Упомянуто несколько лет — сравнение идёт
+        
+        # Проверяем что вердикт ЛОЖЬ при явном противоречии дат/мест
+        answer_match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+        if answer_match and comparison_count > 0:
+            verdict_match = re.search(r"ВЕРДИКТ:\s*(.+?)(?:\n|$)", answer_match.group(1))
+            if verdict_match and verdict_match.group(1).upper().strip() == "ЛОЖЬ":
+                score += 0.5  # Правильный вердикт при найденном противоречии
+        
+        scores.append(max(-1.0, min(1.0, score)))
+    
+    return scores
+
+
+def audit_reward(completions: list, **kwargs) -> list:
+    """Reward за правильный СТАТУС каждого ПУНКТА в audit протоколе."""
+    contents = _extract_contents(completions)
+    rewards = []
+    for text in contents:
+        reward = 0.0
+        # Парсим СТАТУС: из каждого ПУНКТА
+        statuses = re.findall(r"СТАТУС:\s*(ПРАВДА|ЛОЖЬ|НЕТ ДАННЫХ)", text, re.IGNORECASE)
+        ground_truth = kwargs.get("ground_truth", {}).get("sub_verdicts", [])
+
+        for i, status in enumerate(statuses):
+            if i < len(ground_truth):
+                expected = ground_truth[i].get("status", "")
+                status_upper = status.strip().upper()
+                if expected and status_upper == expected.upper():
+                    reward += 0.25  # Правильный статус
+                elif status_upper != "НЕТ ДАННЫХ" and expected.upper() == "НЕТ ДАННЫХ":
+                    reward -= 0.1  # Галлюцинация хуже незнания
+        rewards.append(reward)
+    return rewards
 
 
 # ===== ПОДГОТОВКА ДАННЫХ =====
@@ -630,14 +768,16 @@ def train_grpo(
         model=model,
         processing_class=tokenizer,
         reward_funcs=[
-            format_reward,               # weight 0.1
-            reasoning_quality_reward,     # weight 0.1
-            verdict_consistency_reward,   # weight 0.1
-            correctness_reward,           # weight 3.0 — dominates
-            devils_advocate_reward,       # weight 0.0 — disabled (reward hacking)
-            numerical_accuracy_reward,    # weight 0.2
+            format_reward,                 # weight 0.1 — структура ответа
+            reasoning_quality_reward,      # weight 0.1 — качество reasoning
+            verdict_consistency_reward,    # weight 0.1 — консистентность score/вердикт
+            correctness_reward,            # weight 3.0 — доминирует (правильность)
+            devils_advocate_reward,        # weight 0.0 — disabled (reward hacking)
+            numerical_accuracy_reward,     # weight 0.2 — точность чисел
+            scam_detection_reward,         # weight 0.5 — детекция скама
+            location_date_accuracy_reward, # weight 0.3 — дата/место проверка
         ],
-        reward_weights=[0.1, 0.1, 0.1, 3.0, 0.0, 0.2],
+        reward_weights=[0.1, 0.1, 0.1, 3.0, 0.0, 0.2, 0.5, 0.3],
         args=training_args,
         train_dataset=dataset,
         callbacks=[time_limit_cb],
