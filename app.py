@@ -58,6 +58,46 @@ st.markdown("""
     }
     .source-link { color: #4caf50; text-decoration: none; }
     .tech-params { color: #888; font-size: 13px; line-height: 1.8; }
+
+    /* Карточки фактов */
+    .fact-card {
+        border-radius: 8px; padding: 14px 16px; margin: 10px 0;
+        border-left: 5px solid; background: #1e1e2e;
+    }
+    .fact-card-true  { border-left-color: #28a745; background: #0d2617; }
+    .fact-card-false { border-left-color: #dc3545; background: #2a0d0d; }
+    .fact-card-unknown { border-left-color: #ffc107; background: #2a2100; }
+    .fact-card-header {
+        display: flex; justify-content: space-between;
+        align-items: flex-start; gap: 12px;
+    }
+    .fact-claim-text { font-size: 15px; line-height: 1.5; flex: 1; }
+    .fact-status-badge {
+        padding: 4px 12px; border-radius: 4px; font-size: 12px;
+        font-weight: bold; white-space: nowrap;
+    }
+    .fact-citation {
+        color: #bbb; font-size: 13px; margin-top: 10px;
+        border-top: 1px solid #333; padding-top: 8px; font-style: italic;
+    }
+    .fact-source { color: #777; font-size: 12px; margin-top: 3px; }
+
+    /* Чипы источников */
+    .sources-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+    .source-chip {
+        display: inline-flex; align-items: center; gap: 5px;
+        background: #1e2a1e; border: 1px solid #2d5a2d;
+        border-radius: 20px; padding: 6px 14px;
+        font-size: 13px; color: #4caf50; text-decoration: none;
+        transition: background 0.15s;
+    }
+    .source-chip:hover { background: #263d26; color: #6fcf70; }
+    .source-chip-plain {
+        display: inline-flex; align-items: center; gap: 5px;
+        background: #222; border: 1px solid #444;
+        border-radius: 20px; padding: 6px 14px;
+        font-size: 13px; color: #888;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -136,12 +176,18 @@ def main():
         latency = result["total_time"]
 
         # Определение цвета и статуса
-        if verdict.upper() in ("ЛОЖЬ", "FALSE"):
+        v_upper = verdict.upper().strip()
+        if v_upper in ("ЛОЖЬ", "FALSE", "ФЕЙК"):
             score_color = "#dc3545"
             delta_prefix = "↓"
             verdict_class = "verdict-false"
-            verdict_label = "ЛОЖЬ / FALSE"
-        elif verdict.upper() in ("ПРАВДА", "TRUE"):
+            verdict_label = "ЛОЖЬ / ФЕЙК"
+        elif "МАНИПУЛЯЦИЯ" in v_upper or "ПОЛУПРАВДА" in v_upper:
+            score_color = "#fd7e14"
+            delta_prefix = "⚠"
+            verdict_class = "verdict-partial"
+            verdict_label = "МАНИПУЛЯЦИЯ / ПОЛУПРАВДА"
+        elif v_upper in ("ПРАВДА", "TRUE"):
             score_color = "#28a745"
             delta_prefix = "↑"
             verdict_class = "verdict-true"
@@ -177,13 +223,60 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
-        # Экспертное обоснование
-        st.markdown(f"""
-        <div class="reasoning-box">
-            <div class="reasoning-title">Экспертное обоснование:</div>
-            <div>{result['reasoning']}</div>
-        </div>
-        """, unsafe_allow_html=True)
+        # Карточки фактов (аудиторский шаблон — составные утверждения)
+        sub_verdicts = result.get("sub_verdicts", [])
+        if sub_verdicts:
+            st.markdown("#### Анализ по пунктам:")
+            for sv in sub_verdicts:
+                status = sv.get("status", "НЕТ ДАННЫХ").upper()
+                if status == "ПРАВДА":
+                    card_class = "fact-card-true"
+                    badge_bg = "#28a745"
+                    badge_color = "#fff"
+                    icon = "✅"
+                elif status == "ЛОЖЬ":
+                    card_class = "fact-card-false"
+                    badge_bg = "#dc3545"
+                    badge_color = "#fff"
+                    icon = "❌"
+                else:
+                    card_class = "fact-card-unknown"
+                    badge_bg = "#ffc107"
+                    badge_color = "#333"
+                    icon = "⚠️"
+
+                citation_html = ""
+                if sv.get("citation"):
+                    citation_html = (
+                        f'<div class="fact-citation">«{sv["citation"]}»</div>'
+                    )
+                    if sv.get("source"):
+                        citation_html += (
+                            f'<div class="fact-source">— {sv["source"]}</div>'
+                        )
+
+                st.markdown(f"""
+                <div class="fact-card {card_class}">
+                    <div class="fact-card-header">
+                        <div class="fact-claim-text">{sv['claim']}</div>
+                        <span class="fact-status-badge"
+                              style="background:{badge_bg};color:{badge_color};">
+                            {icon} {status}
+                        </span>
+                    </div>
+                    {citation_html}
+                </div>
+                """, unsafe_allow_html=True)
+
+        # Экспертное обоснование — только если не пустое
+        reasoning = result.get("reasoning", "").strip()
+        if reasoning:
+            st.markdown(f"""
+            <div class="reasoning-box">
+                <div class="reasoning-title">Экспертное обоснование:</div>
+                <div>{reasoning}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
         # Chain-of-Thought (если GRPO модель)
         cot = result.get("chain_of_thought", "")
@@ -208,17 +301,26 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
-        # Первоисточники для проверки
-        st.markdown("#### Первоисточники для проверки:")
+        # Первоисточники — чипы
+        st.markdown("#### Первоисточники:")
         if result["sources"]:
+            chips_html = '<div class="sources-chips">'
             for src in result["sources"]:
                 link = src.get("link", "")
-                source_name = src.get("source", "Источник")
-                title = src.get("title", "")
+                source_name = src.get("source", "") or src.get("title", "Источник")
+                # Обрезаем слишком длинные названия
+                display_name = source_name[:40] + "…" if len(source_name) > 40 else source_name
                 if link:
-                    st.markdown(f"🔗 [{source_name} — {title}]({link})")
+                    chips_html += (
+                        f'<a href="{link}" target="_blank" class="source-chip">'
+                        f'🌐 {display_name}</a>'
+                    )
                 else:
-                    st.markdown(f"📄 {source_name} — {title}")
+                    chips_html += (
+                        f'<span class="source-chip-plain">📄 {display_name}</span>'
+                    )
+            chips_html += '</div>'
+            st.markdown(chips_html, unsafe_allow_html=True)
         else:
             st.info("Подтверждающие источники не найдены.")
 

@@ -16,4 +16,5 @@ sentencepiece>=0.1.99
 protobuf>=4.25.0
 streamlit>=1.30.0
 sentence-transformers>=2.3.0
-duckduckgo-search>=4.0
+ddgs>=9.0
+sacremoses>=0.0.53

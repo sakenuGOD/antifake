@@ -1,0 +1,54 @@
+{
+  "accuracy": 0.816,
+  "precision_fake": 0.8,
+  "recall_fake": 0.833,
+  "f1_fake": 0.816,
+  "precision_real": 0.833,
+  "recall_real": 0.8,
+  "f1_real": 0.816,
+  "f1_macro": 0.816,
+  "tp": 20,
+  "fp": 5,
+  "fn": 4,
+  "tn": 20,
+  "avg_latency": 79.12,
+  "unverified_count": 1,
+  "unverified_rate": 0.02,
+  "verdict_distribution": {
+    "ПРАВДА": 24,
+    "ЛОЖЬ": 24,
+    "НЕ ПОДТВЕРЖДЕНО": 1
+  },
+  "per_type": {
+    "numerical": {
+      "accuracy": 1.0,
+      "f1_macro": 1.0,
+      "count": 10
+    },
+    "date": {
+      "accuracy": 0.8,
+      "f1_macro": 0.8,
+      "count": 10
+    },
+    "person": {
+      "accuracy": 0.667,
+      "f1_macro": 0.625,
+      "count": 6
+    },
+    "institutional": {
+      "accuracy": 0.778,
+      "f1_macro": 0.775,
+      "count": 9
+    },
+    "event": {
+      "accuracy": 0.75,
+      "f1_macro": 0.667,
+      "count": 8
+    },
+    "general": {
+      "accuracy": 0.833,
+      "f1_macro": 0.455,
+      "count": 6
+    }
+  }
+}

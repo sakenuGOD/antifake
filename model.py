@@ -67,10 +67,6 @@ def load_base_model(config: ModelConfig = None):
     return model, tokenizer
 
 
-# Обратная совместимость — pipeline.py импортирует load_unsloth_model
-load_unsloth_model = load_base_model
-
-
 def load_finetuned_model(adapter_path: str, config: ModelConfig = None):
     """Загрузка fine-tuned модели (base + LoRA адаптеры) для inference.
 
@@ -128,11 +124,17 @@ def build_langchain_llm(
     if pipeline_config is None:
         pipeline_config = PipelineConfig()
 
+    # Patch model's generation_config to remove conflicting defaults
+    if hasattr(model, "generation_config"):
+        model.generation_config.max_length = None
+        model.generation_config.max_new_tokens = None
+        model.generation_config.temperature = None
     pipe = hf_pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
         max_new_tokens=max_new_tokens,
+        max_length=None,
         repetition_penalty=pipeline_config.repetition_penalty,
         do_sample=False,
         return_full_text=False,
