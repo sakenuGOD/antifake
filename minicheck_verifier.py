@@ -176,9 +176,16 @@ class MiniCheckVerifier:
         # Decision: supported if max > 0.5
         supported = max_support > 0.5
 
-        # Ensemble signal: strong support → +2, strong contradiction → -2
-        if max_support >= 0.7:
+        # V11: Spread guard — distinguish topic-match from fact-match
+        spread = max_support - mean_support
+        is_narrow = spread <= 0.25  # All sources agree → real support
+
+        if max_support >= 0.80 and is_narrow:
             signal = 2
+        elif max_support >= 0.70 and is_narrow:
+            signal = 1  # Lower confidence
+        elif max_support >= 0.70 and not is_narrow:
+            signal = 0  # Topic-match, not fact-match
         elif max_support <= 0.2 and mean_support <= 0.3:
             signal = -2
         elif max_support <= 0.35:
@@ -193,3 +200,33 @@ class MiniCheckVerifier:
             "per_source": per_source,
             "signal": signal,
         }
+
+    def verify_with_negation(
+        self,
+        claim: str,
+        sources: List[Dict[str, str]],
+        snippet_key: str = "snippet",
+    ) -> int:
+        """V11: Run MiniCheck on claim AND its negation to detect topic-match.
+
+        If both positive and negated claim get high support → topic-match, signal=0.
+        Only called conditionally (when positive signal > 0 and Wikidata contradicts).
+        """
+        pos_result = self.verify_claim(claim, sources, snippet_key)
+        pos_max = pos_result["max_support"]
+
+        if pos_max <= 0.5:
+            return pos_result["signal"]  # Not supported, no need for negation check
+
+        neg_claim = f"Неверно, что {claim[0].lower()}{claim[1:]}"
+        neg_result = self.verify_claim(neg_claim, sources, snippet_key)
+        neg_max = neg_result["max_support"]
+
+        if pos_max > 0.5 and neg_max > 0.5:
+            return 0  # Both supported → topic-match
+        elif pos_max > 0.5 and neg_max < 0.3:
+            return pos_result["signal"]  # Genuine support
+        elif neg_max > 0.5 and pos_max < 0.3:
+            return -abs(pos_result["signal"])  # Genuine contradiction
+        else:
+            return pos_result["signal"]

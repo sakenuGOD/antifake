@@ -20,3 +20,4 @@ ddgs>=9.0
 sacremoses>=0.0.53
 natasha>=1.4.0
 pymorphy2>=0.9.1
+tenacity>=8.2.0

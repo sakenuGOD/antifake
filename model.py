@@ -13,10 +13,24 @@ import os
 os.environ["XFORMERS_DISABLED"] = "1"
 
 import torch
-from transformers import pipeline as hf_pipeline
+from transformers import pipeline as hf_pipeline, StoppingCriteria, StoppingCriteriaList
 from langchain_huggingface import HuggingFacePipeline
 
 from config import ModelConfig, PipelineConfig, PROJECT_ROOT
+
+
+class StopOnString(StoppingCriteria):
+    """V11: Stop generation when a stop string is encountered in recent tokens."""
+    def __init__(self, tokenizer, stop_strings: list):
+        self.tokenizer = tokenizer
+        self.stop_strings = stop_strings
+
+    def __call__(self, input_ids, scores, **kwargs):
+        # Check last 20 tokens for stop strings (efficient)
+        recent = self.tokenizer.decode(
+            input_ids[0, -20:], skip_special_tokens=True
+        )
+        return any(s in recent for s in self.stop_strings)
 
 
 def find_best_adapter() -> str | None:
@@ -124,19 +138,24 @@ def build_langchain_llm(
     if pipeline_config is None:
         pipeline_config = PipelineConfig()
 
-    # Patch model's generation_config to remove conflicting defaults
+    # V13: Set generation params directly on model's generation_config
+    # to avoid "multiple values for keyword argument" error with newer transformers
     if hasattr(model, "generation_config"):
         model.generation_config.max_length = None
-        model.generation_config.max_new_tokens = None
+        model.generation_config.max_new_tokens = max_new_tokens
         model.generation_config.temperature = None
+        model.generation_config.repetition_penalty = pipeline_config.repetition_penalty
+        model.generation_config.do_sample = False
+    # V11: StopOnString criteria — stop on </answer> or ВЕРДИКТ: to prevent drift
+    stop_criteria = StoppingCriteriaList([
+        StopOnString(tokenizer, ["</answer>", "ВЕРДИКТ:", "</reasoning>\n\nВЕРДИКТ:"])
+    ])
+
     pipe = hf_pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=max_new_tokens,
-        max_length=None,
-        repetition_penalty=pipeline_config.repetition_penalty,
-        do_sample=False,
         return_full_text=False,
+        stopping_criteria=stop_criteria,
     )
     return HuggingFacePipeline(pipeline=pipe)

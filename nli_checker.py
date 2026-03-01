@@ -27,16 +27,33 @@ from utils import STOPWORDS
 
 
 class NLIChecker:
-    """Multilingual NLI classifier for fact-checking."""
+    """V13: Russian-native NLI classifier for fact-checking.
 
-    DEFAULT_MODEL = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
-    # CRITICAL: label order for mDeBERTa-xnli is ["entailment", "neutral", "contradiction"]
+    PRIMARY: cointegrated/rubert-base-cased-nli-threeway (RuBERT, native Russian)
+    FALLBACK: MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7
+    """
+
+    # V13: Primary model — RuBERT fine-tuned on Russian NLI (MNLI+SNLI+FEVER translated)
+    PRIMARY_MODEL = "cointegrated/rubert-base-cased-nli-threeway"
+    FALLBACK_MODEL = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+    # Label order for rubert-base-cased-nli-threeway: entailment(0), contradiction(1), neutral(2)
+    # Label order for mDeBERTa: entailment(0), neutral(1), contradiction(2)
+    # We normalize to a common order internally
     LABELS = ["entailment", "neutral", "contradiction"]
 
     def __init__(self, device: str = "cpu", model_name: str = None):
         self.device = device
-        model_name = model_name or self.DEFAULT_MODEL
         self._use_onnx = False
+        self._label_order = None  # will be set based on loaded model
+        # E3: Temperature scaling (Platt Scaling) for NLI calibration
+        self.temperature = 1.5
+
+        # V11: Cross-encoder NLI tiebreaker for ambiguous cases
+        self._cross_encoder = None
+
+        # V13: Try primary RuBERT model first, fallback to mDeBERTa
+        _model_to_load = model_name or self.PRIMARY_MODEL
+        _loaded = False
 
         # B4: Try ONNX Runtime first for 2-3x speedup
         try:
@@ -47,16 +64,177 @@ class NLIChecker:
                 self.tokenizer = AutoTokenizer.from_pretrained(onnx_path)
                 self.model = ORTModelForSequenceClassification.from_pretrained(onnx_path)
                 self._use_onnx = True
+                self._label_order = ["entailment", "neutral", "contradiction"]  # mDeBERTa ONNX
+                _loaded = True
                 print(f"NLI: ONNX Runtime loaded from {onnx_path}")
             else:
                 raise FileNotFoundError(f"ONNX model not found at {onnx_path}")
-        except (ImportError, FileNotFoundError, Exception) as e:
-            # Fallback to PyTorch
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
-            self.model.to(self.device)
-            self.model.eval()
-            print(f"NLI: PyTorch model loaded ({model_name})")
+        except (ImportError, FileNotFoundError, Exception):
+            pass
+
+        if not _loaded:
+            # Try primary model
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*position_ids.*")
+                    self.tokenizer = AutoTokenizer.from_pretrained(_model_to_load)
+                    self.model = AutoModelForSequenceClassification.from_pretrained(_model_to_load)
+                self.model.to(self.device)
+                self.model.eval()
+                # Set label order based on model config
+                if hasattr(self.model.config, 'id2label') and self.model.config.id2label:
+                    id2l = self.model.config.id2label
+                    self._label_order = [id2l[k] for k in sorted(id2l.keys(), key=int)]
+                else:
+                    self._label_order = self.LABELS
+                _loaded = True
+                print(f"NLI: PyTorch model loaded ({_model_to_load})")
+            except Exception as e:
+                print(f"NLI: Failed to load {_model_to_load}: {e}")
+
+        # Fallback to mDeBERTa if primary failed
+        if not _loaded:
+            try:
+                _model_to_load = self.FALLBACK_MODEL
+                self.tokenizer = AutoTokenizer.from_pretrained(_model_to_load)
+                self.model = AutoModelForSequenceClassification.from_pretrained(_model_to_load)
+                self.model.to(self.device)
+                self.model.eval()
+                self._label_order = ["entailment", "neutral", "contradiction"]
+                print(f"NLI: Fallback model loaded ({_model_to_load})")
+            except Exception as e:
+                raise RuntimeError(f"NLI: Cannot load any model: {e}")
+
+    def _init_cross_encoder(self):
+        """V13: Lazy-load BAAI/bge-reranker-v2-m3 for multilingual cross-encoder NLI.
+
+        Falls back to cross-encoder/nli-deberta-v3-base if BAAI model unavailable.
+        """
+        if self._cross_encoder is not None:
+            return True
+        # V13: Try BAAI reranker first (multilingual, trained on FEVER)
+        try:
+            self._ce_model = AutoModelForSequenceClassification.from_pretrained(
+                "BAAI/bge-reranker-v2-m3")
+            self._ce_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-v2-m3")
+            self._ce_model.eval()
+            self._cross_encoder = "baai"  # marker
+            self._ce_is_baai = True
+            print("NLI: BAAI/bge-reranker-v2-m3 loaded for cross-encoder NLI")
+            return True
+        except Exception as e:
+            print(f"NLI: BAAI reranker not available: {e}, trying fallback")
+        # Fallback to original cross-encoder
+        try:
+            from sentence_transformers import CrossEncoder
+            self._cross_encoder = CrossEncoder("cross-encoder/nli-deberta-v3-base")
+            self._ce_is_baai = False
+            print("NLI: Cross-encoder fallback loaded (nli-deberta-v3-base)")
+            return True
+        except Exception as e:
+            print(f"NLI: Cross-encoder not available: {e}")
+            return False
+
+    def cross_nli(self, premise: str, hypothesis: str) -> dict:
+        """Cross-encoder NLI: more accurate but slower. Used as tiebreaker."""
+        if not self._init_cross_encoder():
+            return {"contradiction": 0.0, "entailment": 0.0, "neutral": 1.0}
+        if getattr(self, '_ce_is_baai', False):
+            return self._baai_cross_nli(premise, hypothesis)
+        scores = self._cross_encoder.predict([(premise, hypothesis)])
+        labels = ["contradiction", "entailment", "neutral"]
+        result = dict(zip(labels, scores[0].tolist()))
+        return result
+
+    def _baai_cross_nli(self, premise: str, hypothesis: str) -> dict:
+        """BAAI reranker as cross-encoder: returns relevance score mapped to NLI labels."""
+        inputs = self._ce_tokenizer(
+            premise, hypothesis,
+            return_tensors="pt", truncation=True, max_length=512, padding=True
+        )
+        with torch.no_grad():
+            logits = self._ce_model(**inputs).logits
+        # BAAI reranker outputs a single relevance score (not NLI labels)
+        # High score = premise supports hypothesis, low = contradicts
+        score = torch.sigmoid(logits[0, 0]).item()
+        # Map relevance score to NLI-like probabilities
+        if score >= 0.7:
+            return {"entailment": score, "contradiction": 1.0 - score, "neutral": 0.1}
+        elif score <= 0.3:
+            return {"entailment": score, "contradiction": 1.0 - score, "neutral": 0.1}
+        else:
+            return {"entailment": score, "contradiction": 1.0 - score, "neutral": 0.5}
+
+    def check_claim_cross(
+        self,
+        claim: str,
+        sources: list,
+        snippet_key: str = "snippet",
+        top_k: int = 3,
+    ) -> dict:
+        """V12: CrossEncoder NLI for top-K sources — catches entity-swap contradictions.
+
+        Unlike bi-encoder (encodes claim and premise separately), cross-encoder
+        tokenizes (premise, hypothesis) together, so it sees entity differences directly.
+
+        Returns: {"max_entailment": float, "max_contradiction": float, "ce_pairs": [...]}
+        """
+        if not self._init_cross_encoder():
+            return {"max_entailment": 0.0, "max_contradiction": 0.0, "ce_pairs": []}
+
+        ce_pairs = []
+        max_ent = 0.0
+        max_con = 0.0
+
+        for source in sources[:top_k]:
+            evidence = source.get(snippet_key, "")
+            if not evidence or len(evidence) < 20:
+                continue
+
+            # Split into sentences for fine-grained scoring
+            sentences = self._split_sentences(evidence)
+            if not sentences:
+                sentences = [evidence]
+
+            # Build pairs for batch prediction
+            pairs = [(sent, claim) for sent in sentences[:10]]  # cap at 10 sentences
+            try:
+                # V13: Support both BAAI reranker and original cross-encoder
+                if getattr(self, '_ce_is_baai', False):
+                    # BAAI path: process pairs individually
+                    best_ent = 0.0
+                    best_con = 0.0
+                    for sent, hyp in pairs:
+                        r = self._baai_cross_nli(sent, hyp)
+                        best_ent = max(best_ent, r["entailment"])
+                        best_con = max(best_con, r["contradiction"])
+                else:
+                    scores = self._cross_encoder.predict(pairs, apply_softmax=True)
+                    labels = ["contradiction", "entailment", "neutral"]
+                    best_ent = 0.0
+                    best_con = 0.0
+                    for score_row in scores:
+                        result = dict(zip(labels, score_row.tolist()))
+                        best_ent = max(best_ent, result["entailment"])
+                        best_con = max(best_con, result["contradiction"])
+
+                ce_pairs.append({
+                    "source": source.get("title", source.get("source", "")),
+                    "entailment": round(best_ent, 4),
+                    "contradiction": round(best_con, 4),
+                })
+                max_ent = max(max_ent, best_ent)
+                max_con = max(max_con, best_con)
+            except Exception as e:
+                print(f"  [CE-NLI] Error processing source: {e}")
+                continue
+
+        return {
+            "max_entailment": round(max_ent, 4),
+            "max_contradiction": round(max_con, 4),
+            "ce_pairs": ce_pairs,
+        }
 
     @staticmethod
     def _split_sentences(text: str) -> List[str]:
@@ -98,6 +276,8 @@ class NLIChecker:
                 logits_np = logits.numpy() if not isinstance(logits, np.ndarray) else logits
             else:
                 logits_np = np.array(logits)
+            # E3: Temperature scaling before softmax
+            logits_np = logits_np / self.temperature
             # Softmax
             exp = np.exp(logits_np - np.max(logits_np, axis=-1, keepdims=True))
             probs_all = exp / exp.sum(axis=-1, keepdims=True)
@@ -106,11 +286,28 @@ class NLIChecker:
             inputs = inputs.to(self.device)
             with torch.no_grad():
                 logits = self.model(**inputs).logits
+            # E3: Temperature scaling before softmax
+            logits = logits / self.temperature
             probs = torch.softmax(logits, dim=-1)[0].cpu().tolist()
 
-        scores = {label: round(prob, 4) for label, prob in zip(self.LABELS, probs)}
+        # V13: Use dynamic label order from model config
+        _labels = self._label_order or self.LABELS
+        raw_scores = {label: round(prob, 4) for label, prob in zip(_labels, probs)}
+        # Normalize to standard LABELS order
+        scores = {
+            "entailment": raw_scores.get("entailment", 0.0),
+            "neutral": raw_scores.get("neutral", 0.0),
+            "contradiction": raw_scores.get("contradiction", 0.0),
+        }
         scores["label"] = max(scores, key=lambda k: scores[k] if k in self.LABELS else -1)
         return scores
+
+    # V11: Correction-pattern detection — "на самом деле", "однако", etc.
+    # If source sentence contains a correction, boost contradiction score
+    _CORRECTION_RE = re.compile(
+        r'на\s+самом\s+деле|в\s+действительности|фактически|однако|'
+        r'но\s+не\s+в|а\s+не\s+в|not\s+in|actually|in\s+fact',
+        re.IGNORECASE)
 
     # A2: Survey/misconception sentence filter patterns
     # V8: расширенные паттерны для опросов/заблуждений
@@ -130,19 +327,18 @@ class NLIChecker:
     @staticmethod
     def _claim_term_guard(claim: str, premise: str, score: float,
                           symmetric: bool = False) -> float:
-        """Если ключевые слова claim отсутствуют в premise, cap score.
+        """Если ключевые слова claim отсутствуют в premise, penalize score.
 
-        A2: Proportional cap instead of fixed 0.45. Applied symmetrically
-        to both entailment and contradiction.
+        D3: Soft penalty (score *= 0.7) instead of hard cap when key
+        claim terms are missing from premise.
         """
         claim_tokens = set(re.findall(r'[а-яёa-z]{4,}', claim.lower()))
         premise_tokens = set(re.findall(r'[а-яёa-z]{4,}', premise.lower()))
         claim_unique = claim_tokens - premise_tokens - STOPWORDS
         missing_ratio = len(claim_unique) / max(len(claim_tokens), 1)
         if len(claim_unique) >= 3 and missing_ratio > 0.4:
-            # A2: Proportional cap: more missing terms → lower cap
-            cap = max(0.20, 1.0 - missing_ratio * 1.2)
-            return min(score, cap)
+            # D3: Soft penalty instead of hard cap
+            score *= 0.7
         return score
 
     def _check_batch(self, claim: str, sentences: List[str]) -> List[Dict[str, float]]:
@@ -168,6 +364,8 @@ class NLIChecker:
                 logits_np = logits.numpy() if not isinstance(logits, np.ndarray) else logits
             else:
                 logits_np = np.array(logits)
+            # E3: Temperature scaling before softmax
+            logits_np = logits_np / self.temperature
             # Softmax
             exp = np.exp(logits_np - np.max(logits_np, axis=-1, keepdims=True))
             probs_all = exp / exp.sum(axis=-1, keepdims=True)
@@ -175,11 +373,20 @@ class NLIChecker:
             inputs = inputs.to(self.device)
             with torch.no_grad():
                 logits = self.model(**inputs).logits
+            # E3: Temperature scaling before softmax
+            logits = logits / self.temperature
             probs_all = torch.softmax(logits, dim=-1).cpu().tolist()
 
+        # V13: Use dynamic label order
+        _labels = self._label_order or self.LABELS
         results = []
         for prob_row in (probs_all if isinstance(probs_all, list) else probs_all.tolist()):
-            scores = {label: round(p, 4) for label, p in zip(self.LABELS, prob_row)}
+            raw_scores = {label: round(p, 4) for label, p in zip(_labels, prob_row)}
+            scores = {
+                "entailment": raw_scores.get("entailment", 0.0),
+                "neutral": raw_scores.get("neutral", 0.0),
+                "contradiction": raw_scores.get("contradiction", 0.0),
+            }
             scores["label"] = max(scores, key=lambda k: scores[k] if k in self.LABELS else -1)
             results.append(scores)
         return results
@@ -242,21 +449,31 @@ class NLIChecker:
                         (k for k in self.LABELS),
                         key=lambda k: sr.get(k, -1)
                     )
-            # A2: Filter survey/misconception sentences BEFORE aggregation
-            filtered_results = []
+            # C4: Survey/misconception — boost contradiction score instead of filtering
             for i, sr in enumerate(sentence_results):
                 if self._is_survey_or_misconception(sentences[i]):
-                    continue
-                filtered_results.append(sr)
-            if not filtered_results:
-                filtered_results = sentence_results  # fallback to all if all filtered
+                    sr["contradiction"] = round(sr["contradiction"] * 1.3, 4)
+                    # Recalculate label after boost
+                    sr["label"] = max(
+                        (k for k in self.LABELS),
+                        key=lambda k: sr.get(k, -1)
+                    )
 
-            all_sentence_scores.extend(filtered_results)
+            # V11: Correction-pattern boost — "на самом деле" etc. → boost contradiction
+            for i, sr in enumerate(sentence_results):
+                if self._CORRECTION_RE.search(sentences[i]):
+                    sr["contradiction"] = round(min(0.95, sr["contradiction"] * 1.5), 4)
+                    sr["label"] = max(
+                        (k for k in self.LABELS),
+                        key=lambda k: sr.get(k, -1)
+                    )
+
+            all_sentence_scores.extend(sentence_results)
 
             # Source-level aggregation: A2 — top-k mean instead of max
-            if filtered_results:
-                ent_scores = sorted([r["entailment"] for r in filtered_results], reverse=True)
-                con_scores = sorted([r["contradiction"] for r in filtered_results], reverse=True)
+            if sentence_results:
+                ent_scores = sorted([r["entailment"] for r in sentence_results], reverse=True)
+                con_scores = sorted([r["contradiction"] for r in sentence_results], reverse=True)
                 # Top-2 mean (more robust than single max)
                 best_ent = sum(ent_scores[:2]) / min(2, len(ent_scores))
                 best_con = sum(con_scores[:2]) / min(2, len(con_scores))
