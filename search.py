@@ -17,10 +17,13 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import warnings
 from typing import Any, Dict, List, Optional
+
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Подавляем предупреждение о переименовании duckduckgo_search → ddgs.
 # Старый пакет может быть установлен в системном Python — приложение корректно
@@ -50,6 +53,27 @@ _DDG_TIMEOUT = 20  # секунд — достаточно для медленн
 from cache import SearchCache
 from config import SearchConfig
 from source_credibility import boost_by_credibility
+
+
+# V13: Tenacity retry wrapper for Wikipedia/Wikidata API calls
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        ConnectionError,
+    )),
+    reraise=True,
+)
+def _wiki_api_call(url: str, headers: dict = None, timeout: int = 10) -> dict:
+    """Single Wikipedia/Wikidata API call with tenacity retry."""
+    if headers is None:
+        headers = {"User-Agent": "AntifakeBot/5.0 (fact-checking; Python)"}
+    req = urllib.request.Request(url, headers=headers)
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    return json.loads(resp.read())
 
 
 # ============================================================
@@ -302,6 +326,168 @@ TRANSLATION_OVERRIDES = {
     "безопасный счет": "safe account",
 }
 
+# Словарь переводов именованных сущностей (географические объекты, организации,
+# достопримечательности). Используется ДО машинного перевода для корректной
+# передачи устоявшихся английских названий.
+ENTITY_TRANSLATIONS = {
+    # --- Многословные сущности (длинные первыми при сортировке) ---
+    "великая китайская стена": "Great Wall of China",
+    "эйфелева башня": "Eiffel Tower",
+    "красная площадь": "Red Square",
+    "тихий океан": "Pacific Ocean",
+    "северный ледовитый океан": "Arctic Ocean",
+    "чёрное море": "Black Sea",
+    "черное море": "Black Sea",
+    "средиземное море": "Mediterranean Sea",
+    "атлантический океан": "Atlantic Ocean",
+    "индийский океан": "Indian Ocean",
+    "мёртвое море": "Dead Sea",
+    "мертвое море": "Dead Sea",
+    "каспийское море": "Caspian Sea",
+    "байкал": "Lake Baikal",
+    "эверест": "Mount Everest",
+    "килиманджаро": "Mount Kilimanjaro",
+    "статуя свободы": "Statue of Liberty",
+    "биг-бен": "Big Ben",
+    "колизей": "Colosseum",
+    "тадж-махал": "Taj Mahal",
+    "мачу-пикчу": "Machu Picchu",
+    "ниагарский водопад": "Niagara Falls",
+    "панамский канал": "Panama Canal",
+    "суэцкий канал": "Suez Canal",
+    "сахара": "Sahara Desert",
+    "амазонка": "Amazon River",
+    "нил": "Nile River",
+    "волга": "Volga River",
+    "дунай": "Danube River",
+    "миссисипи": "Mississippi River",
+    "титаник": "Titanic",
+    "кремль": "Kremlin",
+    "версаль": "Palace of Versailles",
+    "букингемский дворец": "Buckingham Palace",
+    "пентагон": "The Pentagon",
+    "белый дом": "White House",
+    "великобритания": "United Kingdom",
+    "соединённые штаты": "United States",
+    "соединенные штаты": "United States",
+    "советский союз": "Soviet Union",
+    "европейский союз": "European Union",
+    "объединённые нации": "United Nations",
+    "объединенные нации": "United Nations",
+    "всемирная организация здравоохранения": "World Health Organization",
+    "международная космическая станция": "International Space Station",
+    "марианская впадина": "Mariana Trench",
+    "пирамиды гизы": "Pyramids of Giza",
+    "гренландия": "Greenland",
+    "антарктида": "Antarctica",
+    "арктика": "Arctic",
+    "фудзияма": "Mount Fuji",
+    "сиднейский оперный театр": "Sydney Opera House",
+    "озеро титикака": "Lake Titicaca",
+    "берлинская стена": "Berlin Wall",
+    "нотр-дам": "Notre-Dame",
+    "альпы": "Alps",
+    "гималаи": "Himalayas",
+    "большой барьерный риф": "Great Barrier Reef",
+    "ватикан": "Vatican",
+    "галапагосские острова": "Galapagos Islands",
+    "стоунхендж": "Stonehenge",
+    # --- Страны (лемма → EN) ---
+    "россия": "Russia",
+    "германия": "Germany",
+    "франция": "France",
+    "китай": "China",
+    "япония": "Japan",
+    "индия": "India",
+    "бразилия": "Brazil",
+    "австралия": "Australia",
+    "канада": "Canada",
+    "италия": "Italy",
+    "испания": "Spain",
+    "турция": "Turkey",
+    "египет": "Egypt",
+    "иран": "Iran",
+    "ирак": "Iraq",
+    "сирия": "Syria",
+    "украина": "Ukraine",
+    "польша": "Poland",
+    "корея": "Korea",
+    "мексика": "Mexico",
+    "аргентина": "Argentina",
+    "нигерия": "Nigeria",
+    "пакистан": "Pakistan",
+    "саудовская аравия": "Saudi Arabia",
+    # --- Города ---
+    "москва": "Moscow",
+    "париж": "Paris",
+    "лондон": "London",
+    "берлин": "Berlin",
+    "пекин": "Beijing",
+    "токио": "Tokyo",
+    "вашингтон": "Washington",
+    "нью-йорк": "New York",
+    "рим": "Rome",
+    "мадрид": "Madrid",
+    "стамбул": "Istanbul",
+    "львов": "Lviv",
+    # --- Персоналии ---
+    "наполеон": "Napoleon",
+    "бонапарт": "Bonaparte",
+    "гагарин": "Gagarin",
+    "путин": "Putin",
+    "трамп": "Trump",
+    "байден": "Biden",
+    "зеленский": "Zelensky",
+    "маск": "Musk",
+    "джобс": "Jobs",
+    "гейтс": "Gates",
+    "эйнштейн": "Einstein",
+    "тесла": "Tesla",
+    "менделеев": "Mendeleev",
+    # --- Континенты/регионы ---
+    "африка": "Africa",
+    "европа": "Europe",
+    "азия": "Asia",
+    "луна": "Moon",
+    "марс": "Mars",
+    "юпитер": "Jupiter",
+    "сатурн": "Saturn",
+    # --- Единицы/термины ---
+    "цельсий": "Celsius",
+    "фаренгейт": "Fahrenheit",
+}
+
+
+def _apply_entity_translations(text: str) -> str:
+    """Заменяет известные именованные сущности на английские аналоги ДО перевода.
+
+    Двухпроходная стратегия:
+    1. Прямое совпадение (case-insensitive) — "амазонка" → "Amazon River"
+    2. Лемматизация через pymorphy2 — "России" → lemma "россия" → "Russia"
+    """
+    result = text
+    # Проход 1: Прямое совпадение (длинные фразы первыми)
+    for ru, en in sorted(ENTITY_TRANSLATIONS.items(), key=lambda x: -len(x[0])):
+        pattern = re.compile(re.escape(ru), re.IGNORECASE)
+        result = pattern.sub(en, result)
+
+    # Проход 2: Лемматизация оставшейся кириллицы
+    # Находим слова, которые не были переведены
+    remaining_cyrillic = re.findall(r'[а-яёА-ЯЁ]{3,}', result)
+    if remaining_cyrillic:
+        try:
+            from nlp_russian import lemmatize
+            for word in remaining_cyrillic:
+                lemma = lemmatize(word)
+                if lemma in ENTITY_TRANSLATIONS:
+                    # Заменяем падежную форму на английский перевод
+                    pattern = re.compile(re.escape(word), re.IGNORECASE)
+                    result = pattern.sub(ENTITY_TRANSLATIONS[lemma], result)
+        except ImportError:
+            pass  # nlp_russian недоступен — пропускаем лемматизацию
+
+    return result
+
 
 def _apply_translation_overrides(text: str) -> str:
     """Заменяет известные проблемные фразы/слова ДО отправки в MarianMT."""
@@ -420,6 +606,33 @@ class QueryClassifier:
         return re.sub(r'[а-яёА-ЯЁ]+', _replace_cyrillic, text)
 
     # ----------------------------------------------------------
+    # Перевод с предварительной подстановкой сущностей
+    # ----------------------------------------------------------
+
+    def translate_with_entities(self, text_ru: str) -> str:
+        """Переводит RU->EN с предварительной подстановкой именованных сущностей.
+
+        1. Применяет словарь ENTITY_TRANSLATIONS (устоявшиеся названия)
+        2. Вызывает основной _translate (NLLB / MarianMT)
+        3. Проверяет остаточную кириллицу и логирует предупреждение
+        """
+        # Шаг 1: подстановка сущностей из словаря
+        with_entities = _apply_entity_translations(text_ru)
+
+        # Шаг 2: машинный перевод (NLLB -> MarianMT -> оригинал)
+        translated = self._translate(with_entities)
+
+        # Шаг 3: проверка остаточной кириллицы (3+ символов подряд)
+        remaining = re.findall(r'[а-яёА-ЯЁ]{3,}', translated)
+        if remaining:
+            print(
+                f"  [Translator] WARN: остаточная кириллица после перевода: "
+                f"{remaining[:5]}"
+            )
+
+        return translated
+
+    # ----------------------------------------------------------
     # Инъекция Mistral (вызывается из FactCheckSearcher)
     # ----------------------------------------------------------
 
@@ -445,7 +658,7 @@ class QueryClassifier:
             category = "general"  # пусть пройдёт через scam-детектор, а не art_culture
         else:
             category = self._classify_topic(claim)
-        en_query = self._translate(claim)
+        en_query = self.translate_with_entities(claim)
         return {
             "category": category,
             "ru_query": claim,
@@ -553,12 +766,16 @@ class QueryClassifier:
             return
         self._nllb_ready = True
         try:
-            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoConfig
             import torch
             print(f"  [Translator] Загрузка {self._NLLB_MODEL_NAME} (CPU)...")
+            # V13: Fix tie_word_embeddings warning
+            nllb_config = AutoConfig.from_pretrained(self._NLLB_MODEL_NAME)
+            nllb_config.tie_word_embeddings = False
             self._nllb_tok = AutoTokenizer.from_pretrained(self._NLLB_MODEL_NAME)
             self._nllb_model = AutoModelForSeq2SeqLM.from_pretrained(
                 self._NLLB_MODEL_NAME,
+                config=nllb_config,
                 torch_dtype=torch.float32,
             )
             self._nllb_model.eval()
@@ -638,17 +855,19 @@ class QueryClassifier:
         # Так "Сальвадор Дали" → PROPN0 ДО того, как overrides обработают "дали"
         protected, placeholders = self._protect_proper_nouns(expanded)
         protected = _apply_translation_overrides(protected)  # Словарь терминов
+        protected = _apply_entity_translations(protected)   # Именованные сущности
 
         # Попытка перевода через NLLB-200
         if self._use_nllb and self._nllb_model is not None:
             try:
                 import torch
                 self._nllb_tok.src_lang = "rus_Cyrl"
-                inputs = self._nllb_tok(protected[:200], return_tensors="pt")
+                # V13: Expanded NLLB limits (400 chars input, 200 tokens output)
+                inputs = self._nllb_tok(protected[:400], return_tensors="pt")
                 translated_tokens = self._nllb_model.generate(
                     **inputs,
                     forced_bos_token_id=self._nllb_tok.convert_tokens_to_ids("eng_Latn"),
-                    max_length=100,
+                    max_length=200,
                 )
                 translated = self._nllb_tok.batch_decode(
                     translated_tokens, skip_special_tokens=True
@@ -1674,7 +1893,11 @@ class FactCheckSearcher:
             return []
 
     def _search_wikipedia_with_extract(self, keyword: str, lang: str = "ru") -> List[Dict[str, str]]:
-        """Wikipedia + полный вводный раздел (первые 10 предложений)."""
+        """Wikipedia + полный вводный раздел (первые 10 предложений).
+
+        EN fallback: если русская Wikipedia пуста или snippet < 200 символов,
+        пробуем английскую Wikipedia с переведённым запросом.
+        """
         hits = self._search_wikipedia(keyword, lang)
 
         for hit in hits[:2]:  # Топ-2 результата
@@ -1697,6 +1920,49 @@ class FactCheckSearcher:
                         hit["snippet"] = extract[:1500]  # Первые 1500 символов
             except Exception:
                 pass  # Оставляем оригинальный snippet
+
+        # --- EN fallback ---
+        # Если RU-результаты пусты или все snippet'ы короткие (< 200 символов),
+        # пробуем английскую Wikipedia
+        total_snippet_len = sum(len(h.get("snippet", "")) for h in hits)
+        if lang == "ru" and (not hits or total_snippet_len < 200):
+            try:
+                # Переводим запрос для EN Wikipedia
+                en_keyword = _apply_entity_translations(keyword)
+                # Если после подстановки сущностей остался кириллический текст,
+                # пробуем машинный перевод через classifier
+                if re.search(r'[а-яёА-ЯЁ]{3,}', en_keyword):
+                    en_keyword = self._classifier.translate_with_entities(keyword)
+                en_hits = self._search_wikipedia(en_keyword[:80], lang="en")
+
+                for hit_en in en_hits[:2]:
+                    title_en = hit_en.get("title", "")
+                    try:
+                        import requests
+                        q_en = urllib.parse.quote(title_en)
+                        extract_url_en = (
+                            f"https://en.wikipedia.org/w/api.php"
+                            f"?action=query&titles={q_en}&prop=extracts"
+                            f"&exintro=1&explaintext=1&format=json&exsentences=10"
+                        )
+                        resp_en = requests.get(
+                            extract_url_en, timeout=5,
+                            headers={"User-Agent": "AntifakeBot/3.0"}
+                        )
+                        data_en = resp_en.json()
+                        pages_en = data_en.get("query", {}).get("pages", {})
+                        for page_en in pages_en.values():
+                            extract_en = page_en.get("extract", "")
+                            if extract_en and len(extract_en) > len(hit_en.get("snippet", "")):
+                                hit_en["snippet"] = extract_en[:1500]
+                    except Exception:
+                        pass
+                if en_hits:
+                    print(f"  [Wikipedia] EN fallback: +{len(en_hits)} результатов для '{en_keyword[:50]}'")
+                    hits.extend(en_hits)
+            except Exception as e:
+                print(f"  [Wikipedia] EN fallback ошибка: {e}")
+
         return hits
 
     def _search_arxiv(self, query: str, max_results: int = 3) -> List[Dict[str, str]]:
@@ -2030,7 +2296,7 @@ class FactCheckSearcher:
                 f'"{short_claim}" миф OR фейк OR разоблачение OR опровержение'
             ]
             try:
-                claim_en = self._classifier._translate(short_claim)
+                claim_en = self._classifier.translate_with_entities(short_claim)
                 if claim_en and claim_en != short_claim:
                     counter_queries.append(
                         f'"{claim_en}" debunked OR false OR myth OR fake'
@@ -2069,68 +2335,127 @@ class FactCheckSearcher:
         - "Титаник" → статья "Титаник" с местом крушения
 
         Возвращает результаты с полными intro-секциями (до 2000 символов).
+        EN fallback: если RU-результат пуст или snippet < 200 символов,
+        пробуем English Wikipedia с переведённым названием сущности.
         """
         results: List[Dict[str, str]] = []
         seen_titles: set = set()
+        headers = {"User-Agent": "AntifakeBot/4.0 (fact-checking)"}
 
         for entity in entities[:5]:  # Макс 5 сущностей
             entity = entity.strip()
             if not entity or len(entity) < 2:
                 continue
+
+            found_extract = ""  # Текст из RU Wikipedia для этой сущности
+
             try:
-                # Шаг 1: Поиск страницы по точному названию
+                # Шаг 1: Поиск страницы по точному названию (RU)
                 q = urllib.parse.quote(entity)
                 search_url = (
                     f"https://{lang}.wikipedia.org/w/api.php"
                     f"?action=query&list=search&srsearch={q}&format=json"
                     f"&srlimit=2&srprop=snippet"
                 )
-                headers = {"User-Agent": "AntifakeBot/4.0 (fact-checking)"}
                 req = urllib.request.Request(search_url, headers=headers)
                 resp = urllib.request.urlopen(req, timeout=8)
                 data = json.loads(resp.read())
                 hits = data.get("query", {}).get("search", [])
 
-                if not hits:
-                    continue
+                if hits:
+                    # Шаг 2: Получаем полный intro для топ-1 результата
+                    title = hits[0].get("title", "")
+                    if title.lower() not in seen_titles:
+                        seen_titles.add(title.lower())
 
-                # Шаг 2: Получаем полный intro для топ-1 результата
-                title = hits[0].get("title", "")
-                if title.lower() in seen_titles:
-                    continue
-                seen_titles.add(title.lower())
-
-                qt = urllib.parse.quote(title)
-                extract_url = (
-                    f"https://{lang}.wikipedia.org/w/api.php"
-                    f"?action=query&titles={qt}&prop=extracts"
-                    f"&exintro=1&explaintext=1&format=json&exsentences=20"
-                )
-                req2 = urllib.request.Request(extract_url, headers=headers)
-                resp2 = urllib.request.urlopen(req2, timeout=8)
-                data2 = json.loads(resp2.read())
-                pages = data2.get("query", {}).get("pages", {})
-
-                for page in pages.values():
-                    extract = page.get("extract", "")
-                    if extract and len(extract) > 50:
-                        link = (
-                            f"https://{lang}.wikipedia.org/wiki/"
-                            + urllib.parse.quote(title.replace(" ", "_"))
+                        qt = urllib.parse.quote(title)
+                        extract_url = (
+                            f"https://{lang}.wikipedia.org/w/api.php"
+                            f"?action=query&titles={qt}&prop=extracts"
+                            f"&exintro=1&explaintext=1&format=json&exsentences=20"
                         )
-                        results.append({
-                            "title": f"{title} — Википедия",
-                            "snippet": extract[:2000],
-                            "source": f"{lang}.wikipedia.org",
-                            "link": link,
-                            "date": "",
-                            "source_credibility": 0.90,
-                        })
-                        break
+                        req2 = urllib.request.Request(extract_url, headers=headers)
+                        resp2 = urllib.request.urlopen(req2, timeout=8)
+                        data2 = json.loads(resp2.read())
+                        pages = data2.get("query", {}).get("pages", {})
+
+                        for page in pages.values():
+                            extract = page.get("extract", "")
+                            if extract and len(extract) > 50:
+                                found_extract = extract
+                                link = (
+                                    f"https://{lang}.wikipedia.org/wiki/"
+                                    + urllib.parse.quote(title.replace(" ", "_"))
+                                )
+                                results.append({
+                                    "title": f"{title} — Википедия",
+                                    "snippet": extract[:2000],
+                                    "source": f"{lang}.wikipedia.org",
+                                    "link": link,
+                                    "date": "",
+                                    "source_credibility": 0.90,
+                                })
+                                break
 
             except Exception as e:
                 print(f"  [WikiEntity] Ошибка для '{entity}': {e}")
-                continue
+
+            # --- EN fallback для этой сущности ---
+            if lang == "ru" and len(found_extract) < 200:
+                try:
+                    # Переводим название сущности для EN Wikipedia
+                    en_entity = _apply_entity_translations(entity)
+                    if re.search(r'[а-яёА-ЯЁ]{3,}', en_entity):
+                        en_entity = self._classifier.translate_with_entities(entity)
+
+                    q_en = urllib.parse.quote(en_entity)
+                    search_url_en = (
+                        f"https://en.wikipedia.org/w/api.php"
+                        f"?action=query&list=search&srsearch={q_en}&format=json"
+                        f"&srlimit=2&srprop=snippet"
+                    )
+                    req_en = urllib.request.Request(search_url_en, headers=headers)
+                    resp_en = urllib.request.urlopen(req_en, timeout=8)
+                    data_en = json.loads(resp_en.read())
+                    hits_en = data_en.get("query", {}).get("search", [])
+
+                    if hits_en:
+                        title_en = hits_en[0].get("title", "")
+                        if title_en.lower() not in seen_titles:
+                            seen_titles.add(title_en.lower())
+                            qt_en = urllib.parse.quote(title_en)
+                            extract_url_en = (
+                                f"https://en.wikipedia.org/w/api.php"
+                                f"?action=query&titles={qt_en}&prop=extracts"
+                                f"&exintro=1&explaintext=1&format=json&exsentences=20"
+                            )
+                            req2_en = urllib.request.Request(extract_url_en, headers=headers)
+                            resp2_en = urllib.request.urlopen(req2_en, timeout=8)
+                            data2_en = json.loads(resp2_en.read())
+                            pages_en = data2_en.get("query", {}).get("pages", {})
+
+                            for page_en in pages_en.values():
+                                extract_en = page_en.get("extract", "")
+                                if extract_en and len(extract_en) > 50:
+                                    link_en = (
+                                        f"https://en.wikipedia.org/wiki/"
+                                        + urllib.parse.quote(title_en.replace(" ", "_"))
+                                    )
+                                    results.append({
+                                        "title": f"{title_en} — Wikipedia (EN)",
+                                        "snippet": extract_en[:2000],
+                                        "source": "en.wikipedia.org",
+                                        "link": link_en,
+                                        "date": "",
+                                        "source_credibility": 0.90,
+                                    })
+                                    print(
+                                        f"  [WikiEntity] EN fallback для '{entity}' "
+                                        f"→ '{title_en}'"
+                                    )
+                                    break
+                except Exception as e:
+                    print(f"  [WikiEntity] EN fallback ошибка для '{entity}': {e}")
 
         if results:
             print(f"  [WikiEntity] Найдено {len(results)} статей для сущностей")

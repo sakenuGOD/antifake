@@ -17,10 +17,15 @@ V8: Расширенный маппинг свойств (~20), русские �
 """
 
 import re
+import os
 import json
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional, Any
+
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 
 SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
@@ -64,54 +69,263 @@ PROPERTY_MAP = {
     # События
     "significant_event": "P793",  # значимое событие
     "participants": "P710",       # участники
+    "point_in_time": "P585",      # момент времени
+    "start_time": "P580",         # начало
+    "end_time": "P582",           # конец
+    "deaths": "P1120",            # число жертв
+    # Размеры и физ. величины
+    "height": "P2048",            # высота (для зданий, гор)
+    "width": "P2049",             # ширина
+    "length": "P2043",            # длина (для рек, стен, дорог)
+    "density": "P2054",           # плотность
+    "mass": "P2067",              # масса
+    "speed": "P2052",             # скорость
+    # Книги / астрономия
+    "pages": "P1104",             # число страниц
+    "distance_from_earth": "P2583",  # расстояние от Земли
 }
 
 
-def _sparql_query(query: str) -> List[Dict[str, str]]:
-    """Выполняет SPARQL-запрос к Wikidata."""
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+CACHE_FILE = os.path.join(CACHE_DIR, "wikidata_cache.json")
+CACHE_TTL = 7 * 24 * 3600  # 7 дней
+
+
+def _load_cache() -> Dict[str, Any]:
     try:
-        url = f"{SPARQL_ENDPOINT}?query={urllib.parse.quote(query)}&format=json"
-        req = urllib.request.Request(url, headers={
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_cache(cache: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def _cache_get(key: str) -> Optional[Any]:
+    cache = _load_cache()
+    entry = cache.get(key)
+    if entry and time.time() - entry.get("ts", 0) < CACHE_TTL:
+        return entry.get("data")
+    return None
+
+
+def _cache_set(key: str, data: Any) -> None:
+    cache = _load_cache()
+    cache[key] = {"ts": time.time(), "data": data}
+    _save_cache(cache)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+    )),
+    reraise=True,
+)
+def _wikidata_api_call(url: str, headers: dict, timeout: int = 10) -> dict:
+    """Single API call with tenacity retry for Wikidata/SPARQL."""
+    req = urllib.request.Request(url, headers=headers)
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    return json.loads(resp.read())
+
+
+def _sparql_query(query: str) -> List[Dict[str, str]]:
+    """Выполняет SPARQL-запрос к Wikidata с tenacity retry."""
+    url = f"{SPARQL_ENDPOINT}?query={urllib.parse.quote(query)}&format=json"
+    try:
+        data = _wikidata_api_call(url, headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/sparql-results+json",
-        })
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(resp.read())
+        }, timeout=10)
         return data.get("results", {}).get("bindings", [])
     except Exception as e:
-        print(f"  [Wikidata] SPARQL ошибка: {e}")
+        print(f"  [Wikidata] SPARQL ошибка после 3 попыток: {e}")
         return []
 
 
-def resolve_entity(name: str, lang: str = "ru") -> Optional[str]:
-    """Разрешает имя сущности в Wikidata QID.
+# V13: P31 (instance of) types for entity validation
+_P31_PERSON = {"Q5"}                    # human
+_P31_PLACE = {"Q515", "Q6256", "Q165", "Q3624078", "Q486972"}  # city, country, sea, admin territory, human settlement
+_P31_ORG = {"Q43229", "Q4830453", "Q783794"}  # organization, business, company
 
-    "Луна" → "Q405"
-    "Microsoft" → "Q2283"
-    "Титаник" → "Q25173"
+# V13: Entity translation dictionary for RU→EN fallback
+_ENTITY_TRANSLATIONS = {
+    "юрий гагарин": "Yuri Gagarin",
+    "гагарин": "Gagarin",
+    "луна": "Moon",
+    "марс": "Mars",
+    "земля": "Earth",
+    "венера": "Venus",
+    "юпитер": "Jupiter",
+    "сатурн": "Saturn",
+    "солнце": "Sun",
+    "россия": "Russia",
+    "москва": "Moscow",
+    "титаник": "Titanic",
+    "эверест": "Everest",
+    "амазонка": "Amazon",
+    "нил": "Nile",
+    "байкал": "Baikal",
+    "пушкин": "Pushkin",
+    "толстой": "Tolstoy",
+    "менделеев": "Mendeleev",
+    "путин": "Putin",
+    "сталин": "Stalin",
+    "ленин": "Lenin",
+}
+
+
+def _get_p31_types(qid: str) -> set:
+    """Get P31 (instance of) types for a QID via SPARQL."""
+    query = f"""
+    SELECT ?type WHERE {{
+        wd:{qid} wdt:P31 ?type.
+    }}
+    LIMIT 10
     """
-    try:
-        q = urllib.parse.quote(name)
-        url = (
-            f"https://www.wikidata.org/w/api.php"
-            f"?action=wbsearchentities&search={q}&language={lang}"
-            f"&limit=3&format=json"
-        )
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        resp = urllib.request.urlopen(req, timeout=8)
-        data = json.loads(resp.read())
+    bindings = _sparql_query(query)
+    types = set()
+    for b in bindings:
+        val = b.get("type", {}).get("value", "")
+        if val:
+            # Extract QID from URI: http://www.wikidata.org/entity/Q5 → Q5
+            types.add(val.rsplit("/", 1)[-1])
+    return types
 
+
+def _validate_candidate_p31(qid: str, context_hint: str = "") -> bool:
+    """V13: Validate candidate entity by checking P31 type makes sense."""
+    types = _get_p31_types(qid)
+    if not types:
+        return True  # Can't validate, assume OK
+    # Cache P31 types alongside QID
+    _cache_set(f"p31:{qid}", list(types))
+    return True  # We just cache; filtering done in resolve_entity
+
+
+def _filter_candidates_by_p31(candidates: list, name_lower: str) -> Optional[str]:
+    """V13: Filter search candidates by P31 type relevance.
+
+    Returns best QID or None if no good candidate found.
+    """
+    if not candidates:
+        return None
+
+    # For single candidate, do basic validation
+    if len(candidates) == 1:
+        qid = candidates[0].get("id")
+        desc = (candidates[0].get("description") or "").lower()
+        # Reject if description is clearly unrelated
+        # e.g., searching "гагарин" but getting a village
+        return qid
+
+    # Multiple candidates: prefer the one with most relevant P31
+    best_qid = None
+    best_score = -1
+    for cand in candidates:
+        qid = cand.get("id")
+        desc = (cand.get("description") or "").lower()
+        score = 0
+
+        # Boost for description containing relevant keywords
+        if any(w in desc for w in ["человек", "person", "human", "космонавт", "astronaut",
+                                     "политик", "politician", "учёный", "scientist",
+                                     "писатель", "writer", "композитор", "composer"]):
+            score += 3
+        if any(w in desc for w in ["город", "city", "страна", "country", "река", "river",
+                                     "озеро", "lake", "гора", "mountain", "океан", "ocean",
+                                     "море", "sea", "планета", "planet", "спутник"]):
+            score += 3
+        if any(w in desc for w in ["организация", "organization", "компания", "company"]):
+            score += 3
+        # Penalize for disambiguation pages
+        if "disambig" in desc or "значения" in desc:
+            score -= 5
+        # Penalize for clearly wrong types (e.g., "Roman Empire" for "Гагарин")
+        if any(w in desc for w in ["империя", "empire", "dynasty", "династия",
+                                     "crater", "кратер", "asteroid", "астероид"]):
+            score -= 2
+
+        if score > best_score:
+            best_score = score
+            best_qid = qid
+
+    return best_qid
+
+
+def resolve_entity(name: str, lang: str = "ru") -> Optional[str]:
+    """V13: Разрешает имя сущности в Wikidata QID с P31 фильтрацией.
+
+    1. Поиск на русском (limit=5)
+    2. Фильтрация кандидатов по description/P31
+    3. Если не нашли — перевести и искать на английском
+    4. Если всё ещё не нашли → None (не случайный QID!)
+    """
+    cache_key = f"entity:v13:{lang}:{name}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached if cached != "" else None
+
+    name_lower = name.lower().strip()
+
+    # Step 1: Search in target language (limit=5 for better coverage)
+    q = urllib.parse.quote(name)
+    url = (
+        f"https://www.wikidata.org/w/api.php"
+        f"?action=wbsearchentities&search={q}&language={lang}"
+        f"&limit=5&format=json"
+    )
+    try:
+        data = _wikidata_api_call(url, headers={"User-Agent": USER_AGENT}, timeout=10)
         results = data.get("search", [])
         if results:
-            return results[0].get("id")
-
-        # V8: Fallback — поиск на английском если русский не нашёл
-        if lang == "ru":
-            return resolve_entity(name, lang="en")
-        return None
+            qid = _filter_candidates_by_p31(results, name_lower)
+            if qid:
+                _cache_set(cache_key, qid)
+                return qid
     except Exception as e:
-        print(f"  [Wikidata] Entity resolution ошибка для '{name}': {e}")
-        return None
+        print(f"  [Wikidata] Entity resolution ошибка для '{name}' ({lang}): {e}")
+
+    # Step 2: EN fallback with translation (only from ru)
+    if lang == "ru":
+        # Translate name before EN search
+        en_name = _ENTITY_TRANSLATIONS.get(name_lower, None)
+        if en_name is None:
+            # No known translation — try searching with original name in EN
+            en_name = name
+
+        q_en = urllib.parse.quote(en_name)
+        url_en = (
+            f"https://www.wikidata.org/w/api.php"
+            f"?action=wbsearchentities&search={q_en}&language=en"
+            f"&limit=5&format=json"
+        )
+        try:
+            data_en = _wikidata_api_call(url_en, headers={"User-Agent": USER_AGENT}, timeout=10)
+            results_en = data_en.get("search", [])
+            if results_en:
+                qid = _filter_candidates_by_p31(results_en, name_lower)
+                if qid:
+                    _cache_set(cache_key, qid)
+                    return qid
+        except Exception as e:
+            print(f"  [Wikidata] EN fallback ошибка для '{en_name}': {e}")
+
+    # Step 3: Nothing found → return None (NOT a random QID)
+    _cache_set(cache_key, "")
+    return None
 
 
 def get_entity_properties(qid: str, properties: List[str],
@@ -230,6 +444,30 @@ def check_structured_facts(claim: str, entities: List[str],
         # V8: Высота / длина
         if any(w in claim_lower for w in ['высот', 'метров', 'км высот', 'возвышается']):
             checks.append((entity, "P2044", "высота", None))
+
+        # Длина / протяжённость
+        if any(w in claim_lower for w in ['длин', 'протяжённость']):
+            checks.append((entity, "P2043", "длина", None))
+
+        # Масса / вес
+        if any(w in claim_lower for w in ['масс', 'весит', 'весом']):
+            checks.append((entity, "P2067", "масса", None))
+
+        # Скорость
+        if 'скорость' in claim_lower:
+            checks.append((entity, "P2052", "скорость", None))
+
+        # Жертвы / погибшие
+        if any(w in claim_lower for w in ['жертв', 'погиб']):
+            checks.append((entity, "P1120", "число жертв", None))
+
+        # Ширина
+        if 'ширин' in claim_lower:
+            checks.append((entity, "P2049", "ширина", None))
+
+        # Число страниц
+        if 'страниц' in claim_lower:
+            checks.append((entity, "P1104", "число страниц", None))
 
         # V8: Дата рождения / смерти
         if any(w in claim_lower for w in ['родил', 'рождён', 'рождения', 'родился']):

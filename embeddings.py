@@ -75,6 +75,12 @@ class SemanticRanker:
         results.sort(key=lambda x: x["semantic_score"], reverse=True)
         return results[:top_k]
 
+    def similarity(self, text_a: str, text_b: str) -> float:
+        """B4/G4: Compute cosine similarity between two texts."""
+        from sentence_transformers import util
+        emb_a = self.model.encode(self._prepare_text(text_a, is_query=True), convert_to_tensor=True)
+        emb_b = self.model.encode(self._prepare_text(text_b), convert_to_tensor=True)
+        return float(util.cos_sim(emb_a, emb_b)[0][0])
 
 
 def get_reranker():
