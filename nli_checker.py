@@ -45,8 +45,8 @@ class NLIChecker:
         self.device = device
         self._use_onnx = False
         self._label_order = None  # will be set based on loaded model
-        # E3: Temperature scaling (Platt Scaling) for NLI calibration
-        self.temperature = 1.5
+        # V17: Temperature scaling — 1.0 = no distortion
+        self.temperature = 1.0
 
         # V11: Cross-encoder NLI tiebreaker for ambiguous cases
         self._cross_encoder = None
@@ -107,30 +107,14 @@ class NLIChecker:
                 raise RuntimeError(f"NLI: Cannot load any model: {e}")
 
     def _init_cross_encoder(self):
-        """V13: Lazy-load BAAI/bge-reranker-v2-m3 for multilingual cross-encoder NLI.
-
-        Falls back to cross-encoder/nli-deberta-v3-base if BAAI model unavailable.
-        """
+        """V17: Load cross-encoder/nli-deberta-v3-base (3-class NLI, not relevance scorer)."""
         if self._cross_encoder is not None:
             return True
-        # V13: Try BAAI reranker first (multilingual, trained on FEVER)
-        try:
-            self._ce_model = AutoModelForSequenceClassification.from_pretrained(
-                "BAAI/bge-reranker-v2-m3")
-            self._ce_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-v2-m3")
-            self._ce_model.eval()
-            self._cross_encoder = "baai"  # marker
-            self._ce_is_baai = True
-            print("NLI: BAAI/bge-reranker-v2-m3 loaded for cross-encoder NLI")
-            return True
-        except Exception as e:
-            print(f"NLI: BAAI reranker not available: {e}, trying fallback")
-        # Fallback to original cross-encoder
         try:
             from sentence_transformers import CrossEncoder
             self._cross_encoder = CrossEncoder("cross-encoder/nli-deberta-v3-base")
             self._ce_is_baai = False
-            print("NLI: Cross-encoder fallback loaded (nli-deberta-v3-base)")
+            print("NLI: cross-encoder/nli-deberta-v3-base loaded")
             return True
         except Exception as e:
             print(f"NLI: Cross-encoder not available: {e}")
@@ -140,31 +124,10 @@ class NLIChecker:
         """Cross-encoder NLI: more accurate but slower. Used as tiebreaker."""
         if not self._init_cross_encoder():
             return {"contradiction": 0.0, "entailment": 0.0, "neutral": 1.0}
-        if getattr(self, '_ce_is_baai', False):
-            return self._baai_cross_nli(premise, hypothesis)
         scores = self._cross_encoder.predict([(premise, hypothesis)])
         labels = ["contradiction", "entailment", "neutral"]
         result = dict(zip(labels, scores[0].tolist()))
         return result
-
-    def _baai_cross_nli(self, premise: str, hypothesis: str) -> dict:
-        """BAAI reranker as cross-encoder: returns relevance score mapped to NLI labels."""
-        inputs = self._ce_tokenizer(
-            premise, hypothesis,
-            return_tensors="pt", truncation=True, max_length=512, padding=True
-        )
-        with torch.no_grad():
-            logits = self._ce_model(**inputs).logits
-        # BAAI reranker outputs a single relevance score (not NLI labels)
-        # High score = premise supports hypothesis, low = contradicts
-        score = torch.sigmoid(logits[0, 0]).item()
-        # Map relevance score to NLI-like probabilities
-        if score >= 0.7:
-            return {"entailment": score, "contradiction": 1.0 - score, "neutral": 0.1}
-        elif score <= 0.3:
-            return {"entailment": score, "contradiction": 1.0 - score, "neutral": 0.1}
-        else:
-            return {"entailment": score, "contradiction": 1.0 - score, "neutral": 0.5}
 
     def check_claim_cross(
         self,
@@ -200,24 +163,14 @@ class NLIChecker:
             # Build pairs for batch prediction
             pairs = [(sent, claim) for sent in sentences[:10]]  # cap at 10 sentences
             try:
-                # V13: Support both BAAI reranker and original cross-encoder
-                if getattr(self, '_ce_is_baai', False):
-                    # BAAI path: process pairs individually
-                    best_ent = 0.0
-                    best_con = 0.0
-                    for sent, hyp in pairs:
-                        r = self._baai_cross_nli(sent, hyp)
-                        best_ent = max(best_ent, r["entailment"])
-                        best_con = max(best_con, r["contradiction"])
-                else:
-                    scores = self._cross_encoder.predict(pairs, apply_softmax=True)
-                    labels = ["contradiction", "entailment", "neutral"]
-                    best_ent = 0.0
-                    best_con = 0.0
-                    for score_row in scores:
-                        result = dict(zip(labels, score_row.tolist()))
-                        best_ent = max(best_ent, result["entailment"])
-                        best_con = max(best_con, result["contradiction"])
+                scores = self._cross_encoder.predict(pairs, apply_softmax=True)
+                labels = ["contradiction", "entailment", "neutral"]
+                best_ent = 0.0
+                best_con = 0.0
+                for score_row in scores:
+                    result = dict(zip(labels, score_row.tolist()))
+                    best_ent = max(best_ent, result["entailment"])
+                    best_con = max(best_con, result["contradiction"])
 
                 ce_pairs.append({
                     "source": source.get("title", source.get("source", "")),
@@ -449,15 +402,16 @@ class NLIChecker:
                         (k for k in self.LABELS),
                         key=lambda k: sr.get(k, -1)
                     )
-            # C4: Survey/misconception — boost contradiction score instead of filtering
-            for i, sr in enumerate(sentence_results):
-                if self._is_survey_or_misconception(sentences[i]):
-                    sr["contradiction"] = round(sr["contradiction"] * 1.3, 4)
-                    # Recalculate label after boost
-                    sr["label"] = max(
-                        (k for k in self.LABELS),
-                        key=lambda k: sr.get(k, -1)
-                    )
+            # V17: Skip survey/misconception sentences entirely (they confuse NLI)
+            sentence_results = [
+                sr for i, sr in enumerate(sentence_results)
+                if not self._is_survey_or_misconception(sentences[i])
+            ]
+            # Also filter the sentences list to keep indices aligned
+            sentences = [
+                s for s in sentences
+                if not self._is_survey_or_misconception(s)
+            ]
 
             # V11: Correction-pattern boost — "на самом деле" etc. → boost contradiction
             for i, sr in enumerate(sentence_results):
@@ -470,17 +424,13 @@ class NLIChecker:
 
             all_sentence_scores.extend(sentence_results)
 
-            # Source-level aggregation: A2 — top-k mean instead of max
+            # V17: Source-level aggregation — MAX single best sentence, no margin guard
             if sentence_results:
                 ent_scores = sorted([r["entailment"] for r in sentence_results], reverse=True)
                 con_scores = sorted([r["contradiction"] for r in sentence_results], reverse=True)
-                # Top-2 mean (more robust than single max)
-                best_ent = sum(ent_scores[:2]) / min(2, len(ent_scores))
-                best_con = sum(con_scores[:2]) / min(2, len(con_scores))
-                # A2: Margin-based label — if difference < 0.15, label neutral
-                if abs(best_ent - best_con) < 0.15:
-                    best_label = "neutral"
-                elif best_ent > best_con:
+                best_ent = ent_scores[0]  # single best sentence
+                best_con = con_scores[0]
+                if best_ent > best_con:
                     best_label = "entailment"
                 else:
                     best_label = "contradiction"
@@ -505,13 +455,25 @@ class NLIChecker:
                 "nli_score": 50,
             }
 
-        ent_count = sum(1 for p in source_level_results if p["label"] == "entailment")
-        con_count = sum(1 for p in source_level_results if p["label"] == "contradiction")
-        neu_count = sum(1 for p in source_level_results if p["label"] == "neutral")
+        # V18: Purity-weighted aggregation — filter out "confused" sources
+        # that give both high ent and high con (noise from mixed-content snippets).
+        # purity = |best_ent - best_con|: low purity → source is ambiguous, exclude it.
+        sorted_by_purity = sorted(source_level_results, key=lambda x: x["purity"], reverse=True)
+        n_keep = max(1, len(sorted_by_purity) // 2)  # top 50% most decisive sources
+        decisive = sorted_by_purity[:n_keep]
 
-        # Max across ALL sentence×source pairs
-        max_ent = max(s["entailment"] for s in all_sentence_scores) if all_sentence_scores else 0.0
-        max_con = max(s["contradiction"] for s in all_sentence_scores) if all_sentence_scores else 0.0
+        max_ent = max(s["entailment"] for s in decisive)
+        max_con = max(s["contradiction"] for s in decisive)
+
+        ent_count = sum(1 for p in decisive if p["label"] == "entailment")
+        con_count = sum(1 for p in decisive if p["label"] == "contradiction")
+        neu_count = sum(1 for p in decisive if p["label"] == "neutral")
+
+        # V18: Contested topic detection — sources genuinely divided on the claim.
+        # Fires when BOTH ent and con signals are significant after purity filtering.
+        # Distinguishes contested scientific claims (мобильники: ent=0.63, con=0.93)
+        # from clear myths (сахар: ent=0.11 — almost no support) and synonym issues.
+        is_contested = max_ent >= 0.40 and max_con >= 0.40
 
         # Aggregated NLI score: 0-100
         if ent_count > 0 and con_count == 0:
@@ -532,6 +494,7 @@ class NLIChecker:
             "neutral_count": neu_count,
             "max_entailment": round(max_ent, 4),
             "max_contradiction": round(max_con, 4),
+            "is_contested": is_contested,
             "summary": f"{ent_count} подтверждают, {con_count} опровергают, {neu_count} нейтральны",
             "nli_score": nli_score,
         }
