@@ -75,6 +75,14 @@ SCAM_PATTERNS = [
     'digital bonds',
     # --- Фальшивые платформы ---
     'зарегистрируйтесь на платформе', 'регистрация на платформе',
+    # V18: Government impersonation & link/data scams
+    'перейти по ссылке', 'перейдите по ссылке', 'перейдёт по ссылке',
+    'ввести данные карты', 'введите данные карты', 'данные карты',
+    'до конца месяца', 'до конца недели',
+    'зарегистрироваться на сайте', 'зарегистрируйтесь на сайте',
+    'зарегистрируется на сайте',
+    'на специальном сайте',
+    'программа выплат', 'программе выплат',
 ]
 
 # Compiled regex-паттерны для сложных скам-формул
@@ -186,6 +194,8 @@ SCAM_CONCEPT_STEMS = {
         "кошел",  # кошелёк/ька
         "привя",  # привязка/ать
         "регис",  # регистрация/руйтесь
+        "зарег",  # V18: зарегистрироваться/уется (prefix за-)
+        "ссылк",  # V18: по ссылке
     },
     "LURE": {
         "выпла",  # выплата/ы/у
@@ -201,6 +211,7 @@ SCAM_CONCEPT_STEMS = {
         "срочн",  # срочно/ая
         "огран",  # ограничено/ный
         "успей",  # успейте
+        "конца",  # V18: до конца месяца/недели/дня
     },
     "AUTHORITY_ABUSE": {
         "сотру",  # сотрудники (банка)
@@ -420,8 +431,14 @@ def extract_numbers(text: str) -> List[Dict[str, Any]]:
         start = max(0, m.start() - 25)
         end = min(len(text), m.end() + 25)
         ctx = text[start:end].strip()
-        # Пропускаем годы — они обрабатываются в extract_dates
+        # V17: Tag year-range numbers explicitly as "year" type
         if re.search(r'(?:19|20)\d{2}', m.group(1)) and len(m.group(1)) == 4:
+            val_year = float(m.group(1))
+            if 1800 <= val_year <= 2100:
+                results.append({
+                    "value": val_year, "raw": m.group(0), "type": "year",
+                    "context": ctx,
+                })
             continue
         if not any(m.group(0) in r["raw"] or r["raw"] in m.group(0) for r in results):
             results.append({
@@ -605,6 +622,7 @@ def classify_claim(claim: str) -> Dict[str, Any]:
         "has_dates": has_dates,
         "verification_hints": hints,
         "is_scam": scam_info["is_scam"],
+        "scam_patterns": scam_info.get("patterns_found", []),
         "locations": locations,
     }
 
@@ -649,12 +667,8 @@ def compare_numbers(claim_numbers: List[Dict], source_numbers: List[Dict],
                 "deviation": round(best_deviation, 4),
             })
         else:
-            comparisons.append({
-                "claim_number": cn,
-                "source_number": None,
-                "match": False,
-                "deviation": None,
-            })
+            # V17: No comparable data of same type — skip, not a mismatch
+            continue
 
     return comparisons
 

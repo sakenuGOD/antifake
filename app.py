@@ -1,348 +1,375 @@
 """
-Streamlit веб-интерфейс для Fact-Checker.
-
-Дизайн соответствует Рисунку 4 документации (Раздел 2.5 / 3.4).
+Система определения достоверности новостей на основе нейросети.
+Веб-интерфейс с прозрачным отображением работы пайплайна.
 """
 
 import os
+import time
 import streamlit as st
 
 st.set_page_config(
-    page_title="Fact-Checker — Проверка достоверности",
+    page_title="Проверка достоверности новостей",
     page_icon="🔍",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# --- Тёмная тема (CSS) ---
+# ── Минимальный CSS ──
 st.markdown("""
 <style>
-    .main-header { font-size: 28px; font-weight: bold; margin-bottom: 5px; }
-    .sub-header { color: #888; font-size: 14px; margin-bottom: 20px; }
-    .status-bar {
-        background: #1a3a1a; border: 1px solid #2d5a2d; border-radius: 8px;
-        padding: 12px 16px; margin: 15px 0; color: #4caf50; font-size: 14px;
-    }
-    .metric-container {
-        display: flex; justify-content: space-between; align-items: center;
-        margin: 15px 0; gap: 20px;
-    }
-    .metric-box { text-align: center; flex: 1; }
-    .metric-label { color: #888; font-size: 12px; margin-bottom: 4px; }
-    .metric-value { font-size: 28px; font-weight: bold; }
-    .metric-delta { font-size: 12px; }
-    .verdict-badge {
-        display: inline-block; padding: 6px 18px; border-radius: 6px;
-        font-size: 14px; font-weight: bold; margin: 5px 0;
-    }
-    .verdict-false { background: #dc3545; color: #fff; }
-    .verdict-true { background: #28a745; color: #fff; }
-    .verdict-partial { background: #ffc107; color: #333; }
-    .reasoning-box {
-        background: #2a1a1a; border: 1px solid #5a2d2d; border-radius: 8px;
-        padding: 16px; margin: 15px 0; line-height: 1.6;
-    }
-    .reasoning-title {
-        color: #ff6b6b; font-weight: bold; font-size: 14px;
-        margin-bottom: 10px; text-transform: uppercase;
-    }
-    .critique-box {
-        background: #1a2a1a; border: 1px solid #2d5a2d; border-radius: 8px;
-        padding: 16px; margin: 15px 0; line-height: 1.6;
-    }
-    .critique-title {
-        color: #4caf50; font-weight: bold; font-size: 14px;
-        margin-bottom: 10px; text-transform: uppercase;
-    }
-    .source-item {
-        padding: 8px 0; border-bottom: 1px solid #333;
-    }
-    .source-link { color: #4caf50; text-decoration: none; }
-    .tech-params { color: #888; font-size: 13px; line-height: 1.8; }
+.block-container { padding-top: 1.2rem; max-width: 1000px; }
 
-    /* Карточки фактов */
-    .fact-card {
-        border-radius: 8px; padding: 14px 16px; margin: 10px 0;
-        border-left: 5px solid; background: #1e1e2e;
-    }
-    .fact-card-true  { border-left-color: #28a745; background: #0d2617; }
-    .fact-card-false { border-left-color: #dc3545; background: #2a0d0d; }
-    .fact-card-unknown { border-left-color: #ffc107; background: #2a2100; }
-    .fact-card-header {
-        display: flex; justify-content: space-between;
-        align-items: flex-start; gap: 12px;
-    }
-    .fact-claim-text { font-size: 15px; line-height: 1.5; flex: 1; }
-    .fact-status-badge {
-        padding: 4px 12px; border-radius: 4px; font-size: 12px;
-        font-weight: bold; white-space: nowrap;
-    }
-    .fact-citation {
-        color: #bbb; font-size: 13px; margin-top: 10px;
-        border-top: 1px solid #333; padding-top: 8px; font-style: italic;
-    }
-    .fact-source { color: #777; font-size: 12px; margin-top: 3px; }
+.verdict-big {
+    text-align: center; padding: 20px; margin: 16px 0;
+    border-radius: 12px; border: 2px solid;
+}
+.verdict-big .label { font-size: 1.5rem; font-weight: 700; letter-spacing: 2px; }
+.vb-true  { border-color: #22c55e; background: rgba(34,197,94,0.06); }
+.vb-true .label { color: #22c55e; }
+.vb-false { border-color: #ef4444; background: rgba(239,68,68,0.06); }
+.vb-false .label { color: #ef4444; }
+.vb-scam { border-color: #f97316; background: rgba(249,115,22,0.08); }
+.vb-scam .label { color: #f97316; }
+.vb-unsure { border-color: #eab308; background: rgba(234,179,8,0.06); }
+.vb-unsure .label { color: #eab308; }
+.vb-composite { border-color: #a855f7; background: rgba(168,85,247,0.06); }
+.vb-composite .label { color: #a855f7; }
 
-    /* Чипы источников */
-    .sources-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
-    .source-chip {
-        display: inline-flex; align-items: center; gap: 5px;
-        background: #1e2a1e; border: 1px solid #2d5a2d;
-        border-radius: 20px; padding: 6px 14px;
-        font-size: 13px; color: #4caf50; text-decoration: none;
-        transition: background 0.15s;
-    }
-    .source-chip:hover { background: #263d26; color: #6fcf70; }
-    .source-chip-plain {
-        display: inline-flex; align-items: center; gap: 5px;
-        background: #222; border: 1px solid #444;
-        border-radius: 20px; padding: 6px 14px;
-        font-size: 13px; color: #888;
-    }
+.signal-pos { color: #22c55e; font-weight: 600; }
+.signal-neg { color: #ef4444; font-weight: 600; }
+.signal-zero { color: #6b7280; }
+
+.src-chip {
+    display: inline-block; padding: 4px 12px; margin: 3px;
+    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 16px; font-size: 12px; color: #93c5fd;
+    text-decoration: none;
+}
+.src-chip:hover { background: rgba(255,255,255,0.08); color: #bfdbfe; }
 </style>
 """, unsafe_allow_html=True)
 
 
+# ── Загрузка пайплайна ──
 @st.cache_resource
 def load_pipeline():
-    """Загрузка пайплайна один раз при старте приложения."""
     from pipeline import FactCheckPipeline
     from config import SearchConfig
     from model import find_best_adapter
 
-    api_key = os.environ.get("SERPAPI_API_KEY", "")
-    search_config = SearchConfig(api_key=api_key)
-
-    # Автовыбор: GRPO > SFT > base
+    search_config = SearchConfig(api_key=os.environ.get("SERPAPI_API_KEY", ""))
     adapter_path = find_best_adapter()
+    return FactCheckPipeline(adapter_path=adapter_path, search_config=search_config)
 
-    return FactCheckPipeline(
-        adapter_path=adapter_path,
-        search_config=search_config,
+
+def _signal_str(val: int) -> str:
+    if val > 0:
+        return '<span class="signal-pos">+1 подтверждает</span>'
+    elif val < 0:
+        return '<span class="signal-neg">−1 противоречит</span>'
+    return '<span class="signal-zero">0 нет данных</span>'
+
+
+# ── Sidebar ──
+with st.sidebar:
+    st.markdown("### Архитектура пайплайна")
+    st.markdown("""
+1. **Парсинг** — тип, числа, даты, скам
+2. **Декомпозиция** — разбивка составных
+3. **Ключевые слова** — NER + pymorphy2
+4. **Поиск** — Wikipedia + DuckDuckGo
+5. **Wikidata** — SPARQL (20+ свойств)
+6. **NLI** — RuBERT + mDeBERTa
+7. **Числовой анализ** — сравнение чисел
+8. **Решение** — Gap-based приоритеты
+9. **Агрегация** — для составных
+10. **Объяснение** — LLM генерация
+    """)
+    st.markdown("---")
+    st.markdown("##### Технологии")
+    st.markdown(
+        "Mistral 7B · QLoRA 4-bit · GRPO · "
+        "RuBERT NLI · mDeBERTa · Cross-Encoder · "
+        "Wikidata · Natasha NER · pymorphy2 · "
+        "LangChain · DuckDuckGo · Wikipedia"
     )
+    st.markdown("---")
+    st.caption("GPU: RTX 5070 12GB · NLI: CPU")
+    st.caption("Конференция «Инженеры будущего» 2026")
 
 
+# ══════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════
 def main():
-    st.markdown('<div class="main-header">Система определения достоверности новостей</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Mistral 7B + RAG-Pipeline | LangChain | SerpAPI + DuckDuckGo</div>', unsafe_allow_html=True)
+    st.markdown("## Система определения достоверности новостей")
+    st.caption("Нейросетевой анализ с верификацией через открытые источники")
 
-    # Проверка API ключа (не обязательно — есть DuckDuckGo fallback)
-    api_key = os.environ.get("SERPAPI_API_KEY", "")
-    if not api_key:
-        st.warning(
-            "SERPAPI_API_KEY не установлен — поиск через DuckDuckGo. "
-            "Для лучших результатов установите: `export SERPAPI_API_KEY='ваш_ключ'`"
-        )
-
-    # Загрузка пайплайна
-    with st.spinner("Загрузка модели Mistral 7B + семантический ранкер..."):
+    with st.spinner("Загрузка моделей..."):
         pipeline = load_pipeline()
 
     if pipeline is None:
         st.error("Не удалось загрузить пайплайн.")
         st.stop()
 
-    # --- Область ввода (Раздел 2.5, п.1) ---
-    st.markdown("#### Исходный текст для анализа")
+    # ── Ввод ──
     claim = st.text_area(
-        label="Исходный текст",
+        "Введите утверждение для проверки:",
         height=80,
-        placeholder="Например: ЦБ РФ экстренно поднял ключевую ставку до 25% сегодня утром",
-        label_visibility="collapsed",
+        placeholder="Например: Менделеев изобрёл водку",
     )
 
-    check_btn = st.button("Проверить достоверность", type="primary", use_container_width=True)
+    check_btn = st.button("Проверить", type="primary", use_container_width=True)
 
-    # --- Результаты ---
-    if check_btn and claim.strip():
+    if not (check_btn and claim.strip()):
+        if check_btn:
+            st.warning("Введите текст.")
+        return
 
-        # Панель индикации статуса (Раздел 2.5, п.2)
-        with st.status("Выполняется анализ...", expanded=True) as status:
-            st.write("Этап 1: Извлечение ключевых слов (Агент-Исследователь)...")
-            st.write("Этап 2: Поиск новостей через SerpAPI (Модуль извлечения)...")
-            st.write("Этап 3: Ранжирование источников (Cosine Similarity)...")
-            st.write("Этап 4: Оценка достоверности (Mistral 7B QLoRA)...")
+    st.markdown("---")
 
-            result = pipeline.check(claim.strip())
+    # ── Placeholder для результата СВЕРХУ ──
+    result_slot = st.empty()
 
-            status.update(
-                label="Анализ завершен на основе актуальных данных поисковой выдачи",
-                state="complete",
-            )
+    # ── Ход анализа НИЖЕ ──
+    st.markdown("### Ход анализа")
+    log = st.container()
+    stages_data = {}
 
-        # --- Область результатов (Раздел 2.5, п.3) ---
-        score = result["credibility_score"]
-        confidence = result["confidence"]
-        verdict = result["verdict"]
-        latency = result["total_time"]
+    def on_progress(stage: str, data: dict):
+        stages_data[stage] = data
 
-        # Определение цвета и статуса
-        v_upper = verdict.upper().strip()
-        if v_upper in ("ЛОЖЬ", "FALSE", "ФЕЙК"):
-            score_color = "#dc3545"
-            delta_prefix = "↓"
-            verdict_class = "verdict-false"
-            verdict_label = "ЛОЖЬ / ФЕЙК"
-        elif "МАНИПУЛЯЦИЯ" in v_upper or "ПОЛУПРАВДА" in v_upper:
-            score_color = "#fd7e14"
-            delta_prefix = "⚠"
-            verdict_class = "verdict-partial"
-            verdict_label = "МАНИПУЛЯЦИЯ / ПОЛУПРАВДА"
-        elif v_upper in ("ПРАВДА", "TRUE"):
-            score_color = "#28a745"
-            delta_prefix = "↑"
-            verdict_class = "verdict-true"
-            verdict_label = "ПРАВДА / TRUE"
-        else:
-            score_color = "#ffc107"
-            delta_prefix = "~"
-            verdict_class = "verdict-partial"
-            verdict_label = "НЕ ПОДТВЕРЖДЕНО / UNVERIFIED"
+        with log:
+            if stage == "cache":
+                st.info(f"Результат из кэша: **{data.get('verdict')}** ({data.get('credibility_score')}%)")
 
-        # Метрики: Достоверность | Статус | Уверенность ИИ
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown(f"""
-            <div class="metric-box">
-                <div class="metric-label">Достоверность</div>
-                <div class="metric-value">{score}%</div>
-                <div class="metric-delta" style="color: {score_color};">{delta_prefix} {100 - score}%</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with col2:
-            st.markdown(f"""
-            <div class="metric-box">
-                <div class="metric-label">Статус:</div>
-                <div><span class="verdict-badge {verdict_class}">{verdict_label}</span></div>
-            </div>
-            """, unsafe_allow_html=True)
-        with col3:
-            st.markdown(f"""
-            <div class="metric-box">
-                <div class="metric-label">Уверенность ИИ:</div>
-                <div class="metric-value">{confidence}%</div>
-            </div>
-            """, unsafe_allow_html=True)
+            elif stage == "parse":
+                with st.expander("📋 Этап 1: Парсинг", expanded=True):
+                    ctype = data.get("type", "?")
+                    nums = data.get("numbers", [])
+                    dates = data.get("dates", [])
+                    scam = data.get("is_scam", False)
+                    st.markdown(f"**Тип:** {ctype}")
+                    if nums:
+                        st.markdown(f"**Числа:** {', '.join(str(n.get('original', n.get('value', ''))) for n in nums)}")
+                    if dates:
+                        st.markdown(f"**Даты:** {', '.join(str(d) for d in dates)}")
+                    if scam:
+                        patterns = data.get("scam_patterns", [])
+                        st.error(f"Скам-паттерны: {', '.join(patterns) if patterns else 'да'}")
+                    elif not nums and not dates:
+                        st.markdown("Числа/даты: нет · Скам: нет")
 
-        # Карточки фактов (аудиторский шаблон — составные утверждения)
+            elif stage == "decompose":
+                subs = data.get("sub_claims", [])
+                comp = data.get("is_composite", False)
+                title = f"✂️ Этап 2: Декомпозиция — {'составное (' + str(len(subs)) + ' частей)' if comp else 'единичное'}"
+                with st.expander(title, expanded=comp):
+                    if comp:
+                        for i, sc in enumerate(subs, 1):
+                            st.markdown(f"{i}. {sc}")
+                    else:
+                        st.markdown("Декомпозиция не требуется.")
+
+            elif stage == "keywords":
+                kws = data.get("keywords", [])
+                with st.expander(f"🔑 Этап 3: Ключевые слова — {len(kws)} шт.", expanded=True):
+                    st.code(", ".join(kws), language=None)
+
+            elif stage == "search":
+                n = data.get("num_sources", 0)
+                srcs = data.get("sources", [])
+                with st.expander(f"🔍 Этап 4: Поиск — найдено {n} источников", expanded=True):
+                    if srcs:
+                        chips = ""
+                        for s in srcs:
+                            link = s.get("link", "")
+                            name = s.get("source", "") or s.get("title", "?")
+                            name = name[:40] + "…" if len(name) > 40 else name
+                            if link:
+                                chips += f'<a href="{link}" target="_blank" class="src-chip">{name}</a> '
+                            else:
+                                chips += f'<span class="src-chip">{name}</span> '
+                        st.markdown(chips, unsafe_allow_html=True)
+                    else:
+                        st.markdown("Источники не найдены.")
+
+            elif stage == "wikidata":
+                sig = data.get("signal", 0)
+                facts = data.get("facts", [])
+                found = data.get("found", False)
+                sc = data.get("claim", "")
+                label = f"📊 Wikidata — сигнал: {'+1' if sig > 0 else '−1' if sig < 0 else '0'}"
+                if sc and stages_data.get("decompose", {}).get("is_composite"):
+                    label += f" [{sc[:40]}]"
+                with st.expander(label, expanded=(sig != 0)):
+                    if found and facts:
+                        for f in facts:
+                            prop = f.get("property", "?")
+                            vals = ", ".join(f.get("values", []))
+                            match = f.get("match")
+                            if match is True:
+                                st.markdown(f"✅ **{prop}**: {vals}")
+                            elif match is False:
+                                st.markdown(f"❌ **{prop}**: {vals}")
+                            else:
+                                st.markdown(f"— **{prop}**: {vals}")
+                    else:
+                        st.markdown("Факты не найдены в Wikidata.")
+                    st.markdown(f"Сигнал: {_signal_str(sig)}", unsafe_allow_html=True)
+
+            elif stage == "nli":
+                sig = data.get("signal", 0)
+                ent = data.get("ent", 0)
+                con = data.get("con", 0)
+                gap = data.get("gap", 0)
+                sc = data.get("claim", "")
+                label = f"🧬 NLI — ent={ent:.2f} con={con:.2f} gap={gap:+.2f}"
+                if sc and stages_data.get("decompose", {}).get("is_composite"):
+                    label += f" [{sc[:40]}]"
+                with st.expander(label, expanded=True):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Entailment", f"{ent:.3f}")
+                    c2.metric("Contradiction", f"{con:.3f}")
+                    c3.metric("Gap (ent−con)", f"{gap:+.3f}")
+                    if abs(gap) < 0.12:
+                        st.markdown("Зона: **неоднозначная** (|gap| < 0.12)")
+                    elif abs(gap) < 0.30:
+                        st.markdown(f"Зона: **умеренная** ({'подтверждение' if gap > 0 else 'противоречие'})")
+                    else:
+                        st.markdown(f"Зона: **сильная** ({'подтверждение' if gap > 0 else 'противоречие'})")
+                    st.markdown(f"Сигнал: {_signal_str(sig)}", unsafe_allow_html=True)
+
+            elif stage == "numbers":
+                sig = data.get("signal", 0)
+                claim_nums = data.get("claim_numbers", [])
+                comparisons = data.get("comparisons", [])
+                if claim_nums or sig != 0:
+                    with st.expander(f"🔢 Числа — сигнал: {'+1' if sig > 0 else '−1' if sig < 0 else '0'}", expanded=(sig != 0)):
+                        if claim_nums:
+                            st.markdown(f"Числа в утверждении: **{', '.join(claim_nums)}**")
+                        if comparisons:
+                            for c in comparisons:
+                                mark = "✅" if c["match"] else "❌"
+                                st.markdown(f"{mark} утверждение: {c['claim']} → источник: {c['source']}")
+                        st.markdown(f"Сигнал: {_signal_str(sig)}", unsafe_allow_html=True)
+
+            elif stage == "debunk":
+                count = data.get("count", 0)
+                if count > 0:
+                    with st.expander(f"🔎 Debunk-источники: {count}", expanded=True):
+                        st.markdown(f"Найдено **{count}** источников, разоблачающих утверждение.")
+
+            elif stage == "llm_knowledge":
+                sig = data.get("signal", 0)
+                if sig != 0:
+                    with st.expander(f"🤖 LLM-знания — сигнал: {'+1' if sig > 0 else '−1'}", expanded=True):
+                        if sig > 0:
+                            st.markdown("Модель считает утверждение **правдивым**.")
+                        else:
+                            st.markdown("Модель считает утверждение **ложным**.")
+
+            elif stage == "decide":
+                v = data.get("verdict", "?")
+                conf = data.get("confidence", 0)
+                sc = data.get("claim", "")
+                label = f"⚖️ Решение: {v} ({conf}%)"
+                if sc and stages_data.get("decompose", {}).get("is_composite"):
+                    label += f" [{sc[:40]}]"
+                with st.expander(label, expanded=True):
+                    signals = []
+                    if data.get("scam"):
+                        signals.append("TIER 0: скам")
+                    if data.get("wd") != 0:
+                        signals.append(f"TIER 1: Wikidata={'+1' if data['wd'] > 0 else '−1'}")
+                    if data.get("num") != 0:
+                        signals.append(f"TIER 2: числа={'+1' if data['num'] > 0 else '−1'}")
+                    if data.get("debunk", 0) > 0:
+                        signals.append(f"TIER 3: debunk×{data['debunk']}")
+                    if data.get("nli") != 0:
+                        signals.append(f"TIER 4: NLI={'+1' if data['nli'] > 0 else '−1'}")
+                    if data.get("llm") != 0:
+                        signals.append(f"TIER 5: LLM={'+1' if data['llm'] > 0 else '−1'}")
+                    if not signals:
+                        signals.append("TIER 6: нет сигналов")
+                    st.markdown("**Путь решения:** " + " → ".join(signals))
+                    st.markdown(f"**Вердикт: {v}** (уверенность {conf}%)")
+
+            elif stage == "aggregate":
+                if data.get("is_composite"):
+                    v = data.get("verdict", "?")
+                    subs = data.get("sub_verdicts", [])
+                    with st.expander(f"📦 Агрегация: {v}", expanded=True):
+                        for sr in subs:
+                            icon = "✅" if sr["verdict"] == "ПРАВДА" else "❌" if sr["verdict"] == "ЛОЖЬ" else "⚠️"
+                            st.markdown(f"{icon} **{sr['verdict']}** — {sr['claim']}")
+                        st.markdown(f"**Итого: {v}**")
+
+            elif stage == "explain_start":
+                st.markdown("💬 *Генерация обоснования...*")
+
+    # ── Запуск пайплайна ──
+    result = pipeline.check(claim.strip(), progress_callback=on_progress)
+
+    # ══════════════════════════════════════════════════════════
+    #  РЕЗУЛЬТАТ — вставляется в placeholder СВЕРХУ
+    # ══════════════════════════════════════════════════════════
+    verdict = result["verdict"].upper().strip()
+    score = result["credibility_score"]
+    confidence = result["confidence"]
+    is_composite = result.get("_composite", False) or verdict == "СОСТАВНОЕ"
+
+    if verdict == "СКАМ":
+        vc, vlabel = "scam", "⚠️ СКАМ / МОШЕННИЧЕСТВО"
+    elif is_composite:
+        vc, vlabel = "composite", "СОСТАВНОЕ"
+    elif verdict in ("ЛОЖЬ", "FALSE", "ФЕЙК"):
+        vc, vlabel = "false", "ЛОЖЬ"
+    elif verdict in ("ПРАВДА", "TRUE"):
+        vc, vlabel = "true", "ПРАВДА"
+    else:
+        vc, vlabel = "unsure", "НЕ УВЕРЕНА"
+
+    with result_slot.container():
+        # Вердикт
+        st.markdown(f"""
+        <div class="verdict-big vb-{vc}">
+            <div class="label">{vlabel}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Метрики
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Достоверность", f"{score}%")
+        c2.metric("Уверенность ИИ", f"{confidence}%")
+        c3.metric("Время анализа", f"{result['total_time']:.1f} сек")
+
+        # Подвердикты (для составных)
         sub_verdicts = result.get("sub_verdicts", [])
         if sub_verdicts:
-            st.markdown("#### Анализ по пунктам:")
             for sv in sub_verdicts:
-                status = sv.get("status", "НЕТ ДАННЫХ").upper()
-                if status == "ПРАВДА":
-                    card_class = "fact-card-true"
-                    badge_bg = "#28a745"
-                    badge_color = "#fff"
-                    icon = "✅"
-                elif status == "ЛОЖЬ":
-                    card_class = "fact-card-false"
-                    badge_bg = "#dc3545"
-                    badge_color = "#fff"
-                    icon = "❌"
-                else:
-                    card_class = "fact-card-unknown"
-                    badge_bg = "#ffc107"
-                    badge_color = "#333"
-                    icon = "⚠️"
+                s = sv.get("status", "?").upper()
+                icon = "✅" if s == "ПРАВДА" else "❌" if s == "ЛОЖЬ" else "⚠️"
+                st.markdown(f"{icon} **{s}** — {sv['claim']}")
 
-                citation_html = ""
-                if sv.get("citation"):
-                    citation_html = (
-                        f'<div class="fact-citation">«{sv["citation"]}»</div>'
-                    )
-                    if sv.get("source"):
-                        citation_html += (
-                            f'<div class="fact-source">— {sv["source"]}</div>'
-                        )
-
-                st.markdown(f"""
-                <div class="fact-card {card_class}">
-                    <div class="fact-card-header">
-                        <div class="fact-claim-text">{sv['claim']}</div>
-                        <span class="fact-status-badge"
-                              style="background:{badge_bg};color:{badge_color};">
-                            {icon} {status}
-                        </span>
-                    </div>
-                    {citation_html}
-                </div>
-                """, unsafe_allow_html=True)
-
-        # Экспертное обоснование — только если не пустое
+        # Обоснование
         reasoning = result.get("reasoning", "").strip()
         if reasoning:
-            st.markdown(f"""
-            <div class="reasoning-box">
-                <div class="reasoning-title">Экспертное обоснование:</div>
-                <div>{reasoning}</div>
-            </div>
-            """, unsafe_allow_html=True)
+            st.markdown(f"**Обоснование:** {reasoning}")
 
-        # Chain-of-Thought (если GRPO модель)
-        cot = result.get("chain_of_thought", "")
-        if cot:
-            with st.expander("Цепочка рассуждений (Chain-of-Thought)", expanded=False):
-                st.markdown(cot.replace("\n", "  \n"))
-
-        # Self-critique (если есть)
-        critique_errors = result.get("self_critique_errors", "")
-        if critique_errors and critique_errors.lower() != "нет":
-            st.markdown(f"""
-            <div class="critique-box">
-                <div class="critique-title">Самопроверка (Self-Critique):</div>
-                <div>{critique_errors}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        elif critique_errors:
-            st.markdown(f"""
-            <div class="critique-box">
-                <div class="critique-title">Самопроверка (Self-Critique):</div>
-                <div>Ошибок не обнаружено — вердикт подтверждён.</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        # Первоисточники — чипы
-        st.markdown("#### Первоисточники:")
-        if result["sources"]:
-            chips_html = '<div class="sources-chips">'
-            for src in result["sources"]:
-                link = src.get("link", "")
-                source_name = src.get("source", "") or src.get("title", "Источник")
-                # Обрезаем слишком длинные названия
-                display_name = source_name[:40] + "…" if len(source_name) > 40 else source_name
+        # Источники
+        sources = result.get("sources", [])
+        if sources:
+            chips = ""
+            for s in sources[:10]:
+                link = s.get("link", "")
+                name = s.get("source", "") or s.get("title", "?")
+                name = name[:45] + "…" if len(name) > 45 else name
                 if link:
-                    chips_html += (
-                        f'<a href="{link}" target="_blank" class="source-chip">'
-                        f'🌐 {display_name}</a>'
-                    )
+                    chips += f'<a href="{link}" target="_blank" class="src-chip">🌐 {name}</a> '
                 else:
-                    chips_html += (
-                        f'<span class="source-chip-plain">📄 {display_name}</span>'
-                    )
-            chips_html += '</div>'
-            st.markdown(chips_html, unsafe_allow_html=True)
-        else:
-            st.info("Подтверждающие источники не найдены.")
-
-        # Технические параметры анализа (как на Рисунке 4)
-        with st.expander("Технические параметры анализа", expanded=False):
-            st.markdown(f"""
-            <div class="tech-params">
-            • <b>Модель:</b> Mistral-7B-Instruct (v0.3)<br>
-            • <b>Метод оптимизации:</b> QLoRA 4-bit NF4<br>
-            • <b>Инфраструктура:</b> LangChain Agentic RAG Pipeline<br>
-            • <b>Задержка (Latency):</b> {latency} сек<br>
-            • <b>Источники:</b> SerpAPI Google Index + DuckDuckGo (fallback)<br>
-            • <b>Ключевые слова:</b> {', '.join(result['keywords'])}
-            </div>
-            """, unsafe_allow_html=True)
-
-            st.text_area("Сырой ответ модели", result["raw_verdict"], height=150, disabled=True)
-            if result.get("self_critique"):
-                st.text_area("Сырой self-critique", result["self_critique"], height=100, disabled=True)
-
-    elif check_btn:
-        st.warning("Введите текст для проверки.")
+                    chips += f'<span class="src-chip">📄 {name}</span> '
+            st.markdown(chips, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

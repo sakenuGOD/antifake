@@ -71,6 +71,18 @@ class SearchConfig:
 
 
 @dataclass
+class DecisionThresholds:
+    """Configurable thresholds for _decide() verdict logic.
+
+    All NLI thresholds are gap-based: gap = entailment - contradiction.
+    Positive gap = sources support claim, negative = sources contradict.
+    """
+    strong_gap: float = 0.30       # NLI gap for high-confidence verdict
+    moderate_gap: float = 0.12     # NLI gap for moderate verdict
+    num_nli_override: float = 0.25 # NLI con-ent gap to override NUM=+1
+
+
+@dataclass
 class PipelineConfig:
     keyword_max_new_tokens: int = 128
     verdict_max_new_tokens: int = 1500  # увеличено для Chain-of-Thought рассуждений
@@ -85,9 +97,4 @@ class PipelineConfig:
     cross_encoder_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     enable_claim_decomposition: bool = True  # Декомпозиция составных утверждений
     translator_model: str = "facebook/nllb-200-distilled-600M"  # NLLB-200 (fallback: MarianMT)
-    enable_adversarial_debate: bool = True  # Адвокат дьявола для mixed NLI
     enable_fact_cache: bool = True  # Redis кэш вердиктов
-    enable_minicheck: bool = True  # MiniCheck-FT5 дополнительная верификация (CPU)
-    enable_self_consistency: bool = True  # Self-consistency: 3 прогона LLM, majority vote
-    self_consistency_n: int = 3  # количество прогонов для self-consistency
-    self_consistency_temperature: float = 0.3  # температура для дополнительных прогонов

@@ -1771,6 +1771,7 @@ class FactCheckSearcher:
             try:
                 raw = _DDGS(timeout=_DDG_TIMEOUT).text(
                     query.strip(),
+                    region="ru-ru",   # V17: Russian region for better results
                     max_results=max_results,
                     backend="html",   # детерминистичный бэкенд
                 )
@@ -2318,6 +2319,17 @@ class FactCheckSearcher:
                 f"  [Counter-search] +{counter_added} результатов "
                 f"контр-доказательств (разоблачения/опровержения)"
             )
+
+        # V17: Demote survey results — they confuse NLI
+        _survey_re = re.compile(
+            r'(?:опрос|верят|считают|думают|убеждены|процент\w*\s+(?:россиян|людей))',
+            re.IGNORECASE)
+        for r in all_results:
+            text = r.get("snippet", "") + " " + r.get("title", "")
+            if _survey_re.search(text):
+                r["_survey"] = True
+        # Sort surveys to end
+        all_results.sort(key=lambda r: r.get("_survey", False))
 
         return all_results
 

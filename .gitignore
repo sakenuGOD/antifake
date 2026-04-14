@@ -16,13 +16,20 @@ unsloth_compiled_cache/
 adapters/**/*.bin
 adapters/**/*.safetensors
 adapters/**/*.pt
+adapters/**/*.pth
 adapters/**/*.msgpack
+adapters/**/*.model
 adapters/_sft_merged_temp/
-adapters/checkpoint-*/
+adapters/**/checkpoint-*/
 
 # Eval logs (generated)
 eval_log*.txt
+training_log.txt
 
 # Markdown files (documentation, reports) — кроме README
 *.md
 !README.md
+
+# Misc
+=9.0
+WORK_PROMPT.txt

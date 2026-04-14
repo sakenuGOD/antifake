@@ -545,6 +545,7 @@ def check_structured_facts(claim: str, entities: List[str],
                 facts.append({
                     "entity": entity,
                     "property": prop_label,
+                    "property_id": prop_id,
                     "wikidata_values": values,
                     "match": match,
                 })

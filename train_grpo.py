@@ -519,7 +519,7 @@ def audit_reward(completions: list, **kwargs) -> list:
     for text in contents:
         reward = 0.0
         # Парсим СТАТУС: из каждого ПУНКТА
-        statuses = re.findall(r"СТАТУС:\s*(ПРАВДА|ЛОЖЬ|НЕТ ДАННЫХ)", text, re.IGNORECASE)
+        statuses = re.findall(r"СТАТУС:\s*(ПРАВДА|ЛОЖЬ|НЕ УВЕРЕНА)", text, re.IGNORECASE)
         ground_truth = kwargs.get("ground_truth", {}).get("sub_verdicts", [])
 
         for i, status in enumerate(statuses):
@@ -528,7 +528,7 @@ def audit_reward(completions: list, **kwargs) -> list:
                 status_upper = status.strip().upper()
                 if expected and status_upper == expected.upper():
                     reward += 0.25  # Правильный статус
-                elif status_upper != "НЕТ ДАННЫХ" and expected.upper() == "НЕТ ДАННЫХ":
+                elif status_upper != "НЕ УВЕРЕНА" and expected.upper() == "НЕ УВЕРЕНА":
                     reward -= 0.1  # Галлюцинация хуже незнания
         rewards.append(reward)
     return rewards

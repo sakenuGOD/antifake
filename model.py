@@ -133,8 +133,15 @@ def build_langchain_llm(
     tokenizer,
     max_new_tokens: int = 512,
     pipeline_config: PipelineConfig = None,
+    stop_strings: list = None,
 ):
-    """Обёртка модели в HuggingFacePipeline для использования в LangChain LCEL."""
+    """Обёртка модели в HuggingFacePipeline для использования в LangChain LCEL.
+
+    Args:
+        stop_strings: Custom stop strings. Default (None) uses keyword-extraction
+            stops: ["</answer>", "ВЕРДИКТ:", "</reasoning>\\n\\nВЕРДИКТ:"].
+            Pass explicit list to override (e.g. ["</answer>"] for explain_llm).
+    """
     if pipeline_config is None:
         pipeline_config = PipelineConfig()
 
@@ -146,9 +153,11 @@ def build_langchain_llm(
         model.generation_config.temperature = None
         model.generation_config.repetition_penalty = pipeline_config.repetition_penalty
         model.generation_config.do_sample = False
-    # V11: StopOnString criteria — stop on </answer> or ВЕРДИКТ: to prevent drift
+
+    if stop_strings is None:
+        stop_strings = ["</answer>", "ВЕРДИКТ:", "</reasoning>\n\nВЕРДИКТ:"]
     stop_criteria = StoppingCriteriaList([
-        StopOnString(tokenizer, ["</answer>", "ВЕРДИКТ:", "</reasoning>\n\nВЕРДИКТ:"])
+        StopOnString(tokenizer, stop_strings)
     ])
 
     pipe = hf_pipeline(

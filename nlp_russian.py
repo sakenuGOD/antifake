@@ -115,6 +115,29 @@ def extract_keywords_lemmatized(text: str) -> List[str]:
     return keywords
 
 
+def is_verb_form(word: str) -> bool:
+    """Check if word is a finite verb or short participle (subject boundary marker).
+
+    Finite verbs: является, содержит, написал, создал
+    Short participles: расположен, основан, окружён
+    """
+    parsed = _morph.parse(word.lower())
+    if parsed:
+        pos = parsed[0].tag.POS
+        return pos in ('VERB', 'PRTS')
+    return False
+
+
+def get_nouns(text: str) -> set:
+    """Extract noun lemmas from text (for topic comparison)."""
+    nouns = set()
+    for word in re.findall(r'[а-яёА-ЯЁ]{3,}', text):
+        parsed = _morph.parse(word.lower())
+        if parsed and parsed[0].tag.POS == 'NOUN':
+            nouns.add(parsed[0].normal_form)
+    return nouns
+
+
 def stems_match(word1: str, word2: str) -> bool:
     """Проверяет совпадение слов через лемматизацию.
 

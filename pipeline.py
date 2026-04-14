@@ -16,7 +16,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
 
-from config import ModelConfig, PipelineConfig, SearchConfig
+from config import ModelConfig, PipelineConfig, SearchConfig, DecisionThresholds
 from prompts import KEYWORD_EXTRACTION_TEMPLATE, EXPLANATION_TEMPLATE, LLM_KNOWLEDGE_TEMPLATE
 from model import load_base_model, load_finetuned_model, build_langchain_llm, is_grpo_adapter
 from search import FactCheckSearcher, boost_factcheck_scores
@@ -32,7 +32,7 @@ try:
     from nlp_russian import (
         extract_entities, extract_entity_names, lemmatize,
         lemmatize_text, extract_keywords_lemmatized, stems_match,
-        words_overlap_lemmatized,
+        words_overlap_lemmatized, is_verb_form, get_nouns,
     )
     _HAS_NATASHA = True
 except ImportError:
@@ -51,6 +51,11 @@ _DEBUNK_RE = re.compile(
     r'ложн\w+\s+(?:утверждение|информация|факт)|'
     r'это\s+неправда|это\s+ложь|не\s+правда)',
     re.IGNORECASE
+)
+
+# Strong absolute negation — trust NLI over LLM for negated claims
+_STRONG_NEGATION_RE = re.compile(
+    r'никогда\s+не|ни\s+разу\s+не|ни\s+одн[аоиыйуюегм]', re.IGNORECASE
 )
 
 # Months and generic words for keyword cleanup
@@ -116,6 +121,7 @@ class FactCheckPipeline:
         self._use_reasoning_template = is_grpo_adapter(adapter_path)
         self._ctx = PipelineContext()
         self.fact_cache = FactCache()
+        self._thresholds = DecisionThresholds()
 
         # Cross-encoder re-ranker (CPU)
         self._reranker = None
@@ -158,6 +164,7 @@ class FactCheckPipeline:
             model, tokenizer,
             max_new_tokens=pipeline_config.verdict_max_new_tokens,
             pipeline_config=pipeline_config,
+            stop_strings=["</answer>"],  # НЕ останавливаться на "ВЕРДИКТ:" — модель может использовать это слово в объяснении
         )
 
         # Connect LLM to query classifier
@@ -195,8 +202,30 @@ class FactCheckPipeline:
         return False
 
     @staticmethod
-    def _split_by_conjunctions(claim: str) -> list:
-        """Rule-based split of composite claims by conjunctions."""
+    def _extract_subject(first_part: str) -> str:
+        """Extract grammatical subject from first part using pymorphy2.
+
+        Universal: handles ANY Russian verb form via morphological analysis,
+        not a hardcoded list of conjugations.
+        """
+        if not _HAS_NATASHA:
+            return ""
+        # Find first verb or short participle — everything before it is the subject
+        words = re.findall(r'[а-яёА-ЯЁa-zA-Z]+|[—–\-]', first_part)
+        for i, word in enumerate(words):
+            if word in ('—', '–', '-'):
+                return " ".join(words[:i]).strip()
+            if is_verb_form(word):
+                return " ".join(words[:i]).strip()
+        return ""
+
+    def _split_by_conjunctions(self, claim: str) -> list:
+        """Rule-based split of composite claims by conjunctions.
+
+        Uses pymorphy2 for universal verb detection (no hardcoded conjugation lists).
+        Guards against over-decomposition: only splits when part2 introduces
+        a genuinely new topic (new nouns not in part1).
+        """
         parts = re.split(
             r',\s*(?:и|а\s+также|при\s+этом|причём|а)\s+|\s+(?:и|а\s+также)\s+',
             claim, flags=re.IGNORECASE)
@@ -204,37 +233,83 @@ class FactCheckPipeline:
             return [claim]
 
         first = parts[0].strip()
-        subj_match = re.match(
-            r'^(.+?)\s+(?:имеет|является|находится|входит|использует|'
-            r'расположен[аоы]?|основан[аоы]?|был[аоы]?|стал[аоы]?|'
-            r'содержит|составляет|протекает|впадает|насчитывает|'
-            r'включает|обладает|достигает|'
-            r'родил(?:ся|ась)|получил[аоы]?|написал[аоы]?|'
-            r'изобрел[аоы]?|изобрёл[аоы]?|открыл[аоы]?|создал[аоы]?|'
-            r'совершил[аоы]?|выиграл[аоы]?|состоит|'
-            r'вращается|обращается|летает|летит|'
-            r'весит|длится|занимает|помнит|проглатывает|'
-            r'вызывает|'
-            r'—\s|–\s|-\s)', first, re.IGNORECASE)
-        subject = subj_match.group(1).strip() if subj_match else ""
+        subject = self._extract_subject(first)
 
-        result = [first]
+        # Collect raw parts, merge to max 2 BEFORE subject propagation
+        raw_parts = [first]
         for part in parts[1:]:
             part = part.strip()
-            if not part:
-                continue
+            if part and len(part) > 5:
+                raw_parts.append(part)
+
+        if len(raw_parts) > 2:
+            raw_parts = [raw_parts[0], " и ".join(raw_parts[1:])]
+
+        if len(raw_parts) <= 1:
+            return [claim]
+
+        # Subject propagation AFTER merge
+        result = [raw_parts[0]]
+        for part in raw_parts[1:]:
             if subject and not re.match(r'^[А-ЯЁA-Z]', part):
                 part = f"{subject} {part}"
             result.append(part)
 
-        return [p for p in result if len(p) > 5]
+        # Decomposition guard: only split if part2 introduces new topics
+        if len(result) == 2 and _HAS_NATASHA:
+            if not self._has_new_topic(result[0], result[1], subject):
+                return [claim]
+
+        return result
+
+    @staticmethod
+    def _has_new_topic(part1: str, part2: str, subject: str) -> bool:
+        """Check if part2 introduces genuinely new verifiable content.
+
+        Prevents over-decomposition of single-fact claims with elaboration
+        (e.g., "мёд не портится и может храниться тысячелетиями" = same fact).
+        Allows genuine composites (e.g., "создал таблицу и изобрёл водку" = different facts).
+        """
+        if not _HAS_NATASHA:
+            return True
+
+        # Skip nouns: time measures, abstract concepts that don't represent new topics
+        _SKIP = {'год', 'процент', 'время', 'день', 'место', 'раз', 'вид',
+                 'дело', 'часть', 'тысячелетие', 'миллион', 'тысяча', 'сотня',
+                 'образ', 'основание', 'случай', 'помощь', 'результат', 'рубль',
+                 'доллар', 'человек', 'гражданин', 'житель'}
+
+        subj_lemma = lemmatize(subject) if subject else ""
+
+        nouns1 = get_nouns(part1) - _SKIP - {subj_lemma}
+        nouns2 = get_nouns(part2) - _SKIP - {subj_lemma}
+
+        # Part2 introduces at least 1 new concrete noun → genuinely new topic
+        new_nouns = nouns2 - nouns1
+        return len(new_nouns) >= 1
 
     def _decompose(self, claim: str) -> List[str]:
         """Decompose claim into sub-claims (rule-based only)."""
-        if not self._has_conjunction(claim):
-            return [claim]
-        parts = self._split_by_conjunctions(claim)
-        return parts if len(parts) > 1 else [claim]
+        if self._has_conjunction(claim):
+            parts = self._split_by_conjunctions(claim)
+            if len(parts) > 1:
+                return parts
+
+        # V18: Year-location split — "X verb в YEAR году в LOCATION"
+        # Catches "Титаник затонул в 1912 году в Тихом океане" → 2 checkable facts
+        year_loc = re.match(
+            r'^(.+?\d{4}\s*(?:году?)?)\s+((?:в|на)\s+[А-ЯЁ][\w\s]*\w)\s*$',
+            claim)
+        if year_loc:
+            part1 = year_loc.group(1).strip()
+            location = year_loc.group(2).strip()
+            # Extract subject+verb for part2
+            subj_verb = re.match(r'^(.+?)\s+в\s+\d', part1)
+            if subj_verb:
+                part2 = f"{subj_verb.group(1).strip()} {location}"
+                return [part1, part2]
+
+        return [claim]
 
     # ======================================================================
     # STAGE 3: SEARCH
@@ -476,13 +551,45 @@ class FactCheckPipeline:
             contradicted = sum(1 for f in facts if f.get("match") is False)
 
             # Neutral facts matching claim text = implicit confirmation
+            # Skip self-referential facts (e.g. "страна: Австралия" for entity "австралия")
             if _HAS_NATASHA:
                 claim_lemmas = set(lemmatize(w) for w in re.findall(r'[а-яёa-z]{3,}', claim.lower()))
                 for f in facts:
                     if f.get("match") is None:
+                        entity_lemma = lemmatize(f.get("entity", "").lower())
                         for v in f.get("wikidata_values", []):
-                            if lemmatize(v) in claim_lemmas or v.lower() in claim.lower():
+                            v_lemma = lemmatize(v.lower())
+                            # Skip if value ≈ entity itself (self-referential)
+                            if v_lemma == entity_lemma or v.lower() == f.get("entity", "").lower():
+                                continue
+                            if v_lemma in claim_lemmas or v.lower() in claim.lower():
                                 confirmed += 1
+                                break
+
+            # Person mismatch: WD says "author: Толстой" but claim says "Достоевский написал"
+            # Universal: for person-related properties (P50, P112, P170, P57, P86),
+            # check if WD value is a person NOT mentioned in the claim
+            if _HAS_NATASHA and confirmed == 0 and contradicted == 0:
+                _PERSON_PROPS = {"P50", "P112", "P170", "P175", "P57", "P86"}
+                claim_persons = set()
+                for ent in extract_entities(claim):
+                    if ent["type"] == "PER":
+                        claim_persons.add(lemmatize(ent["normal"]))
+                if claim_persons:
+                    for f in facts:
+                        if f.get("match") is not None:
+                            continue
+                        if f.get("property_id", "") not in _PERSON_PROPS:
+                            continue
+                        for v in f.get("wikidata_values", []):
+                            if len(v) < 4:
+                                continue
+                            # Check if WD value matches any claimed person
+                            v_words = set(lemmatize(w) for w in re.findall(r'[а-яёА-ЯЁa-zA-Z]{3,}', v))
+                            matched = any(p in v_words for p in claim_persons)
+                            if not matched and v_words:
+                                print(f"  [Wikidata] Person mismatch: WD={v}, claim persons={claim_persons}")
+                                contradicted += 1
                                 break
 
             if contradicted > 0:
@@ -617,83 +724,87 @@ class FactCheckPipeline:
 
     def _decide(self, wikidata_signal: int, numbers_signal: int,
                 nli_signal: int, nli_scores: Dict, is_scam: bool,
-                debunk_count: int = 0, llm_signal: int = 0) -> tuple:
-        """Priority-based verdict. Hard facts override soft signals.
+                debunk_count: int = 0, llm_signal: int = 0,
+                claim: str = "") -> tuple:
+        """Universal priority-based verdict. Hard facts override soft signals.
 
+        Principles (from fact-checking literature):
+        1. Structured facts (WD, NUM) are authoritative vetoes (Hybrid KG+LLM)
+        2. NLI interpreted via gap = entailment - contradiction (no special cases)
+        3. When signals conflict → НЕ УВЕРЕНА (safety > false certainty)
+        4. LLM as tiebreaker only in ambiguous NLI zone
+        5. Debunk sources amplify NLI contradiction (myth detection)
+
+        Thresholds are in self._thresholds (DecisionThresholds), not hardcoded.
         Returns: (verdict, confidence)
         """
-        # TIER 0: Scam
-        if is_scam:
-            return "ЛОЖЬ", 95
+        t = self._thresholds
+        ent = nli_scores.get("ent", 0)
+        con = nli_scores.get("con", 0)
+        gap = ent - con  # positive = entailment, negative = contradiction
 
-        # TIER 1: Wikidata (structured DB = highest authority)
+        # ── TIER 0: Scam (rule-based, very high confidence) ──
+        if is_scam:
+            return "СКАМ", 95
+
+        # ── TIER 1: Wikidata (structured DB = authoritative veto) ──
         if wikidata_signal == -1:
             return "ЛОЖЬ", 90
-        if wikidata_signal == +1 and numbers_signal != -1:
+        if wikidata_signal == +1:
             return "ПРАВДА", 85
 
-        # TIER 2: Numbers (deterministic)
+        # ── TIER 2: Numbers (deterministic comparison) ──
         if numbers_signal == -1:
             return "ЛОЖЬ", 85
-        if numbers_signal == +1 and wikidata_signal != -1:
-            # NLI явно противоречит — число нашлось в другом контексте
-            # (пример: '1939' есть в статьях о ВМВ, но WWI началась в 1914)
-            if nli_signal == -1:
-                return "ЛОЖЬ", 75
-            _con = nli_scores.get("con", 0)
-            _ent = nli_scores.get("ent", 0)
-            # Слабое противоречие NLI (gap >= 0.10) тоже бьёт ложное числовое совпадение
-            if _con >= 0.40 and _con > _ent + 0.10:
-                return "ЛОЖЬ", 68
-            # Оба NLI-скора высокие (genuinely conflicted) + LLM знает что факт ложный
-            if _con >= 0.50 and _ent >= 0.50 and llm_signal == -1:
-                return "ЛОЖЬ", 68
+        if numbers_signal == +1:
+            # Number matched in sources, but NLI strongly disagrees →
+            # number appeared in wrong context (e.g., "1939" in WWII article for WWI claim)
+            if (con - ent) > t.num_nli_override:
+                return "ЛОЖЬ", 72
             return "ПРАВДА", 80
 
-        # TIER 2.5: Contested topic — источники реально делятся (max_ent >= 0.40 И max_con >= 0.40)
-        # Срабатывает для любой оспариваемой темы: мобильники+рак, ГМО, альт-медицина и т.д.
-        # НЕ срабатывает для мифов (max_ent < 0.40) и для фактических ошибок (WD/NUM сигнал)
-        if nli_scores.get("is_contested") and wikidata_signal == 0 and numbers_signal == 0:
-            # LLM как арбитр: при оспариваемых темах параметрические знания решают
-            if llm_signal == +1:
-                return "ПРАВДА", 62
-            elif llm_signal == -1:
-                return "ЛОЖЬ", 58
-            return "НЕ УВЕРЕНА", 50
+        # ── From here: WD=0, NUM=0 — rely on NLI + Debunk + LLM ──
 
-        # TIER 3: NLI (statistical)
-        if nli_signal == -1:
-            _con = nli_scores.get("con", 0)
-            _ent = nli_scores.get("ent", 0)
-            # LLM veto: синоним/перефразировка (ent≈0 = источники не нашли эту формулировку)
-            # ent < 0.05 означает: NO sources entail → чисто лексическая проблема, не фактическая
-            # (Менделеев "изобрёл"→ent=0.02: нет entail из-за синонима "создал/открыл")
-            # ent=0.11 (Сахар) или выше → есть реальное обсуждение, NLI противоречие не синоним
-            if llm_signal == +1 and wikidata_signal == 0 and debunk_count == 0 and _ent < 0.05:
-                return "ПРАВДА", 60
-            # Мягкое противоречие с реальной поддержкой → оспариваемый факт (мобильники+рак)
-            # Требует: ent >= 0.20 (реальные "за" источники), con >= 0.70, нет debunk-источников
-            if _ent >= 0.20 and _con >= 0.70 and debunk_count == 0:
-                return "НЕ УВЕРЕНА", 48
-            return "ЛОЖЬ", 70
-        if nli_signal == +1:
+        # ── TIER 3: Debunk sources (myth/misconception detection) ──
+        # Multiple debunk sources + NLI contradiction = strong myth signal
+        if debunk_count >= 2 and gap < 0:
+            return "ЛОЖЬ", 78
+
+        # ── TIER 4: NLI (gap-based, 3 zones: strong / moderate / ambiguous) ──
+
+        # Strong NLI entailment (sources clearly support)
+        if gap > t.strong_gap:
             return "ПРАВДА", 75
 
-        # TIER 3.5: Debunk sources (myth detection)
-        if debunk_count >= 2:
-            return "ЛОЖЬ", 65
-        if debunk_count == 1:
-            # Require minimum gap to avoid float precision noise
-            if nli_scores.get("con", 0) > nli_scores.get("ent", 0) + 0.05:
-                return "ЛОЖЬ", 60
+        # Strong NLI contradiction (sources clearly contradict)
+        if gap < -t.strong_gap:
+            # Safety: if LLM disagrees, this might be adversarial_true or
+            # NLI contamination → prefer honest uncertainty over confident wrong answer
+            if llm_signal == +1:
+                return "НЕ УВЕРЕНА", 48
+            return "ЛОЖЬ", 75
 
-        # TIER 4: LLM parametric knowledge (last resort — fine-tuned model знает факты)
-        if llm_signal == +1:
+        # Moderate NLI entailment
+        if gap > t.moderate_gap:
             return "ПРАВДА", 65
-        elif llm_signal == -1:
-            return "ЛОЖЬ", 60
 
-        # TIER 5: No signal at all
+        # Moderate NLI contradiction
+        if gap < -t.moderate_gap:
+            if debunk_count >= 1:
+                return "ЛОЖЬ", 68
+            if llm_signal == -1:
+                return "ЛОЖЬ", 62
+            if llm_signal == +1:
+                return "НЕ УВЕРЕНА", 48
+            return "ЛОЖЬ", 58
+
+        # ── TIER 5: LLM parametric knowledge (last resort) ──
+        if llm_signal == +1:
+            return "ПРАВДА", 58
+        if llm_signal == -1:
+            return "ЛОЖЬ", 55
+
+        # ── TIER 6: No signal ──
         return "НЕ УВЕРЕНА", 45
 
     # ======================================================================
@@ -702,16 +813,28 @@ class FactCheckPipeline:
 
     @staticmethod
     def _aggregate(sub_results: List[Dict]) -> str:
-        """Aggregate sub-results into final verdict."""
+        """Aggregate sub-results into final verdict.
+
+        LOREN-style logical aggregation:
+        - ПРАВДА + ЛОЖЬ → СОСТАВНОЕ (mixed sub-verdicts)
+        - ALL ПРАВДА → ПРАВДА
+        - ANY ЛОЖЬ (no ПРАВДА) → ЛОЖЬ
+        - Otherwise → НЕ УВЕРЕНА
+        """
         verdicts = [r["verdict"] for r in sub_results]
-        if "ПРАВДА" in verdicts and "ЛОЖЬ" in verdicts:
+        has_true = "ПРАВДА" in verdicts
+        has_false = "ЛОЖЬ" in verdicts or "СКАМ" in verdicts
+        has_scam = "СКАМ" in verdicts
+
+        if has_true and has_false:
             return "СОСТАВНОЕ"
-        elif all(v == "ПРАВДА" for v in verdicts):
+        if all(v == "ПРАВДА" for v in verdicts):
             return "ПРАВДА"
-        elif any(v == "ЛОЖЬ" for v in verdicts):
+        if has_scam and not has_true:
+            return "СКАМ"
+        if has_false:
             return "ЛОЖЬ"
-        else:
-            return "НЕ УВЕРЕНА"
+        return "НЕ УВЕРЕНА"
 
     # ======================================================================
     # STAGE 7: EXPLAIN (LLM — explanation only, NOT verdict)
@@ -768,16 +891,41 @@ class FactCheckPipeline:
                 evidence_summary += f"\nПодфакт: {sr['claim'][:80]} → {sr['verdict']}"
 
         try:
+            # Для СКАМ — объясняем через ЛОЖЬ + добавляем предупреждение
+            explain_verdict = verdict
+            scam_prefix = ""
+            if verdict == "СКАМ":
+                explain_verdict = "ЛОЖЬ (мошенничество)"
+                scam_patterns = []
+                if self._ctx.claim_info:
+                    scam_patterns = self._ctx.claim_info.get("scam_patterns", [])
+                if scam_patterns:
+                    evidence_summary = (
+                        f"ОБНАРУЖЕНЫ ПРИЗНАКИ МОШЕННИЧЕСТВА: {', '.join(scam_patterns)}.\n"
+                        + evidence_summary
+                    )
+                scam_prefix = (
+                    "⚠️ Это мошенническая схема. "
+                    "Ни один банк или государственный орган не просит переводить деньги "
+                    "на «безопасный счёт» по телефону или в интернете. "
+                )
+
             prompt = EXPLANATION_TEMPLATE.format(
                 claim=claim,
-                verdict=verdict,
+                verdict=explain_verdict,
                 evidence_summary=evidence_summary,
             )
             raw = self.explain_llm.invoke(prompt)
             explanation = StrOutputParser().invoke(raw)
-            return explanation.strip()[:1500]
+            return (scam_prefix + explanation).strip()[:1500]
         except Exception as e:
             logger.warning(f"Explanation failed: {e}")
+            if verdict == "СКАМ":
+                return (
+                    "⚠️ Обнаружены признаки мошенничества. "
+                    "Ни один банк или госорган не просит переводить деньги на «безопасный счёт». "
+                    "Это типичная схема телефонных мошенников."
+                )
             return evidence_summary[:500]
 
     # ======================================================================
@@ -789,7 +937,7 @@ class FactCheckPipeline:
         """Map verdict + confidence to credibility score (0-100)."""
         if verdict == "ПРАВДА":
             return max(60, min(95, confidence))
-        elif verdict == "ЛОЖЬ":
+        elif verdict in ("ЛОЖЬ", "СКАМ"):
             return max(5, min(34, 100 - confidence))
         else:
             return 45
@@ -798,15 +946,29 @@ class FactCheckPipeline:
     # MAIN CHECK FLOW
     # ======================================================================
 
-    def check(self, claim: str) -> Dict[str, Any]:
-        """Check a single claim. Returns structured result."""
+    def check(self, claim: str, progress_callback=None) -> Dict[str, Any]:
+        """Check a single claim. Returns structured result.
+
+        Args:
+            claim: The claim to check.
+            progress_callback: Optional callable(stage: str, data: dict) for
+                real-time progress reporting (used by Streamlit UI).
+        """
         logger.info(f"Проверка: {claim[:120]}")
         print(f"\nПроверка: {claim}")
+
+        def _report(stage, data):
+            if progress_callback:
+                try:
+                    progress_callback(stage, data)
+                except Exception:
+                    pass
 
         # Cache check
         cached = self.fact_cache.get(claim)
         if cached:
             print(f"  [Cache] HIT — {cached['verdict']} (score={cached['credibility_score']})")
+            _report("cache", cached)
             return cached
 
         # Fresh context
@@ -818,6 +980,13 @@ class FactCheckPipeline:
             claim_info = self._parse_claim(claim)
             print(f"  Тип: {claim_info['type']}, чисел: {len(claim_info['numbers'])}, "
                   f"скам: {claim_info.get('is_scam', False)}")
+            _report("parse", {
+                "type": claim_info.get("type", "unknown"),
+                "numbers": claim_info.get("numbers", []),
+                "dates": claim_info.get("dates", []),
+                "is_scam": claim_info.get("is_scam", False),
+                "scam_patterns": claim_info.get("scam_patterns", []),
+            })
 
             # STAGE 2: DECOMPOSE
             sub_claims = self._decompose(claim)
@@ -827,6 +996,10 @@ class FactCheckPipeline:
                 print(f"  Декомпозиция: {len(sub_claims)} подфактов")
                 for i, sc in enumerate(sub_claims, 1):
                     print(f"    {i}. {sc}")
+            _report("decompose", {
+                "sub_claims": sub_claims,
+                "is_composite": is_composite,
+            })
 
             # Extract keywords (rule-based, LLM fallback)
             rule_kw = self._extract_keywords_rule_based(claim)
@@ -839,6 +1012,7 @@ class FactCheckPipeline:
                 except Exception:
                     pass
             print(f"  Ключевые слова: {keywords}")
+            _report("keywords", {"keywords": keywords})
 
             # STAGE 3: SEARCH (global — shared across sub-claims)
             sources = self._search_sources(claim, keywords)
@@ -858,6 +1032,13 @@ class FactCheckPipeline:
                     except Exception:
                         pass
                 self._ctx.raw_results = sources
+            _report("search", {
+                "num_sources": len(sources),
+                "sources": [
+                    {"title": s.get("title", ""), "source": s.get("source", ""), "link": s.get("link", "")}
+                    for s in sources[:8]
+                ],
+            })
 
             # STAGE 4+5: EVIDENCE + DECIDE (per sub-claim)
             sub_results = []
@@ -866,10 +1047,43 @@ class FactCheckPipeline:
             for sc in sub_claims:
                 # Evidence signals
                 wd_signal = self._check_wikidata(sc, entities)
+                wd_facts = self._ctx.wikidata_result.get("facts", []) if self._ctx.wikidata_result else []
+                _report("wikidata", {
+                    "claim": sc,
+                    "signal": wd_signal,
+                    "found": bool(self._ctx.wikidata_result and self._ctx.wikidata_result.get("found")),
+                    "facts": [
+                        {"property": f.get("property_label", ""), "values": f.get("wikidata_values", []),
+                         "match": f.get("match")}
+                        for f in wd_facts[:5]
+                    ],
+                })
+
                 sc_claim_info = classify_claim(sc) if is_composite else claim_info
                 num_signal = self._check_numbers(sc, sources, sc_claim_info)
+                _report("numbers", {
+                    "claim": sc,
+                    "signal": num_signal,
+                    "claim_numbers": [n.get("original", str(n.get("value", ""))) for n in sc_claim_info.get("numbers", [])],
+                    "comparisons": [
+                        {"claim": str(c.get("claim_number", {}).get("value", "")),
+                         "source": str(c.get("source_number", {}).get("value", "")),
+                         "match": c.get("match", False)}
+                        for c in (self._ctx.num_comparisons or [])[:5]
+                    ],
+                })
+
                 nli_signal, nli_scores = self._check_nli(sc, sources)
+                _report("nli", {
+                    "claim": sc,
+                    "signal": nli_signal,
+                    "ent": nli_scores.get("ent", 0),
+                    "con": nli_scores.get("con", 0),
+                    "gap": nli_scores.get("ent", 0) - nli_scores.get("con", 0),
+                })
+
                 debunk_count = self._check_debunk(sc, sources)
+                _report("debunk", {"claim": sc, "count": debunk_count})
 
                 # Tier 4: LLM knowledge
                 # Вызываем если нет СТРОГИХ сигналов (wikidata/nli/debunk чистые).
@@ -882,15 +1096,31 @@ class FactCheckPipeline:
                 nli_contradicts_no_wd = nli_signal == -1 and wd_signal == 0  # NLI-only без WD подтверждения
                 if wd_signal == 0 and (nli_uncertain or nli_contradicts_no_wd):
                     llm_signal = self._check_llm_knowledge(sc)
+                _report("llm_knowledge", {"claim": sc, "signal": llm_signal})
+
+                # V18: Per-sub-claim scam detection for composites
+                # Global is_scam might be True for mixed claims (e.g., "Sberbank is big AND gives away money")
+                # but individual sub-claims may differ
+                sc_is_scam = self._ctx.is_scam
+                if is_composite:
+                    sc_scam_info = detect_scam_patterns(sc)
+                    sc_is_scam = sc_scam_info["is_scam"]
 
                 print(f"  [{sc[:50]}] WD={wd_signal:+d} NUM={num_signal:+d} "
                       f"NLI={nli_signal:+d} (ent={nli_scores['ent']:.2f}, con={nli_scores['con']:.2f}) "
-                      f"debunk={debunk_count} LLM={llm_signal:+d}")
+                      f"debunk={debunk_count} LLM={llm_signal:+d}"
+                      f"{' SCAM' if sc_is_scam else ''}")
 
                 # Decide
                 verdict, confidence = self._decide(
                     wd_signal, num_signal, nli_signal, nli_scores,
-                    self._ctx.is_scam, debunk_count, llm_signal)
+                    sc_is_scam, debunk_count, llm_signal,
+                    claim=sc)
+                _report("decide", {
+                    "claim": sc, "verdict": verdict, "confidence": confidence,
+                    "wd": wd_signal, "num": num_signal, "nli": nli_signal,
+                    "debunk": debunk_count, "llm": llm_signal, "scam": sc_is_scam,
+                })
 
                 sub_results.append({
                     "claim": sc,
@@ -902,6 +1132,7 @@ class FactCheckPipeline:
                     "nli_signal": nli_signal,
                     "nli_scores": nli_scores,
                     "debunk_count": debunk_count,
+                    "llm_signal": llm_signal,
                 })
 
             # STAGE 6: AGGREGATE
@@ -914,9 +1145,17 @@ class FactCheckPipeline:
                 final_confidence = sub_results[0]["confidence"]
 
             print(f"  VERDICT: {final_verdict} (confidence={final_confidence})")
+            _report("aggregate", {
+                "verdict": final_verdict,
+                "confidence": final_confidence,
+                "is_composite": is_composite,
+                "sub_verdicts": [{"claim": r["claim"], "verdict": r["verdict"]} for r in sub_results],
+            })
 
             # STAGE 7: EXPLAIN
+            _report("explain_start", {})
             explanation = self._explain(claim, final_verdict, sub_results, sources)
+            _report("explain", {"text": explanation[:300]})
 
             # Build result
             credibility_score = self._confidence_to_score(final_verdict, final_confidence)
