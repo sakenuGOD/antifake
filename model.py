@@ -121,8 +121,12 @@ def load_finetuned_model(adapter_path: str, config: ModelConfig = None):
     # GRPO адаптеры уже содержат SFT-веса (GRPO дообучает SFT LoRA напрямую),
     # поэтому загрузка одноэтапная — как и для SFT адаптеров.
     print(f"  Применение адаптеров из {adapter_path}")
+    # Do NOT call merge_and_unload() — merging LoRA into a 4-bit quantized base
+    # round-trips through NF4 quantization and introduces rounding error
+    # (PEFT warns: "Merge lora module to 4-bit linear may get different
+    # generations due to rounding errors"). Keep LoRA as an overlay for
+    # deterministic, drift-free inference. A small speed cost is acceptable.
     model = PeftModel.from_pretrained(model, adapter_path)
-    model = model.merge_and_unload()
 
     model.eval()
     return model, tokenizer
@@ -134,6 +138,9 @@ def build_langchain_llm(
     max_new_tokens: int = 512,
     pipeline_config: PipelineConfig = None,
     stop_strings: list = None,
+    sampling: bool = False,
+    temperature: float = 0.3,
+    top_p: float = 0.95,
 ):
     """Обёртка модели в HuggingFacePipeline для использования в LangChain LCEL.
 
@@ -141,18 +148,33 @@ def build_langchain_llm(
         stop_strings: Custom stop strings. Default (None) uses keyword-extraction
             stops: ["</answer>", "ВЕРДИКТ:", "</reasoning>\\n\\nВЕРДИКТ:"].
             Pass explicit list to override (e.g. ["</answer>"] for explain_llm).
+        sampling: If True, enable do_sample + temperature (for Self-Consistency).
+            Default False = deterministic greedy decoding (for keyword extraction
+            and single-pass verdicts).
+        temperature: Sampling temperature when sampling=True. 0.3 gives diversity
+            without destroying coherence; 0.7+ tends to hallucinate on 7B models.
+        top_p: Nucleus sampling threshold when sampling=True.
     """
     if pipeline_config is None:
         pipeline_config = PipelineConfig()
 
-    # V13: Set generation params directly on model's generation_config
-    # to avoid "multiple values for keyword argument" error with newer transformers
+    # Set generation params directly on model.generation_config so hf_pipeline
+    # doesn't double-pass them. Without this we get "multiple values for
+    # keyword argument" on transformers 4.57+.
     if hasattr(model, "generation_config"):
         model.generation_config.max_length = None
         model.generation_config.max_new_tokens = max_new_tokens
-        model.generation_config.temperature = None
         model.generation_config.repetition_penalty = pipeline_config.repetition_penalty
-        model.generation_config.do_sample = False
+        if sampling:
+            model.generation_config.do_sample = True
+            model.generation_config.temperature = temperature
+            model.generation_config.top_p = top_p
+        else:
+            model.generation_config.do_sample = False
+            # Setting temperature=None is required by transformers when do_sample=False,
+            # otherwise it logs a spurious "temperature ignored" warning every call.
+            model.generation_config.temperature = None
+            model.generation_config.top_p = None
 
     if stop_strings is None:
         stop_strings = ["</answer>", "ВЕРДИКТ:", "</reasoning>\n\nВЕРДИКТ:"]
