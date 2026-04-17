@@ -213,6 +213,22 @@ def verdict_consistency_reward(completions: list, **kwargs) -> list:
     return scores
 
 
+# Adjacency for partial credit — avoids hard -1 when verdict is "close".
+_VERDICT_ADJACENT = {
+    "ПРАВДА": {"ЧАСТИЧНО ПОДТВЕРЖДЕНО", "ЧАСТИЧНО ПРАВДА"},
+    "ЛОЖЬ": {"МАНИПУЛЯЦИЯ", "ПОЛУПРАВДА"},
+    "МАНИПУЛЯЦИЯ": {"ПОЛУПРАВДА", "ЧАСТИЧНО ПОДТВЕРЖДЕНО", "ЧАСТИЧНО ПРАВДА", "ЛОЖЬ"},
+    "ПОЛУПРАВДА": {"МАНИПУЛЯЦИЯ", "ЧАСТИЧНО ПОДТВЕРЖДЕНО"},
+    "ЧАСТИЧНО ПОДТВЕРЖДЕНО": {"МАНИПУЛЯЦИЯ", "ПОЛУПРАВДА", "ПРАВДА"},
+    "ЧАСТИЧНО ПРАВДА": {"МАНИПУЛЯЦИЯ", "ПОЛУПРАВДА", "ПРАВДА"},
+    "НЕ ПОДТВЕРЖДЕНО": {"МАНИПУЛЯЦИЯ", "ПОЛУПРАВДА"},
+}
+
+
+def _verdicts_adjacent(predicted: str, expected: str) -> bool:
+    return predicted in _VERDICT_ADJACENT.get(expected, set())
+
+
 def correctness_reward(completions: list, **kwargs) -> list:
     expected_verdicts = kwargs.get("expected_verdict", [])
     if not expected_verdicts:
@@ -232,15 +248,17 @@ def correctness_reward(completions: list, **kwargs) -> list:
         answer_match = re.search(
             r"<answer>(.*?)</answer>", text, re.DOTALL
         )
+        # Softer penalty for truncation so length-discipline can be learned
+        # without destroying the whole gradient when mask_truncated=False.
         if not answer_match:
-            scores.append(-1.0)
+            scores.append(-0.3)
             continue
 
         verdict_match = re.search(
             r"ВЕРДИКТ:\s*(.+?)(?:\n|$)", answer_match.group(1)
         )
         if not verdict_match:
-            scores.append(-0.5)
+            scores.append(-0.3)
             continue
 
         predicted = verdict_match.group(1).upper().strip()
@@ -248,10 +266,12 @@ def correctness_reward(completions: list, **kwargs) -> list:
 
         if predicted == expected_upper:
             scores.append(1.0)
+        elif _verdicts_adjacent(predicted, expected_upper):
+            scores.append(0.3)
         elif "НЕ ПОДТВЕРЖДЕНО" in predicted:
-            scores.append(0.0)  # не штрафуем за осторожность
+            scores.append(0.0)
         else:
-            scores.append(-1.0)
+            scores.append(-0.6)  # was -1.0; smoother gradient
 
     return scores
 
@@ -650,7 +670,10 @@ def train_grpo(
     base_model_name = model_config.base_model_name
 
     max_prompt_len = 512
-    max_completion_len = 512  # баланс скорости и качества (1024 слишком медленно)
+    # 512 caused 50-75% of completions to truncate before </answer>, producing
+    # spurious negative correctness_reward. 1024 gives room for full reasoning
+    # with ~2x step time; tradeoff is worth it on 12GB at num_generations=2.
+    max_completion_len = 1024
 
     if load_adapter is not None:
         adapter_path = load_adapter
@@ -744,8 +767,8 @@ def train_grpo(
         max_prompt_length=max_prompt_len,
         max_completion_length=max_completion_len,
         max_steps=max_steps,
-        save_steps=10,                # чекпоинт каждые ~20 мин
-        save_total_limit=5,
+        save_steps=25,                # чекпоинт каждые ~50 мин (max_len=1024)
+        save_total_limit=20,           # держим больше чекпоинтов для выбора лучшего
         logging_steps=1,
         warmup_ratio=0.03,            # короткий warmup (SFT модель уже прогрета)
         lr_scheduler_type="cosine",
@@ -754,7 +777,11 @@ def train_grpo(
         max_grad_norm=0.3,            # менее жёсткий клиппинг
         temperature=1.0,              # разнообразие генераций для GRPO exploration
         bf16=False,                   # native bfloat16 (Accelerator dtype fix)
-        mask_truncated_completions=True,
+        # mask_truncated_completions=True masked learning signal from cut-off
+        # outputs, leaving GRPO with an effective batch of 0-2 valid completions
+        # per step. With soft truncation penalty in correctness_reward, we keep
+        # gradient from all completions including truncated ones.
+        mask_truncated_completions=False,
         report_to="none",
         log_completions=True,
         use_vllm=False,
@@ -768,16 +795,21 @@ def train_grpo(
         model=model,
         processing_class=tokenizer,
         reward_funcs=[
-            format_reward,                 # weight 0.1 — структура ответа
-            reasoning_quality_reward,      # weight 0.1 — качество reasoning
-            verdict_consistency_reward,    # weight 0.1 — консистентность score/вердикт
-            correctness_reward,            # weight 3.0 — доминирует (правильность)
-            devils_advocate_reward,        # weight 0.0 — disabled (reward hacking)
-            numerical_accuracy_reward,     # weight 0.2 — точность чисел
-            scam_detection_reward,         # weight 0.5 — детекция скама
-            location_date_accuracy_reward, # weight 0.3 — дата/место проверка
+            format_reward,                 # structural tags
+            reasoning_quality_reward,      # DISABLED: keyword farming ("шаг 1", "источник")
+            verdict_consistency_reward,    # score <-> verdict coherence
+            correctness_reward,            # DOMINANT: matches ground-truth (with partial credit)
+            devils_advocate_reward,        # DISABLED: duplicates reasoning_quality, reward-hackable
+            numerical_accuracy_reward,     # numbers mentioned in reasoning
+            scam_detection_reward,         # scam pattern detection
+            location_date_accuracy_reward, # date/location explicit comparison
         ],
-        reward_weights=[0.1, 0.1, 0.1, 3.0, 0.0, 0.2, 0.5, 0.3],
+        # reasoning_quality + devils_advocate are set to 0 because logs show
+        # they both saturate to 1.0 within 5-10 steps (surface keyword match)
+        # while correctness stays at -0.5. This is textbook reward hacking.
+        # Weights rebalanced so correctness dominates and non-gameable signals
+        # (format, verdict_consistency, numerical, scam, location) contribute.
+        reward_weights=[0.2, 0.0, 0.4, 3.0, 0.0, 0.5, 0.7, 0.5],
         args=training_args,
         train_dataset=dataset,
         callbacks=[time_limit_cb],
@@ -836,18 +868,28 @@ def main():
         help="Директория для сохранения (по умолчанию: adapters/fact_checker_grpo)",
     )
     parser.add_argument(
-        "--steps", type=int, default=500,
-        help="Количество шагов обучения (по умолчанию: 500)",
+        "--steps", type=int, default=300,
+        help="Количество шагов обучения (по умолчанию: 300, ~10 часов при max_len=1024, gen=2)",
     )
     parser.add_argument(
         "--generations", type=int, default=2,
-        help="Вариантов генерации на пример (по умолчанию: 2, для 12GB VRAM)",
+        help="Вариантов генерации на пример (по умолчанию: 2, для 12GB VRAM; 4 = OOM при max_len=1024)",
     )
     parser.add_argument(
-        "--load-adapter", type=str, default=None,
-        help="Путь к SFT-адаптеру для инициализации LoRA весов (по умолчанию: с нуля)",
+        "--load-adapter", type=str, default="adapters/fact_checker_lora",
+        help="SFT-адаптер как стартовая точка (по умолчанию: adapters/fact_checker_lora). "
+             "Передайте 'none' для обучения с нуля (не рекомендуется — grad_norm>400 на step 1).",
     )
     args = parser.parse_args()
+
+    # Auto-disable load-adapter if user passes 'none' or path does not exist
+    if args.load_adapter and args.load_adapter.lower() == "none":
+        args.load_adapter = None
+    elif args.load_adapter and not os.path.isabs(args.load_adapter):
+        abs_path = os.path.join(PROJECT_ROOT, args.load_adapter)
+        if not os.path.exists(abs_path):
+            print(f"[WARN] SFT adapter not found at {abs_path} — training from scratch")
+            args.load_adapter = None
 
     train_grpo(
         dataset_path=args.dataset,
