@@ -29,6 +29,7 @@ training_log.txt
 # Markdown files (documentation, reports) — кроме README
 *.md
 !README.md
+!NIGHT_RUN_README.md
 
 # Misc
 =9.0

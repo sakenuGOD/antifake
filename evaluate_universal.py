@@ -390,6 +390,9 @@ def main():
                         help="Limit number of claims (0 = all)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print dataset stats without running pipeline")
+    parser.add_argument("--adapter", "-a", type=str, default=None,
+                        help="Explicit adapter path (overrides find_best_adapter). "
+                             "Pass 'base' or 'none' to use the base model without any adapter.")
     args = parser.parse_args()
 
     # Load dataset
@@ -424,11 +427,27 @@ def main():
 
     serpapi_key = os.environ.get("SERPAPI_API_KEY", "")
     search_config = SearchConfig(api_key=serpapi_key)
-    adapter_path = find_best_adapter()
-    if adapter_path:
-        print(f"Adapter: {adapter_path}")
+
+    if args.adapter is not None:
+        if args.adapter.lower() in ("base", "none", ""):
+            adapter_path = None
+            print("Adapter: [base model, no adapter]")
+        else:
+            adapter_path = args.adapter
+            if not os.path.isabs(adapter_path):
+                abs_candidate = os.path.join(os.path.dirname(__file__), adapter_path)
+                if os.path.exists(abs_candidate):
+                    adapter_path = abs_candidate
+            if not os.path.exists(adapter_path):
+                print(f"[ERROR] Adapter path does not exist: {adapter_path}")
+                sys.exit(1)
+            print(f"Adapter (explicit): {adapter_path}")
     else:
-        print("No adapter found, using base model")
+        adapter_path = find_best_adapter()
+        if adapter_path:
+            print(f"Adapter (auto): {adapter_path}")
+        else:
+            print("No adapter found, using base model")
 
     pipeline = FactCheckPipeline(adapter_path=adapter_path, search_config=search_config)
 
