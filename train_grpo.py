@@ -817,11 +817,15 @@ def train_grpo(
 
     # Страховка: оборачиваем generate() в autocast для совместимости dtype
     # (bnb-4bit отдаёт hidden_states в bf16, lm_head может быть в другом dtype)
+    # Wrap _generate_single_turn with bfloat16 autocast for TRL dtype safety.
+    # Signature differs across TRL versions: 0.24 took (prompts, images=None),
+    # 1.x takes (prompt_ids, images, multimodal_fields). We use *args/**kwargs
+    # to stay forward/backward compatible across TRL releases.
     _orig_generate = trainer._generate_single_turn
 
-    def _patched_generate(prompts, images=None):
+    def _patched_generate(*args, **kwargs):
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            return _orig_generate(prompts, images)
+            return _orig_generate(*args, **kwargs)
 
     trainer._generate_single_turn = _patched_generate
 
