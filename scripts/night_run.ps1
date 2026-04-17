@@ -1,13 +1,13 @@
-# night_run.ps1 — Windows PowerShell ночной прогон.
-# Делает то же что night_run.sh, но нативно на Windows (WSL не требуется).
+# night_run.ps1 -- Windows PowerShell overnight runner.
+# Mirrors night_run.sh but runs natively on Windows (no WSL required).
 #
-# Запуск из активированного venv:
+# Run from the activated venv:
 #   .\scripts\night_run.ps1
 #
-# Предотвращает засыпание компьютера через SetThreadExecutionState.
-# Пишет логи в night_logs_<timestamp>/.
+# Prevents Windows from sleeping via SetThreadExecutionState.
+# Writes logs to night_logs_<timestamp>\.
 
-$ErrorActionPreference = 'Continue'   # продолжать даже если один этап упал
+$ErrorActionPreference = 'Continue'
 
 $dateTag = Get-Date -Format 'yyyyMMdd_HHmm'
 $logDir  = "night_logs_$dateTag"
@@ -31,7 +31,7 @@ function Run-Eval {
     Log "Eval $outName finished (exit=$LASTEXITCODE)"
 }
 
-# --- Keep system awake during training ---
+# Keep system awake during training.
 Add-Type -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("kernel32.dll")]
 public static extern uint SetThreadExecutionState(uint esFlags);
@@ -45,14 +45,14 @@ Log "LOG_DIR: $logDir"
 nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv | Tee-Object "$logDir\gpu.log"
 
 # =====================================================================
-# STAGE 1: BASELINE EVAL (SFT only — на broken GRPO нет смысла тратить время)
+# STAGE 1: BASELINE SFT EVAL
 # =====================================================================
 Log ""
 Log "=== STAGE 1/3: BASELINE SFT EVAL (~30-60 min) ==="
 Run-Eval "adapters/fact_checker_lora" "baseline_sft"
 
 # =====================================================================
-# STAGE 2: GRPO RETRAIN (6-7h)
+# STAGE 2: GRPO RETRAIN (6-8h)
 # =====================================================================
 Log ""
 Log "=== STAGE 2/3: GRPO RETRAIN 300 steps, max_len=1024, SFT-init ==="
@@ -84,7 +84,7 @@ if (Test-Path $ckptDir) {
     # Final saved adapter (post-training)
     Run-Eval $ckptDir "eval_final"
 } else {
-    Log "[ERROR] $ckptDir не существует — retrain провалился."
+    Log "[ERROR] $ckptDir does not exist -- retrain failed."
 }
 
 # =====================================================================
@@ -105,4 +105,4 @@ if (Test-Path $reportPath) {
 [Win32.Power]::SetThreadExecutionState(0x80000000) | Out-Null
 
 Log "=== NIGHT RUN END ==="
-Log "Утром: cat $logDir\final_report.md"
+Log "In the morning: Get-Content $logDir\final_report.md"
