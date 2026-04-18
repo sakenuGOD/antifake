@@ -34,15 +34,35 @@ class StopOnString(StoppingCriteria):
 
 
 def find_best_adapter() -> str | None:
-    """Автоматический выбор лучших адаптеров: GRPO > SFT > None."""
+    """Выбор лучшего адаптера: валидированный GRPO > SFT > None.
+
+    V18: GRPO проверяется через train_metrics.json — если epoch < 1.0 или reward
+    отрицательный, адаптер считается битым и игнорируется. Предыдущий checkpoint-100
+    имел epoch=0.04 и correctness_reward=-0.5 — использование такого GRPO
+    отравляло LLM parametric check на базовых фактах.
+    """
     grpo_path = os.path.join(PROJECT_ROOT, "adapters", "fact_checker_grpo")
     sft_path = os.path.join(PROJECT_ROOT, "adapters", "fact_checker_lora")
 
-    if os.path.exists(grpo_path):
+    if os.path.exists(grpo_path) and _grpo_is_valid(grpo_path):
         return grpo_path
-    elif os.path.exists(sft_path):
+    if os.path.exists(sft_path):
         return sft_path
     return None
+
+
+def _grpo_is_valid(grpo_path: str) -> bool:
+    """GRPO считается валидным только если обучился хотя бы 1 эпоху."""
+    metrics_file = os.path.join(grpo_path, "train_metrics.json")
+    if not os.path.exists(metrics_file):
+        return False
+    try:
+        import json
+        with open(metrics_file, "r", encoding="utf-8") as f:
+            m = json.load(f)
+        return float(m.get("epoch", 0)) >= 1.0
+    except Exception:
+        return False
 
 
 def is_grpo_adapter(adapter_path: str) -> bool:

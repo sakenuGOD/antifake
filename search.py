@@ -1745,6 +1745,14 @@ class FactCheckSearcher:
             config = SearchConfig()
         self.config = config
         self._serpapi_failed = False
+        # V19.2: soft budget cap. SerpAPI is used only via `search_keyword`
+        # (supplementary path), never from the main DDG route. Override via
+        # SERPAPI_MAX_CALLS if you want a hard limit — default is generous.
+        try:
+            self._serpapi_quota = int(os.environ.get("SERPAPI_MAX_CALLS", "50"))
+        except (TypeError, ValueError):
+            self._serpapi_quota = 50
+        self._serpapi_used = 0
         self._cache = SearchCache()
         self._rate_limiter = RateLimiter(calls_per_second=0.5)
 
@@ -1766,7 +1774,14 @@ class FactCheckSearcher:
     # ----------------------------------------------------------
 
     def _search_ddg(self, query: str, max_results: int = 8) -> List[Dict[str, str]]:
-        """DDG поиск с exponential backoff (3 попытки: 2 / 4 / 8 сек)."""
+        """DDG поиск с exponential backoff (3 попытки: 2 / 4 / 8 сек).
+
+        V19.2: SerpAPI intentionally NOT routed through this path. Each
+        fact-check triggers 6-15 searches (main/verification/counter/debunk
+        queries) — auto-routing would drain the SerpAPI quota fast. Callers
+        that explicitly want SerpAPI should use `search_keyword(web_mode=True)`
+        which preserves the conservative SerpAPI-first, DDG-fallback semantics.
+        """
         for attempt in range(3):
             try:
                 raw = _DDGS(timeout=_DDG_TIMEOUT).text(
@@ -1821,7 +1836,12 @@ class FactCheckSearcher:
                 return [self._search_ddg(q, max_results) for q in queries]
 
     def _search_serpapi(self, keyword: str, web_mode: bool = False) -> List[Dict[str, str]]:
-        """SerpAPI Google поиск (платный, основной при наличии API-ключа)."""
+        """SerpAPI Google поиск (платный, quota-enforced)."""
+        if self._serpapi_used >= self._serpapi_quota:
+            # Hard quota exceeded — bail out to prevent runaway spend.
+            print(f"  [SerpAPI] Quota exhausted ({self._serpapi_used}/{self._serpapi_quota}) — skipping")
+            self._serpapi_failed = True
+            return []
         from serpapi import GoogleSearch
 
         params = {
@@ -1832,6 +1852,7 @@ class FactCheckSearcher:
             "num":     self.config.num_results,
             "api_key": self.config.api_key,
         }
+        self._serpapi_used += 1
         if not web_mode:
             params["tbm"] = self.config.tbm
 

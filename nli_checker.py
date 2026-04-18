@@ -439,6 +439,7 @@ class NLIChecker:
                     "contradiction": best_con,
                     "label": best_label,
                     "source": source.get("title", source.get("source", "")),
+                    "url": source.get("link") or source.get("url", ""),
                     "num_sentences": len(sentences),
                     "purity": abs(best_ent - best_con),
                 })

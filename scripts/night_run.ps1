@@ -102,7 +102,7 @@ if (Test-Path $reportPath) {
 }
 
 # Restore normal power state
-[Win32.Power]::SetThreadExecutionState(0x80000000) | Out-Null
+[Win32.Power]::SetThreadExecutionState([uint32]0x80000000) | Out-Null
 
 Log "=== NIGHT RUN END ==="
 Log "In the morning: Get-Content $logDir\final_report.md"

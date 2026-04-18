@@ -1,0 +1,97 @@
+{
+  "accuracy": 0.8,
+  "correct": 8,
+  "total": 10,
+  "results": [
+    {
+      "claim": "Александр Пушкин написал роман в стихах Евгений Онегин",
+      "expected": "ПРАВДА",
+      "predicted": "ПРАВДА",
+      "score": 85,
+      "correct": true,
+      "category": "well_known_fact",
+      "latency": 207.4
+    },
+    {
+      "claim": "Юрий Гагарин был первым человеком в космосе",
+      "expected": "ПРАВДА",
+      "predicted": "ПРАВДА",
+      "score": 75,
+      "correct": true,
+      "category": "well_known_fact",
+      "latency": 207.33
+    },
+    {
+      "claim": "Солнце вращается вокруг Земли",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 10,
+      "correct": true,
+      "category": "pseudo_authority_false",
+      "latency": 203.24
+    },
+    {
+      "claim": "Эйфелева башня находится в Париже",
+      "expected": "ПРАВДА",
+      "predicted": "ПРАВДА",
+      "score": 75,
+      "correct": true,
+      "category": "location_true",
+      "latency": 111.57
+    },
+    {
+      "claim": "Кислород составляет примерно 21% атмосферы Земли",
+      "expected": "ПРАВДА",
+      "predicted": "ПРАВДА",
+      "score": 80,
+      "correct": true,
+      "category": "numerical_true",
+      "latency": 180.83
+    },
+    {
+      "claim": "Вторая мировая война закончилась в 1943 году",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 28,
+      "correct": true,
+      "category": "date_swap",
+      "latency": 187.14
+    },
+    {
+      "claim": "ДНК содержит генетическую информацию живых организмов",
+      "expected": "ПРАВДА",
+      "predicted": "ПРАВДА",
+      "score": 75,
+      "correct": true,
+      "category": "science_fact",
+      "latency": 257.41
+    },
+    {
+      "claim": "Биткоин был создан Виталиком Бутериным",
+      "expected": "ЛОЖЬ",
+      "predicted": "ПРАВДА",
+      "score": 75,
+      "correct": false,
+      "category": "person_swap",
+      "latency": 201.84
+    },
+    {
+      "claim": "Столица Австралии — Сидней",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 34,
+      "correct": true,
+      "category": "location_trap",
+      "latency": 216.96
+    },
+    {
+      "claim": "Сахара является самой большой жаркой пустыней в мире",
+      "expected": "ПРАВДА",
+      "predicted": "ЛОЖЬ",
+      "score": 34,
+      "correct": false,
+      "category": "general_true",
+      "latency": 236.0
+    }
+  ]
+}

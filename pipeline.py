@@ -134,13 +134,19 @@ class FactCheckPipeline:
             except Exception as e:
                 print(f"CrossEncoder не загружен: {e}")
 
-        # NLI checker (CPU)
+        # NLI checker (CPU). V19.2: pass through config-specified model name.
+        # Default (PipelineConfig.nli_model_name) is mDeBERTa-v3-base-xnli-multilingual —
+        # trained on 2.7M multilingual NLI pairs, significantly better at contradiction
+        # discrimination than cointegrated/rubert-base-cased-nli-threeway.
         self.nli_checker = None
         if pipeline_config.enable_nli:
             try:
                 from nli_checker import NLIChecker
-                print("Загрузка NLI модели на CPU...")
-                self.nli_checker = NLIChecker(device=pipeline_config.nli_device)
+                print(f"Загрузка NLI модели на {pipeline_config.nli_device}: {pipeline_config.nli_model_name}")
+                self.nli_checker = NLIChecker(
+                    device=pipeline_config.nli_device,
+                    model_name=pipeline_config.nli_model_name,
+                )
                 print("NLI модель загружена.")
             except Exception as e:
                 print(f"NLI модель не загружена: {e}")
@@ -508,6 +514,26 @@ class FactCheckPipeline:
         except Exception:
             pass
 
+        # V19: Multi-frame counter-search. Build explicit debunk / verify queries
+        # so fact-check articles that frame the claim as myth/misconception land
+        # in the source pool, not just sources that syntactically echo the claim.
+        try:
+            from counter_search import build_query_frames
+            frames = build_query_frames(claim, max_frames=4)
+            for frame in frames:
+                if frame.frame in ("affirm",):
+                    # Already covered by the main DDG pass.
+                    continue
+                framed_hits = self.searcher.search_verification_queries([frame.text])
+                for hit in framed_hits:
+                    url = hit.get("link", "")
+                    if url and url not in existing_urls:
+                        hit["_frame"] = frame.frame
+                        results.append(hit)
+                        existing_urls.add(url)
+        except Exception as e:
+            logger.debug(f"counter-search frames failed: {e}")
+
         wiki_cnt = sum(1 for r in results if 'wikipedia.org' in r.get('link', ''))
         print(f"  Найдено источников: {len(results)} (Wikipedia: {wiki_cnt})")
 
@@ -552,17 +578,57 @@ class FactCheckPipeline:
 
             # Neutral facts matching claim text = implicit confirmation
             # Skip self-referential facts (e.g. "страна: Австралия" for entity "австралия")
+            # V18: multi-word WD values (e.g. "Александр Сергеевич Пушкин") must be compared
+            # word-by-word against claim lemmas. Previously the full string was treated as
+            # a single lemma, causing matches to fail and triggering false "Person mismatch".
+            # V19: directional relation check. For orbital / containment relations
+            # ("вокруг", "внутри", "часть"), the WD subject-object order must match claim.
+            # Previously "Солнце вращается вокруг Земли" got WD=+1 because entity "земля"
+            # has P59=Солнце and both words appeared in the claim — direction reversed
+            # but lexical overlap sufficed.
+            _REL_REVERSAL_RE = re.compile(
+                r'(вокруг|находится\s+внутри|является\s+частью|внутри)', re.IGNORECASE
+            )
+            has_directional_relation = bool(_REL_REVERSAL_RE.search(claim))
             if _HAS_NATASHA:
                 claim_lemmas = set(lemmatize(w) for w in re.findall(r'[а-яёa-z]{3,}', claim.lower()))
                 for f in facts:
                     if f.get("match") is None:
-                        entity_lemma = lemmatize(f.get("entity", "").lower())
+                        entity_raw = f.get("entity", "").lower()
+                        entity_lemma = lemmatize(entity_raw)
                         for v in f.get("wikidata_values", []):
-                            v_lemma = lemmatize(v.lower())
-                            # Skip if value ≈ entity itself (self-referential)
-                            if v_lemma == entity_lemma or v.lower() == f.get("entity", "").lower():
+                            v_lower = v.lower()
+                            v_lemma_full = lemmatize(v_lower)
+                            if v_lemma_full == entity_lemma or v_lower == entity_raw:
                                 continue
-                            if v_lemma in claim_lemmas or v.lower() in claim.lower():
+                            v_words = {lemmatize(w) for w in re.findall(r'[а-яёa-z]{3,}', v_lower)}
+                            v_words -= {entity_lemma}
+                            overlap = v_words & claim_lemmas
+                            if overlap or v_lemma_full in claim_lemmas or v_lower in claim.lower():
+                                # Directional check: for orbital/containment claims,
+                                # WD entity must precede WD value in claim text.
+                                # ("Земля вращается вокруг Солнца" — Земля first = correct direction)
+                                # ("Солнце вращается вокруг Земли" — Солнце first = REVERSED = wrong)
+                                if has_directional_relation:
+                                    # V19.1: stem-based position match. Raw entity may be
+                                    # lemma form ("земля") while claim uses inflected form
+                                    # ("земли"). Compare on first 4–5 chars of the lemma,
+                                    # which is stable across common Russian declensions.
+                                    claim_lower = claim.lower()
+                                    ent_stem = entity_raw[:4] if len(entity_raw) >= 4 else entity_raw
+                                    m = re.search(rf"\b{re.escape(ent_stem)}\w*", claim_lower)
+                                    ent_pos = m.start() if m else -1
+                                    val_pos = -1
+                                    for vw in v_words:
+                                        vstem = vw[:4] if len(vw) >= 4 else vw
+                                        vm = re.search(rf"\b{re.escape(vstem)}\w*", claim_lower)
+                                        if vm and (val_pos < 0 or vm.start() < val_pos):
+                                            val_pos = vm.start()
+                                    if ent_pos >= 0 and val_pos >= 0 and ent_pos > val_pos:
+                                        # Entity appears AFTER value → claim reverses WD relation
+                                        print(f"  [Wikidata] Directional mismatch: claim has '{v}' before '{entity_raw}' but WD says '{entity_raw}' → '{v}'")
+                                        contradicted += 1
+                                        break
                                 confirmed += 1
                                 break
 
@@ -584,9 +650,15 @@ class FactCheckPipeline:
                         for v in f.get("wikidata_values", []):
                             if len(v) < 4:
                                 continue
-                            # Check if WD value matches any claimed person
-                            v_words = set(lemmatize(w) for w in re.findall(r'[а-яёА-ЯЁa-zA-Z]{3,}', v))
-                            matched = any(p in v_words for p in claim_persons)
+                            # V18: compare at word-level. Multi-word claim_persons
+                            # (e.g. "александр пушкин") never matched the single-word
+                            # v_words set, causing false "Person mismatch" for any claim
+                            # that named the author correctly but as a two-token entity.
+                            v_words = {lemmatize(w) for w in re.findall(r'[а-яёА-ЯЁa-zA-Z]{3,}', v)}
+                            matched = any(
+                                any(pw in v_words for pw in p.split() if len(pw) >= 3)
+                                for p in claim_persons
+                            )
                             if not matched and v_words:
                                 print(f"  [Wikidata] Person mismatch: WD={v}, claim persons={claim_persons}")
                                 contradicted += 1
@@ -607,6 +679,7 @@ class FactCheckPipeline:
         claim_numbers = claim_info.get("numbers", [])
         if not claim_numbers:
             return 0
+
 
         # Extract numbers from all source snippets
         source_numbers = []
@@ -643,7 +716,15 @@ class FactCheckPipeline:
         return 0
 
     def _check_nli(self, claim: str, sources: List[Dict]) -> tuple:
-        """Check claim vs sources using NLI. Returns (signal, scores)."""
+        """Check claim vs sources using NLI. Returns (signal, scores).
+
+        V19: raw NLI scores are preserved for backward-compatible thresholds,
+        but per-source pairs are also aggregated with authority-tier weights
+        (see evidence_tiers.weighted_nli_scores). The weighted values and tier
+        counts surface through scores[\"weighted_*\"] / scores[\"tier_counts\"]
+        for use by the confidence calibrator — they're additive context, not a
+        replacement for the raw probabilities the tier tree thresholds assume.
+        """
         if not self.nli_checker or not sources:
             return 0, {"ent": 0.0, "con": 0.0}
 
@@ -651,6 +732,27 @@ class FactCheckPipeline:
         self._ctx.nli_result = nli_result
         max_ent = nli_result.get("max_entailment", 0.0)
         max_con = nli_result.get("max_contradiction", 0.0)
+
+        # Authority-aware context (does NOT replace raw max_ent/max_con — those
+        # feed the existing gap thresholds that work on raw [0,1] probabilities).
+        tier_weighted: Dict[str, Any] = {}
+        try:
+            from evidence_tiers import weighted_nli_scores, tier_summary
+            per_source = [
+                (p.get("url", ""), p.get("entailment", 0.0), p.get("contradiction", 0.0))
+                for p in nli_result.get("pairs", [])
+            ]
+            tier_weighted = weighted_nli_scores(per_source)
+            tier_weighted["tier_counts"] = tier_summary(sources[:7])
+            nli_result.update({
+                "weighted_ent": tier_weighted["weighted_ent"],
+                "weighted_con": tier_weighted["weighted_con"],
+                "top_ent_tier": tier_weighted["top_ent_tier"],
+                "top_con_tier": tier_weighted["top_con_tier"],
+                "tier_counts": tier_weighted["tier_counts"],
+            })
+        except Exception as e:
+            logger.debug(f"tier-weighting failed: {e}")
 
         # Cross-encoder tiebreaker for close cases — REPLACE scores, not MAX
         if abs(max_ent - max_con) < 0.15:
@@ -675,6 +777,13 @@ class FactCheckPipeline:
             "con": max_con,
             # Use FINAL (post-CE) scores for is_contested — pre-CE purity values can differ
             "is_contested": max_ent >= 0.40 and max_con >= 0.40,
+            # V19: authority-weighted context for the calibrator.
+            "weighted_ent": tier_weighted.get("weighted_ent", max_ent),
+            "weighted_con": tier_weighted.get("weighted_con", max_con),
+            "top_ent_tier": tier_weighted.get("top_ent_tier", "T3"),
+            "top_con_tier": tier_weighted.get("top_con_tier", "T3"),
+            "t1_ratio": tier_weighted.get("t1_ratio", 0.0),
+            "tier_counts": tier_weighted.get("tier_counts", {}),
         }
 
         # V17.1: Gap-based threshold — dominant signal wins if gap >= 0.15
@@ -712,12 +821,32 @@ class FactCheckPipeline:
         try:
             prompt = LLM_KNOWLEDGE_TEMPLATE.format(claim=claim[:200])
             raw = self.keyword_llm.invoke(prompt)
-            text = StrOutputParser().invoke(raw).strip().upper()[:50]
-            if "ПРАВДА" in text or "\nTRUE" in text:
-                return +1
-            elif "ЛОЖЬ" in text or "FALSE" in text or "НЕПРАВДА" in text:
-                return -1
-            return 0
+            text = StrOutputParser().invoke(raw).strip().upper()
+            head = text[:200]
+            # V19.1: robust parsing — scan first recognised verdict token.
+            # A negation prefix ("НЕ ПРАВДА", "НЕ ВЕРНО", "НЕ СОГЛАСЕН")
+            # flips the polarity. Unrecognised / empty output → 0.
+            true_tokens = ("ПРАВДА", "ВЕРНО", "ВЕРНА", "ИСТИНА", "TRUE", "ДА,", "СОГЛАСЕН")
+            false_tokens = ("ЛОЖЬ", "НЕВЕРНО", "НЕВЕРНА", "НЕПРАВДА", "FALSE", "НЕТ,", "НЕ СОГЛАСЕН", "ОШИБОЧНО")
+            negation_re = re.compile(r"\bНЕ\s+(ПРАВД|ВЕРН|СОГЛАС|ИСТИН)", re.IGNORECASE)
+
+            def _first_hit(tokens):
+                hits = [head.find(t) for t in tokens]
+                hits = [h for h in hits if h >= 0]
+                return min(hits) if hits else 10**9
+
+            pos_true = _first_hit(true_tokens)
+            pos_false = _first_hit(false_tokens)
+
+            # Polarity flip when a negation appears *before* the true token
+            neg = negation_re.search(head)
+            if neg and neg.start() < pos_true:
+                # Treat "не правда/верно" as a false signal at that position.
+                pos_false = min(pos_false, neg.start())
+
+            if pos_true == pos_false == 10**9:
+                return 0
+            return +1 if pos_true < pos_false else -1
         except Exception as e:
             logger.debug(f"LLM knowledge check failed: {e}")
             return 0
@@ -743,14 +872,29 @@ class FactCheckPipeline:
         con = nli_scores.get("con", 0)
         gap = ent - con  # positive = entailment, negative = contradiction
 
+        # V19: authority-tier signals (populated by _check_nli, see evidence_tiers).
+        t1_ratio = nli_scores.get("t1_ratio", 0.0)
+        tier_counts = nli_scores.get("tier_counts", {})
+        t1_count = tier_counts.get("T1", 0) if tier_counts else 0
+
         # ── TIER 0: Scam (rule-based, very high confidence) ──
         if is_scam:
             return "СКАМ", 95
 
         # ── TIER 1: Wikidata (structured DB = authoritative veto) ──
+        # V18: LLM coherence check. WD lexical matching can produce directional
+        # false positives (e.g. claim "Солнце вокруг Земли" matched "Земля→вокруг:Солнце"
+        # via shared entities). When LLM strongly disagrees with WD, WD signal is
+        # likely spurious → trust LLM parametric knowledge.
         if wikidata_signal == -1:
-            return "ЛОЖЬ", 90
+            if llm_signal == +1:
+                # WD may be multi-word match false negative — fall through to NLI/LLM tiers
+                pass
+            else:
+                return "ЛОЖЬ", 90
         if wikidata_signal == +1:
+            if llm_signal == -1:
+                return "ЛОЖЬ", 62
             return "ПРАВДА", 85
 
         # ── TIER 2: Numbers (deterministic comparison) ──
@@ -766,7 +910,10 @@ class FactCheckPipeline:
         # ── From here: WD=0, NUM=0 — rely on NLI + Debunk + LLM ──
 
         # ── TIER 3: Debunk sources (myth/misconception detection) ──
-        # Multiple debunk sources + NLI contradiction = strong myth signal
+        # Multiple debunk sources + NLI contradiction = strong myth signal.
+        # V18: raised to >=2 (was >=1 later in the tree); single-source debunk
+        # matches triggered false positives on TRUE claims whose sources happened
+        # to contain "миф"/"на самом деле" in unrelated context (Гагарин → FALSE).
         if debunk_count >= 2 and gap < 0:
             return "ЛОЖЬ", 78
 
@@ -774,28 +921,54 @@ class FactCheckPipeline:
 
         # Strong NLI entailment (sources clearly support)
         if gap > t.strong_gap:
+            # V18: Pseudo-authority guard — clickbait titles lexically entail false
+            # claims. When LLM strongly disagrees, trust LLM over snippet-level NLI.
+            if llm_signal == -1:
+                return "ЛОЖЬ", 62
+            # V19 calibration: strong entailment with zero T1 sources is a red flag.
+            # Popular myths entail strongly on non-authoritative sources. Require
+            # at least one T1 confirmation or defer to LLM.
+            if t1_count == 0 and llm_signal != +1:
+                return "НЕ УВЕРЕНА", 55
             return "ПРАВДА", 75
 
         # Strong NLI contradiction (sources clearly contradict)
         if gap < -t.strong_gap:
-            # Safety: if LLM disagrees, this might be adversarial_true or
-            # NLI contamination → prefer honest uncertainty over confident wrong answer
+            # V19: trust NLI when gap is very strong. Myth detection and
+            # person/fact swaps rely on this path. LLM parametric knowledge
+            # can hallucinate on adversarial framings (Vikings' horned helmets
+            # → LLM=+1), so a decisive NLI contradiction wins.
             if llm_signal == +1:
-                return "НЕ УВЕРЕНА", 48
+                if gap < -0.50 or con >= 0.75:
+                    return "ЛОЖЬ", 64
+                return "ПРАВДА", 58
             return "ЛОЖЬ", 75
 
         # Moderate NLI entailment
         if gap > t.moderate_gap:
+            if llm_signal == -1:
+                # V19: Trust LLM disagreement for moderate snippet entailment. Common
+                # myths entail on popular-culture snippets but LLM parametric knows
+                # they're false. Previously НЕ УВЕРЕНА 50 (still wrong).
+                return "ЛОЖЬ", 58
+            # V19 calibration: entailment only from T3/T4 sources is weak evidence.
+            # If no T1 authoritative source agrees, don't commit to ПРАВДА — the
+            # entailment may be a pop-culture echo of the claim phrasing.
+            if t1_count == 0 and llm_signal != +1:
+                return "НЕ УВЕРЕНА", 50
             return "ПРАВДА", 65
 
         # Moderate NLI contradiction
         if gap < -t.moderate_gap:
-            if debunk_count >= 1:
-                return "ЛОЖЬ", 68
+            # V18: Check LLM coherence BEFORE debunk threshold. Single spurious
+            # debunk match (on "миф"/"на самом деле" in off-topic snippet) was
+            # pre-empting LLM=+1 trust for TRUE claims like Гагарин.
+            if llm_signal == +1:
+                return "ПРАВДА", 60
+            if debunk_count >= 2:
+                return "ЛОЖЬ", 70
             if llm_signal == -1:
                 return "ЛОЖЬ", 62
-            if llm_signal == +1:
-                return "НЕ УВЕРЕНА", 48
             return "ЛОЖЬ", 58
 
         # ── TIER 5: LLM parametric knowledge (last resort) ──
@@ -1085,17 +1258,13 @@ class FactCheckPipeline:
                 debunk_count = self._check_debunk(sc, sources)
                 _report("debunk", {"claim": sc, "count": debunk_count})
 
-                # Tier 4: LLM knowledge
-                # Вызываем если нет СТРОГИХ сигналов (wikidata/nli/debunk чистые).
-                # num_signal=+1 НЕ блокирует: число может встречаться в ином контексте
-                # (пример: '1943' есть в статьях о ВМВ, но не как дата окончания войны).
-                llm_signal = 0
-                ent = nli_scores.get("ent", 0)
-                con = nli_scores.get("con", 0)
-                nli_uncertain = abs(ent - con) < 0.30  # слабый или отсутствующий сигнал NLI
-                nli_contradicts_no_wd = nli_signal == -1 and wd_signal == 0  # NLI-only без WD подтверждения
-                if wd_signal == 0 and (nli_uncertain or nli_contradicts_no_wd):
-                    llm_signal = self._check_llm_knowledge(sc)
+                # Tier 4: LLM knowledge.
+                # V18: Always call LLM, even when WD has a signal. Needed as a coherence
+                # check against WD directional false positives — e.g. "Солнце вращается
+                # вокруг Земли" matched WD "Земля→вокруг:Солнце" via lexical overlap
+                # but the directional relation was REVERSED. LLM disagreement on a WD=+1
+                # claim signals this kind of spurious confirm.
+                llm_signal = self._check_llm_knowledge(sc)
                 _report("llm_knowledge", {"claim": sc, "signal": llm_signal})
 
                 # V18: Per-sub-claim scam detection for composites

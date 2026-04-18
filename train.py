@@ -7,7 +7,18 @@ Fine-tuning скрипт (Unsloth + QLoRA).
 import argparse
 import json
 import os
+import sys
 import torch
+
+# Fix для Windows spawn-воркеров: добавляем unsloth_compiled_cache в PYTHONPATH,
+# чтобы subprocess мог импортировать UnslothSFTTrainer (иначе dill.loads падает).
+_COMPILED_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unsloth_compiled_cache")
+if os.path.isdir(_COMPILED_CACHE):
+    if _COMPILED_CACHE not in sys.path:
+        sys.path.insert(0, _COMPILED_CACHE)
+    _existing_pp = os.environ.get("PYTHONPATH", "")
+    if _COMPILED_CACHE not in _existing_pp:
+        os.environ["PYTHONPATH"] = _COMPILED_CACHE + (os.pathsep + _existing_pp if _existing_pp else "")
 
 from config import ModelConfig, LoraConfig, TrainingConfig
 

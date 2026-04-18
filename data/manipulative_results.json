@@ -1,0 +1,42 @@
+{
+  "progress": "4/10",
+  "correct_so_far": 3,
+  "results": [
+    {
+      "claim": "Высадка американских астронавтов на Луну в 1969 году была снята в голливудской студии",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 34,
+      "correct": true,
+      "category": "conspiracy",
+      "latency": 105.75
+    },
+    {
+      "claim": "Мозг человека использует лишь 10 процентов своих возможностей",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 15,
+      "correct": true,
+      "category": "myth",
+      "latency": 99.54
+    },
+    {
+      "claim": "Викинги носили шлемы с рогами в боевых сражениях",
+      "expected": "ЛОЖЬ",
+      "predicted": "ПРАВДА",
+      "score": 65,
+      "correct": false,
+      "category": "myth",
+      "latency": 111.13
+    },
+    {
+      "claim": "Прививки вызывают у детей аутизм",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 22,
+      "correct": true,
+      "category": "pseudoscience",
+      "latency": 65.8
+    }
+  ]
+}

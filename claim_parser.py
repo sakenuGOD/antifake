@@ -446,6 +446,29 @@ def extract_numbers(text: str) -> List[Dict[str, Any]]:
                 "context": ctx,
             })
 
+    # V19.1: Annotate one-sided bounds. A number preceded by "более/больше/свыше/
+    # не менее" is a lower bound — source values >= claim are matches, and
+    # source values > claim are NOT mismatches. "Не более/меньше" is an upper
+    # bound (symmetric). Annotation is consumed by compare_numbers() downstream.
+    _LOWER_BOUND_RE = re.compile(
+        r'\b(более|больше|свыше|от|не\s+менее|не\s+меньше|минимум|как\s+минимум)\s*$',
+        re.IGNORECASE,
+    )
+    _UPPER_BOUND_RE = re.compile(
+        r'\b(менее|меньше|до|не\s+более|не\s+больше|максимум|как\s+максимум)\s*$',
+        re.IGNORECASE,
+    )
+    for r in results:
+        raw = r.get("raw", "")
+        pos = text.find(raw)
+        if pos < 0:
+            continue
+        prefix = text[max(0, pos - 30):pos].strip()
+        if _LOWER_BOUND_RE.search(prefix):
+            r["bound"] = "lower"
+        elif _UPPER_BOUND_RE.search(prefix):
+            r["bound"] = "upper"
+
     return results
 
 
@@ -660,11 +683,23 @@ def compare_numbers(claim_numbers: List[Dict], source_numbers: List[Dict],
                 best_match = sn
 
         if best_match is not None:
+            # V19.1: honour one-sided bounds annotated on claim numbers.
+            # "Более 97%" is satisfied by any source value >= 97; exceeding the
+            # claim is NOT a contradiction (whereas it would be for an equality
+            # claim "Ровно 97%"). Same logic symmetric for upper bounds.
+            bound = cn.get("bound")
+            if bound == "lower":
+                match = best_match["value"] >= cn["value"] * (1 - tolerance)
+            elif bound == "upper":
+                match = best_match["value"] <= cn["value"] * (1 + tolerance)
+            else:
+                match = best_deviation <= tolerance
             comparisons.append({
                 "claim_number": cn,
                 "source_number": best_match,
-                "match": best_deviation <= tolerance,
+                "match": match,
                 "deviation": round(best_deviation, 4),
+                "bound": bound,
             })
         else:
             # V17: No comparable data of same type — skip, not a mismatch

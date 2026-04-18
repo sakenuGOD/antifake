@@ -16,7 +16,7 @@ class ModelConfig:
     # Оригинальная модель для inference через plain transformers (без Unsloth)
     # Unsloth-версия уже 4-bit — нельзя квантовать повторно через BitsAndBytes
     inference_model_name: str = "mistralai/Mistral-7B-Instruct-v0.3"
-    max_seq_length: int = 4096           # 4096 — больше контекста для reasoning с источниками
+    max_seq_length: int = 1024           # p99 данных ~550 токенов; 1024 с запасом и отключает gradient offload
     dtype: str = None  # auto-detect (bf16 на Blackwell)
     load_in_4bit: bool = True
 
@@ -39,9 +39,9 @@ class LoraConfig:
 class TrainingConfig:
     output_dir: str = "adapters"
     num_train_epochs: int = 4             # 4 эпохи для малого датасета (~2500)
-    per_device_train_batch_size: int = 1   # 1 — safe для 12GB (избегает gradient offload)
+    per_device_train_batch_size: int = 2   # 2 при seq=1024 (меньше overhead, тот же effective batch)
     per_device_eval_batch_size: int = 1   # 1 — eval тоже должен быть 1 (иначе OOM при evaluation)
-    gradient_accumulation_steps: int = 8   # эффективный batch = 8
+    gradient_accumulation_steps: int = 4   # эффективный batch = 2×4 = 8
     eval_accumulation_steps: int = 4      # накапливать predictions пошагово (не всё сразу на GPU)
     learning_rate: float = 5e-5           # низкий LR для точного дообучения
     weight_decay: float = 0.01
@@ -79,7 +79,7 @@ class DecisionThresholds:
     """
     strong_gap: float = 0.30       # NLI gap for high-confidence verdict
     moderate_gap: float = 0.12     # NLI gap for moderate verdict
-    num_nli_override: float = 0.25 # NLI con-ent gap to override NUM=+1
+    num_nli_override: float = 0.40 # NLI con-ent gap to override NUM=+1 (raised from 0.25: NLI on snippets is noisy, confirmed numbers should rarely be flipped)
 
 
 @dataclass
