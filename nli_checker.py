@@ -294,6 +294,111 @@ class NLIChecker:
             score *= 0.7
         return score
 
+    # V20: Proper-noun sentence-initial filter — don't treat sentence-starting
+    # capitalization as a proper noun. Covers:
+    #   - Russian sentence-starters (Когда, Что, …)
+    #   - Ordinals and their gender variants (Первый, Вторая, Третье, …) which
+    #     often lead named events ("Вторая мировая война") where the ordinal is
+    #     the only capitalized word and the rest of the name is lowercase. NLI
+    #     on such claims is driven by the event's content words, not the ordinal.
+    _SENTENCE_STARTERS = {
+        # question / connector words
+        "когда", "что", "как", "где", "почему", "нужно", "можно", "это",
+        "существует", "возможно", "действительно", "например", "однако",
+        "сейчас", "сегодня", "вчера", "раньше", "некоторые", "многие",
+        "большинство", "именно", "кроме", "согласно", "после", "перед",
+        "каждый", "каждая", "каждое", "весь", "вся", "все", "всё",
+        # ordinals — Russian 1–10 across gender / number variants
+        "первый", "первая", "первое", "первые", "первому", "первую", "первой",
+        "второй", "вторая", "второе", "вторые", "второму", "вторую",
+        "третий", "третья", "третье", "третьи", "третьему", "третью", "третьей",
+        "четвёртый", "четвертый", "четвёртая", "четвертая", "четвёртое", "четвертое",
+        "пятый", "пятая", "пятое", "пятые",
+        "шестой", "шестая", "шестое",
+        "седьмой", "седьмая", "седьмое",
+        "восьмой", "восьмая", "восьмое",
+        "девятый", "девятая", "девятое",
+        "десятый", "десятая", "десятое",
+    }
+
+    @staticmethod
+    def _extract_proper_noun_groups(text: str) -> List[List[str]]:
+        """Extract proper-noun stem groups from text.
+
+        Adjacent capitalized tokens (no intervening lowercase word) form a
+        single group — this treats compound names like "Юрий Гагарин" or
+        "Виталик Бутерин" as one entity. Separate groups mark distinct
+        entities in the claim (e.g., "Биткоин ... Виталиком Бутериным" →
+        two groups: [битко] and [витал, бутер]).
+
+        Sentence-starter words that happen to be capitalized (Как, Что, etc.)
+        are skipped.
+
+        Returns a list of groups; each group is a list of 5-char lowercase
+        stems preserving input order.
+        """
+        # Tokenize into (token, is_capitalized) pairs. Word = [A-Za-zА-ЯЁа-яё]{2,}
+        word_re = re.compile(r'[А-ЯЁA-Zа-яёa-z]{2,}')
+        groups: List[List[str]] = []
+        current: List[str] = []
+        for m in word_re.finditer(text):
+            w = m.group(0)
+            first = w[0]
+            is_cap = first.isupper()
+            if not is_cap:
+                if current:
+                    groups.append(current)
+                    current = []
+                continue
+            low = w.lower()
+            if low in NLIChecker._SENTENCE_STARTERS:
+                if current:
+                    groups.append(current)
+                    current = []
+                continue
+            stem = low[:5]
+            if stem not in current:
+                current.append(stem)
+        if current:
+            groups.append(current)
+        return groups
+
+    @staticmethod
+    def _subject_mention_penalty(claim_pn_groups: List[List[str]],
+                                 sentence: str) -> float:
+        """Return multiplier in [0.3, 1.0] for NLI sentence scores.
+
+        Mechanism: NLI on a sentence that doesn't contain the claim's primary
+        entity (first proper-noun group = the subject) is likely cross-topic
+        noise — the signal comes from verb/object lexical echo, not the claim
+        itself. Strong entailment from such a sentence is a spurious match.
+
+        Compound names are handled via groups: "Юрий Гагарин" is one group,
+        so a sentence mentioning only "Гагарин" still satisfies the primary
+        subject.
+
+        Rules:
+          - No proper nouns in claim → no penalty (1.0).
+          - Any stem of the PRIMARY group in sentence → 1.0.
+          - Primary group absent, but some other-group stem present → 0.6.
+          - No claim proper-noun stem in sentence at all → 0.3.
+        """
+        if not claim_pn_groups:
+            return 1.0
+        sent_lower = sentence.lower()
+        primary = claim_pn_groups[0]
+        primary_hit = any(s in sent_lower for s in primary)
+        if primary_hit:
+            return 1.0
+        rest = [s for g in claim_pn_groups[1:] for s in g]
+        any_other = any(s in sent_lower for s in rest)
+        if any_other:
+            # Sentence mentions a non-primary entity (e.g., claim's object)
+            # but not the subject — classic entity-swap noise signal.
+            return 0.30
+        # Sentence references no claim entity at all — cross-topic echo.
+        return 0.10
+
     def _check_batch(self, claim: str, sentences: List[str]) -> List[Dict[str, float]]:
         """Batch NLI check for multiple sentences against a single claim."""
         if not sentences:
@@ -372,6 +477,12 @@ class NLIChecker:
         all_sentence_scores = []
         source_level_results = []
 
+        # V20: pre-compute claim's proper-noun groups for subject-mention guard.
+        # Adjacent capitalized tokens are grouped (compound names). Applied per
+        # sentence below to downgrade NLI signals from sentences that don't
+        # reference the claim's primary subject.
+        claim_pn_groups = self._extract_proper_noun_groups(claim)
+
         for source in sources:
             evidence = source.get(snippet_key, "")
             if not evidence:
@@ -389,6 +500,19 @@ class NLIChecker:
                 guarded_ent = self._claim_term_guard(claim, sentences[i], sr["entailment"])
                 # A2: Symmetric guard — also cap contradiction
                 guarded_con = self._claim_term_guard(claim, sentences[i], sr["contradiction"], symmetric=True)
+                # V20: subject-mention penalty. If the claim's primary proper-noun
+                # subject is missing from the sentence, the NLI signal is likely
+                # cross-topic noise (verb/object lexical echo). Applies symmetrically
+                # to ent and con so both false entailments and false contradictions
+                # get downgraded.
+                subj_mult = self._subject_mention_penalty(claim_pn_groups, sentences[i])
+                # Record whether this sentence references the claim's primary
+                # subject — used in source-level aggregation to flag
+                # signals driven purely by cross-topic lexical echo.
+                sr["_subject_verified"] = (subj_mult >= 1.0)
+                if subj_mult < 1.0:
+                    guarded_ent *= subj_mult
+                    guarded_con *= subj_mult
                 changed = False
                 if guarded_ent < sr["entailment"]:
                     sr["entailment"] = guarded_ent
@@ -426,10 +550,14 @@ class NLIChecker:
 
             # V17: Source-level aggregation — MAX single best sentence, no margin guard
             if sentence_results:
-                ent_scores = sorted([r["entailment"] for r in sentence_results], reverse=True)
-                con_scores = sorted([r["contradiction"] for r in sentence_results], reverse=True)
-                best_ent = ent_scores[0]  # single best sentence
-                best_con = con_scores[0]
+                # V20: track whether the sentence driving best_ent / best_con
+                # referenced the claim's primary subject. If not, the source's
+                # signal is likely cross-topic noise even after per-sentence
+                # penalty (there may just be no on-topic sentence at all).
+                best_ent_sr = max(sentence_results, key=lambda r: r["entailment"])
+                best_con_sr = max(sentence_results, key=lambda r: r["contradiction"])
+                best_ent = best_ent_sr["entailment"]
+                best_con = best_con_sr["contradiction"]
                 if best_ent > best_con:
                     best_label = "entailment"
                 else:
@@ -437,6 +565,8 @@ class NLIChecker:
                 source_level_results.append({
                     "entailment": best_ent,
                     "contradiction": best_con,
+                    "subject_verified_ent": bool(best_ent_sr.get("_subject_verified", True)),
+                    "subject_verified_con": bool(best_con_sr.get("_subject_verified", True)),
                     "label": best_label,
                     "source": source.get("title", source.get("source", "")),
                     "url": source.get("link") or source.get("url", ""),
@@ -465,6 +595,22 @@ class NLIChecker:
 
         max_ent = max(s["entailment"] for s in decisive)
         max_con = max(s["contradiction"] for s in decisive)
+
+        # V20: subject-verified aggregates. A signal is "subject-verified" if at
+        # least one decisive source driving it had its best-scoring sentence
+        # mention the claim's primary subject. Signals without ANY subject-
+        # verified source are unreliable (classic entity-swap noise) — the
+        # decide-tree uses this to gate strong/moderate NLI verdicts.
+        subj_verified_ent = any(
+            s.get("subject_verified_ent", True)
+            for s in decisive
+            if s["entailment"] >= 0.50
+        )
+        subj_verified_con = any(
+            s.get("subject_verified_con", True)
+            for s in decisive
+            if s["contradiction"] >= 0.50
+        )
 
         ent_count = sum(1 for p in decisive if p["label"] == "entailment")
         con_count = sum(1 for p in decisive if p["label"] == "contradiction")
@@ -496,6 +642,8 @@ class NLIChecker:
             "max_entailment": round(max_ent, 4),
             "max_contradiction": round(max_con, 4),
             "is_contested": is_contested,
+            "subject_verified_ent": subj_verified_ent,
+            "subject_verified_con": subj_verified_con,
             "summary": f"{ent_count} подтверждают, {con_count} опровергают, {neu_count} нейтральны",
             "nli_score": nli_score,
         }

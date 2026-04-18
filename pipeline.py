@@ -784,6 +784,11 @@ class FactCheckPipeline:
             "top_con_tier": tier_weighted.get("top_con_tier", "T3"),
             "t1_ratio": tier_weighted.get("t1_ratio", 0.0),
             "tier_counts": tier_weighted.get("tier_counts", {}),
+            # V20: subject-verification flags — True if at least one decisive
+            # source drove the signal from a sentence mentioning the claim's
+            # primary subject. Default True for backward safety when no flag.
+            "subject_verified_ent": nli_result.get("subject_verified_ent", True),
+            "subject_verified_con": nli_result.get("subject_verified_con", True),
         }
 
         # V17.1: Gap-based threshold — dominant signal wins if gap >= 0.15
@@ -877,6 +882,14 @@ class FactCheckPipeline:
         tier_counts = nli_scores.get("tier_counts", {})
         t1_count = tier_counts.get("T1", 0) if tier_counts else 0
 
+        # V20: subject-verification flags. When an NLI signal is NOT subject-
+        # verified (no decisive source mentioned the claim's primary subject),
+        # the signal is most likely cross-topic lexical echo — treat it as
+        # unreliable and defer to LLM / downgrade to НЕ УВЕРЕНА rather than
+        # issuing a confident verdict from it.
+        subj_ok_ent = nli_scores.get("subject_verified_ent", True)
+        subj_ok_con = nli_scores.get("subject_verified_con", True)
+
         # ── TIER 0: Scam (rule-based, very high confidence) ──
         if is_scam:
             return "СКАМ", 95
@@ -925,6 +938,17 @@ class FactCheckPipeline:
             # claims. When LLM strongly disagrees, trust LLM over snippet-level NLI.
             if llm_signal == -1:
                 return "ЛОЖЬ", 62
+            # V20: subject-verification gate. Strong entailment with no decisive
+            # source mentioning the claim's subject is cross-topic noise (classic
+            # entity-swap pattern: claim asks about X, sentence talks about Y
+            # doing the verb). Defer to LLM parametric when it has a view; else
+            # НЕ УВЕРЕНА rather than echo the spurious match.
+            if not subj_ok_ent:
+                if llm_signal == +1:
+                    return "ПРАВДА", 58
+                if llm_signal == -1:
+                    return "ЛОЖЬ", 62
+                return "НЕ УВЕРЕНА", 45
             # V19 calibration: strong entailment with zero T1 sources is a red flag.
             # Popular myths entail strongly on non-authoritative sources. Require
             # at least one T1 confirmation or defer to LLM.
@@ -934,6 +958,13 @@ class FactCheckPipeline:
 
         # Strong NLI contradiction (sources clearly contradict)
         if gap < -t.strong_gap:
+            # V20: subject-verification gate — see strong-ent branch.
+            if not subj_ok_con:
+                if llm_signal == -1:
+                    return "ЛОЖЬ", 62
+                if llm_signal == +1:
+                    return "ПРАВДА", 58
+                return "НЕ УВЕРЕНА", 45
             # V19: trust NLI when gap is very strong. Myth detection and
             # person/fact swaps rely on this path. LLM parametric knowledge
             # can hallucinate on adversarial framings (Vikings' horned helmets
@@ -951,6 +982,10 @@ class FactCheckPipeline:
                 # myths entail on popular-culture snippets but LLM parametric knows
                 # they're false. Previously НЕ УВЕРЕНА 50 (still wrong).
                 return "ЛОЖЬ", 58
+            # V20: subject-verification gate — moderate entailment from a non-
+            # subject-verified sentence is weak evidence even with T1 sources.
+            if not subj_ok_ent and llm_signal != +1:
+                return "НЕ УВЕРЕНА", 48
             # V19 calibration: entailment only from T3/T4 sources is weak evidence.
             # If no T1 authoritative source agrees, don't commit to ПРАВДА — the
             # entailment may be a pop-culture echo of the claim phrasing.
@@ -965,6 +1000,9 @@ class FactCheckPipeline:
             # pre-empting LLM=+1 trust for TRUE claims like Гагарин.
             if llm_signal == +1:
                 return "ПРАВДА", 60
+            # V20: subject-verification gate — same logic for moderate con.
+            if not subj_ok_con and llm_signal != -1:
+                return "НЕ УВЕРЕНА", 48
             if debunk_count >= 2:
                 return "ЛОЖЬ", 70
             if llm_signal == -1:
@@ -1275,8 +1313,13 @@ class FactCheckPipeline:
                     sc_scam_info = detect_scam_patterns(sc)
                     sc_is_scam = sc_scam_info["is_scam"]
 
+                # V20: surface subject-verification flags in the log so we can see
+                # at a glance when NLI signals are driven by cross-topic noise.
+                _subj_e = "y" if nli_scores.get("subject_verified_ent", True) else "n"
+                _subj_c = "y" if nli_scores.get("subject_verified_con", True) else "n"
                 print(f"  [{sc[:50]}] WD={wd_signal:+d} NUM={num_signal:+d} "
-                      f"NLI={nli_signal:+d} (ent={nli_scores['ent']:.2f}, con={nli_scores['con']:.2f}) "
+                      f"NLI={nli_signal:+d} (ent={nli_scores['ent']:.2f}, con={nli_scores['con']:.2f}, "
+                      f"subj={_subj_e}{_subj_c}) "
                       f"debunk={debunk_count} LLM={llm_signal:+d}"
                       f"{' SCAM' if sc_is_scam else ''}")
 
