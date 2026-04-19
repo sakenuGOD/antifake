@@ -196,9 +196,24 @@ class FactCheckPipeline:
     # ======================================================================
 
     @staticmethod
+    def _mask_quoted(claim: str) -> str:
+        """Replace text inside Russian/Latin quotation marks with neutral
+        placeholder characters, preserving claim length and word boundaries.
+        Used by decomposition to keep titles like «Война и мир» intact —
+        without this the " и " inside the title is treated as a conjunction
+        and the claim gets split through the title."""
+        # Quote pairs: « », " ", " " ' '. Replace inner chars with 'x'.
+        return re.sub(
+            r'(«[^»]*»|"[^"]*"|"[^"]*"|\'[^\']*\')',
+            lambda m: m.group(0)[0] + ('x' * (len(m.group(0)) - 2)) + m.group(0)[-1],
+            claim,
+        )
+
+    @staticmethod
     def _has_conjunction(claim: str) -> bool:
         """Check if claim has compound markers."""
-        claim_lower = claim.lower()
+        # Mask quoted titles so internal " и " doesn't trigger decomposition.
+        claim_lower = FactCheckPipeline._mask_quoted(claim).lower()
         markers = [" и ", ", а также", ", при этом", ", причём", ", а "]
         if any(m in claim_lower for m in markers):
             return True
@@ -232,9 +247,21 @@ class FactCheckPipeline:
         Guards against over-decomposition: only splits when part2 introduces
         a genuinely new topic (new nouns not in part1).
         """
-        parts = re.split(
+        # V21: split on the *masked* claim so that conjunctions inside
+        # quoted titles («Война и мир») don't produce split points; then map
+        # the split offsets back onto the original characters.
+        masked = self._mask_quoted(claim)
+        split_re = re.compile(
             r',\s*(?:и|а\s+также|при\s+этом|причём|а)\s+|\s+(?:и|а\s+также)\s+',
-            claim, flags=re.IGNORECASE)
+            flags=re.IGNORECASE,
+        )
+        spans = []
+        last = 0
+        for m in split_re.finditer(masked):
+            spans.append(claim[last:m.start()])
+            last = m.end()
+        spans.append(claim[last:])
+        parts = spans
         if len(parts) <= 1:
             return [claim]
 
@@ -635,8 +662,9 @@ class FactCheckPipeline:
             # Person mismatch: WD says "author: Толстой" but claim says "Достоевский написал"
             # Universal: for person-related properties (P50, P112, P170, P57, P86),
             # check if WD value is a person NOT mentioned in the claim
+            hard_mismatch = False
             if _HAS_NATASHA and confirmed == 0 and contradicted == 0:
-                _PERSON_PROPS = {"P50", "P112", "P170", "P175", "P57", "P86"}
+                _PERSON_PROPS = {"P50", "P112", "P170", "P175", "P57", "P86", "P178"}
                 claim_persons = set()
                 for ent in extract_entities(claim):
                     if ent["type"] == "PER":
@@ -662,7 +690,114 @@ class FactCheckPipeline:
                             if not matched and v_words:
                                 print(f"  [Wikidata] Person mismatch: WD={v}, claim persons={claim_persons}")
                                 contradicted += 1
+                                hard_mismatch = True
                                 break
+
+            # V21: Generalised structural entity-mismatch.
+            # Covers location/structural single-value properties (capital, country,
+            # continent, HQ, mouth, location, ...) — parallel to Person-mismatch
+            # above. Pattern: WD returns a canonical proper-noun value V for entity
+            # E; the claim states E with a DIFFERENT proper noun in that role.
+            # Example: claim "Столица Австралии — Сидней"; WD says австралия→P36=
+            # Канберра; claim contains "Сидней" ≠ Канберра → entity-swap →
+            # contradicted. Guarded: only fires when (a) WD value starts with
+            # uppercase (proper noun) and (b) claim has at least one other proper
+            # noun that is NOT the entity and NOT the WD value AND (c) the claim
+            # text actually invokes the relation being checked (so we don't
+            # misfire on e.g. "Эйфелева башня находится в Париже" → Париж P17
+            # =Франция, where "Эйфелева" is a proper noun in a different role).
+            #
+            # Geography props require an explicit relation keyword in the claim;
+            # creator/author props fire on the presence of the canonical creator-
+            # verb vocabulary (which is already how check_structured_facts decides
+            # to query them, so the claim lemma check here is a paranoid redo).
+            _STRUCTURAL_PROPS_RELATION_KEYS = {
+                "P36":  ("столиц",),
+                "P17":  ("стран",),  # "стран" ≠ "страниц" substring check below
+                "P30":  ("материк", "континент"),
+                "P159": ("штаб", "главн"),
+                "P403": ("впада", "устье"),
+                # P276 ('location') is intentionally omitted — it fires on any
+                # "находится в" / "расположен" which carries no role information.
+                # Creator props: no keyword gate — wikidata.py already gates the
+                # lookup itself on creator-verb triggers ('написал', 'создал', …),
+                # and the role is unambiguous in those cases.
+                "P112": (),
+                "P170": (),
+                "P175": (),
+                "P50":  (),
+                "P57":  (),
+                "P86":  (),
+                "P178": (),
+            }
+            if _HAS_NATASHA and confirmed == 0 and contradicted == 0:
+                # Extract claim's proper-noun tokens (≥3 chars, capitalised).
+                # Include the first token — sentence-initial entities ("Биткоин",
+                # "Сахара", "Пушкин") must participate in the mismatch check.
+                # The "other proper nouns" test below still rules out cases where
+                # the first word is a generic common noun (e.g. "Столица").
+                pn_tokens = [m.group(0) for m in
+                             re.finditer(r'[А-ЯЁA-Z][а-яёa-zA-Z]{2,}', claim)]
+                pn_lemmas = {lemmatize(t.lower()) for t in pn_tokens}
+
+                claim_lower = claim.lower()
+                for f in facts:
+                    if f.get("match") is not None:
+                        continue
+                    pid = f.get("property_id", "")
+                    if pid not in _STRUCTURAL_PROPS_RELATION_KEYS:
+                        continue
+                    # Property-specific relation gate: geography props must be
+                    # explicitly invoked by claim text (e.g. P17 requires "стран";
+                    # otherwise "Эйфелева башня находится в Париже" would fire
+                    # on "Париж → P17=Франция" because Эйфелева is an unrelated
+                    # proper noun). Creator props have empty key tuple (no gate).
+                    rel_keys = _STRUCTURAL_PROPS_RELATION_KEYS[pid]
+                    if rel_keys and not any(k in claim_lower for k in rel_keys):
+                        continue
+                    entity_raw = f.get("entity", "").lower()
+                    entity_lemma = lemmatize(entity_raw)
+                    # Skip when entity resolution likely matched a common word
+                    # (lowercase, short, or adjective form). WD results for
+                    # "жаркой → род занятий: X" must not trigger this rule.
+                    if len(entity_raw) < 4 or not any(
+                        entity_lemma == lemmatize(t.lower()) or entity_raw in t.lower()
+                        for t in pn_tokens
+                    ):
+                        continue
+                    for v in f.get("wikidata_values", []):
+                        if len(v) < 3:
+                            continue
+                        # Value must itself be a proper noun for structural
+                        # swap to be meaningful (skip numeric / common-noun vals).
+                        if not v[0].isupper():
+                            continue
+                        v_lemmas = {lemmatize(w.lower())
+                                    for w in re.findall(r'[А-ЯЁA-Zа-яёa-z]{3,}', v)}
+                        if not v_lemmas:
+                            continue
+                        # Candidate proper nouns in claim, excluding the entity
+                        # itself and the WD value. Anything left means the claim
+                        # asserts a different proper noun for this role.
+                        other_lemmas = pn_lemmas - {entity_lemma} - v_lemmas
+                        if not other_lemmas:
+                            continue
+                        # Sanity: WD value should not already appear in claim.
+                        if v_lemmas & pn_lemmas:
+                            continue
+                        print(f"  [Wikidata] Structural mismatch ({pid}): "
+                              f"WD '{entity_raw}'→'{v}', claim has {sorted(other_lemmas)}")
+                        contradicted += 1
+                        hard_mismatch = True
+                        break
+                    if hard_mismatch:
+                        break
+
+            # Surface the hard-mismatch flag so _decide can skip the V18
+            # LLM-coherence fall-through, which is intended for directional /
+            # lexical WD false positives, not for entity-swap contradictions.
+            if self._ctx.wikidata_result is not None:
+                self._ctx.wikidata_result["hard_mismatch"] = hard_mismatch
 
             if contradicted > 0:
                 return -1
@@ -899,8 +1034,17 @@ class FactCheckPipeline:
         # false positives (e.g. claim "Солнце вокруг Земли" matched "Земля→вокруг:Солнце"
         # via shared entities). When LLM strongly disagrees with WD, WD signal is
         # likely spurious → trust LLM parametric knowledge.
+        # V21: structural entity-mismatch (person-swap, location-swap) is a hard
+        # contradiction from the structured DB directly — LLM parametric knowledge
+        # is prone to hallucinate that swapped claims are true (pop-culture echo).
+        # The hard_mismatch flag set by _check_wikidata tells us to trust WD.
+        wd_hard = False
+        try:
+            wd_hard = bool(self._ctx.wikidata_result.get("hard_mismatch", False))
+        except Exception:
+            wd_hard = False
         if wikidata_signal == -1:
-            if llm_signal == +1:
+            if llm_signal == +1 and not wd_hard:
                 # WD may be multi-word match false negative — fall through to NLI/LLM tiers
                 pass
             else:
@@ -911,13 +1055,32 @@ class FactCheckPipeline:
             return "ПРАВДА", 85
 
         # ── TIER 2: Numbers (deterministic comparison) ──
+        # V21: NUM=-1 is not a veto when the other two signals agree the claim
+        # is correct. The extractor is context-blind — it pulls every number
+        # from every snippet and picks the closest-of-same-type within 10%.
+        # For a claim like "Более 97% климатологов согласны…" the sources may
+        # report related-but-different figures (emissions %, temperature Δ)
+        # which don't line up with 97 and produce a spurious mismatch. When
+        # both LLM parametric knowledge and NLI entailment agree with the
+        # claim, a single context-blind mismatch shouldn't flip the verdict.
         if numbers_signal == -1:
+            if llm_signal == +1 and nli_signal == +1:
+                # Strong multi-signal consensus for truth; NUM likely spurious.
+                return "ПРАВДА", 62
             return "ЛОЖЬ", 85
         if numbers_signal == +1:
             # Number matched in sources, but NLI strongly disagrees →
             # number appeared in wrong context (e.g., "1939" in WWII article for WWI claim)
             if (con - ent) > t.num_nli_override:
                 return "ЛОЖЬ", 72
+            # V21: context-blind NUM=+1 also yields to LLM=-1 — symmetric to
+            # the NUM=-1 yield-to-consensus rule. The number extractor matches
+            # any same-type number within tolerance, so a false claim like
+            # "Берлинская стена пала в 1979" gets NUM=+1 from any "1979"
+            # mention in sources (cold-war-era, unrelated). When LLM
+            # parametric knowledge actively disagrees, prefer it.
+            if llm_signal == -1:
+                return "ЛОЖЬ", 60
             return "ПРАВДА", 80
 
         # ── From here: WD=0, NUM=0 — rely on NLI + Debunk + LLM ──

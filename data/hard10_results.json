@@ -1,6 +1,6 @@
 {
-  "accuracy": 0.8,
-  "correct": 8,
+  "accuracy": 0.9,
+  "correct": 9,
   "total": 10,
   "results": [
     {
@@ -10,7 +10,7 @@
       "score": 85,
       "correct": true,
       "category": "well_known_fact",
-      "latency": 207.4
+      "latency": 124.21
     },
     {
       "claim": "Юрий Гагарин был первым человеком в космосе",
@@ -19,7 +19,7 @@
       "score": 75,
       "correct": true,
       "category": "well_known_fact",
-      "latency": 207.33
+      "latency": 152.45
     },
     {
       "claim": "Солнце вращается вокруг Земли",
@@ -28,7 +28,7 @@
       "score": 10,
       "correct": true,
       "category": "pseudo_authority_false",
-      "latency": 203.24
+      "latency": 182.48
     },
     {
       "claim": "Эйфелева башня находится в Париже",
@@ -37,16 +37,16 @@
       "score": 75,
       "correct": true,
       "category": "location_true",
-      "latency": 111.57
+      "latency": 133.71
     },
     {
       "claim": "Кислород составляет примерно 21% атмосферы Земли",
       "expected": "ПРАВДА",
-      "predicted": "ПРАВДА",
-      "score": 80,
-      "correct": true,
+      "predicted": "ЛОЖЬ",
+      "score": 15,
+      "correct": false,
       "category": "numerical_true",
-      "latency": 180.83
+      "latency": 198.5
     },
     {
       "claim": "Вторая мировая война закончилась в 1943 году",
@@ -55,7 +55,7 @@
       "score": 28,
       "correct": true,
       "category": "date_swap",
-      "latency": 187.14
+      "latency": 106.67
     },
     {
       "claim": "ДНК содержит генетическую информацию живых организмов",
@@ -64,34 +64,34 @@
       "score": 75,
       "correct": true,
       "category": "science_fact",
-      "latency": 257.41
+      "latency": 184.44
     },
     {
       "claim": "Биткоин был создан Виталиком Бутериным",
       "expected": "ЛОЖЬ",
-      "predicted": "ПРАВДА",
-      "score": 75,
-      "correct": false,
+      "predicted": "ЛОЖЬ",
+      "score": 10,
+      "correct": true,
       "category": "person_swap",
-      "latency": 201.84
+      "latency": 129.3
     },
     {
       "claim": "Столица Австралии — Сидней",
       "expected": "ЛОЖЬ",
       "predicted": "ЛОЖЬ",
-      "score": 34,
+      "score": 10,
       "correct": true,
       "category": "location_trap",
-      "latency": 216.96
+      "latency": 147.04
     },
     {
       "claim": "Сахара является самой большой жаркой пустыней в мире",
       "expected": "ПРАВДА",
-      "predicted": "ЛОЖЬ",
-      "score": 34,
-      "correct": false,
+      "predicted": "ПРАВДА",
+      "score": 65,
+      "correct": true,
       "category": "general_true",
-      "latency": 236.0
+      "latency": 173.56
     }
   ]
 }

@@ -1,15 +1,16 @@
 {
-  "progress": "4/10",
-  "correct_so_far": 3,
+  "accuracy": 0.5,
+  "correct": 5,
+  "total": 10,
   "results": [
     {
       "claim": "Высадка американских астронавтов на Луну в 1969 году была снята в голливудской студии",
       "expected": "ЛОЖЬ",
-      "predicted": "ЛОЖЬ",
-      "score": 34,
-      "correct": true,
+      "predicted": "ПРАВДА",
+      "score": 85,
+      "correct": false,
       "category": "conspiracy",
-      "latency": 105.75
+      "latency": 155.44
     },
     {
       "claim": "Мозг человека использует лишь 10 процентов своих возможностей",
@@ -18,25 +19,79 @@
       "score": 15,
       "correct": true,
       "category": "myth",
-      "latency": 99.54
+      "latency": 125.85
     },
     {
       "claim": "Викинги носили шлемы с рогами в боевых сражениях",
+      "expected": "ЛОЖЬ",
+      "predicted": "НЕ УВЕРЕНА",
+      "score": 45,
+      "correct": false,
+      "category": "myth",
+      "latency": 189.6
+    },
+    {
+      "claim": "Прививки вызывают у детей аутизм",
+      "expected": "ЛОЖЬ",
+      "predicted": "ПРАВДА",
+      "score": 75,
+      "correct": false,
+      "category": "pseudoscience",
+      "latency": 181.38
+    },
+    {
+      "claim": "Излучение сетей 5G вызывает онкологические заболевания у людей",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 28,
+      "correct": true,
+      "category": "conspiracy",
+      "latency": 275.29
+    },
+    {
+      "claim": "Земля имеет плоскую форму",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 34,
+      "correct": true,
+      "category": "pseudoscience",
+      "latency": 438.3
+    },
+    {
+      "claim": "Великая Китайская стена является единственным рукотворным объектом, видимым с Луны невооружённым глазом",
       "expected": "ЛОЖЬ",
       "predicted": "ПРАВДА",
       "score": 65,
       "correct": false,
       "category": "myth",
-      "latency": 111.13
+      "latency": 280.37
     },
     {
-      "claim": "Прививки вызывают у детей аутизм",
+      "claim": "COVID-19 был создан как биологическое оружие в лаборатории",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 28,
+      "correct": true,
+      "category": "conspiracy",
+      "latency": 166.65
+    },
+    {
+      "claim": "Более 97 процентов климатологов согласны, что глобальное потепление вызвано деятельностью человека",
+      "expected": "ПРАВДА",
+      "predicted": "ЛОЖЬ",
+      "score": 15,
+      "correct": false,
+      "category": "scientific_consensus",
+      "latency": 79.07
+    },
+    {
+      "claim": "Наполеон Бонапарт был человеком маленького роста по меркам своего времени",
       "expected": "ЛОЖЬ",
       "predicted": "ЛОЖЬ",
       "score": 22,
       "correct": true,
-      "category": "pseudoscience",
-      "latency": 65.8
+      "category": "myth",
+      "latency": 199.61
     }
   ]
 }

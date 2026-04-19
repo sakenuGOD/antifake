@@ -56,24 +56,106 @@ from source_credibility import boost_by_credibility
 
 
 # V13: Tenacity retry wrapper for Wikipedia/Wikidata API calls
+# V21: global token-bucket rate limiter — Wikipedia's MediaWiki API rate-limits
+# anonymous clients aggressively (observed cascading 429s after ~30-40 rapid
+# requests). We enforce a per-host min-interval between outgoing calls so
+# bursty inner loops (entity lookups per claim × many entities per claim) can't
+# drain the budget in seconds. 429 is also now explicitly retried with
+# exponential backoff and honoured Retry-After.
+import threading as _threading
+_WIKI_HOST_RE = re.compile(r'https?://([^/]+)/')
+_WIKI_MIN_INTERVAL = 0.35  # seconds between calls to the same host
+_wiki_rate_lock = _threading.Lock()
+_wiki_last_call: Dict[str, float] = {}
+
+
+def _wiki_rate_limit(url: str) -> None:
+    """Block until at least _WIKI_MIN_INTERVAL has elapsed since the last call
+    to this URL's host. Cheap, thread-safe; avoids the 429 storm we saw
+    when the pipeline fires 10+ Wikipedia entity lookups per claim."""
+    m = _WIKI_HOST_RE.match(url)
+    if not m:
+        return
+    host = m.group(1)
+    with _wiki_rate_lock:
+        last = _wiki_last_call.get(host, 0.0)
+        wait = _WIKI_MIN_INTERVAL - (time.time() - last)
+        if wait > 0:
+            time.sleep(wait)
+        _wiki_last_call[host] = time.time()
+
+
+class _RateLimitError(Exception):
+    """Signals HTTP 429 so tenacity retries it with exponential backoff."""
+
+
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
     retry=retry_if_exception_type((
         urllib.error.URLError,
         TimeoutError,
         OSError,
         ConnectionError,
+        _RateLimitError,
     )),
     reraise=True,
 )
 def _wiki_api_call(url: str, headers: dict = None, timeout: int = 10) -> dict:
-    """Single Wikipedia/Wikidata API call with tenacity retry."""
+    """Single Wikipedia/Wikidata API call with rate-limiting and retry.
+
+    V21: rate-limits per host (anonymous MediaWiki API kicks 429 aggressively);
+    treats HTTP 429 as retriable — exponential backoff wait between attempts
+    (and bumped to 4 attempts, max 30s between retries) so a rate-limit
+    episode clears instead of leaving the caller with zero sources.
+    """
     if headers is None:
         headers = {"User-Agent": "AntifakeBot/5.0 (fact-checking; Python)"}
+    _wiki_rate_limit(url)
     req = urllib.request.Request(url, headers=headers)
-    resp = urllib.request.urlopen(req, timeout=timeout)
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            # Bump this host's last-call time so in-flight siblings wait longer.
+            m = _WIKI_HOST_RE.match(url)
+            if m:
+                with _wiki_rate_lock:
+                    _wiki_last_call[m.group(1)] = time.time() + 2.0
+            raise _RateLimitError(f"429 on {url[:80]}") from e
+        raise
     return json.loads(resp.read())
+
+
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    retry=retry_if_exception_type((
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        ConnectionError,
+        _RateLimitError,
+    )),
+    reraise=True,
+)
+def _safe_urlopen(req, timeout: int = 10):
+    """urlopen with per-host rate-limit + 429-aware retry.
+
+    Use anywhere search.py hits Wikipedia directly (without going through
+    _wiki_api_call). Returns the raw response object; caller reads/parses.
+    """
+    _wiki_rate_limit(req.full_url)
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            m = _WIKI_HOST_RE.match(req.full_url)
+            if m:
+                with _wiki_rate_lock:
+                    _wiki_last_call[m.group(1)] = time.time() + 2.0
+            raise _RateLimitError(f"429 on {req.full_url[:80]}") from e
+        raise
 
 
 # ============================================================
@@ -1888,7 +1970,7 @@ class FactCheckSearcher:
                 f"&srlimit=3&srprop=snippet"
             )
             req  = urllib.request.Request(url, headers=headers)
-            resp = urllib.request.urlopen(req, timeout=8)
+            resp = _safe_urlopen(req, timeout=8)
             data = json.loads(resp.read())
             hits = data.get("query", {}).get("search", [])
 
@@ -1993,7 +2075,7 @@ class FactCheckSearcher:
             q = urllib.parse.quote(query[:100])
             url = f"http://export.arxiv.org/api/query?search_query=all:{q}&max_results={max_results}"
             req = urllib.request.Request(url, headers={"User-Agent": "AntifakeBot/3.0"})
-            resp = urllib.request.urlopen(req, timeout=8)
+            resp = _safe_urlopen(req, timeout=8)
             data = resp.read().decode("utf-8")
 
             articles = []
@@ -2391,7 +2473,7 @@ class FactCheckSearcher:
                     f"&srlimit=2&srprop=snippet"
                 )
                 req = urllib.request.Request(search_url, headers=headers)
-                resp = urllib.request.urlopen(req, timeout=8)
+                resp = _safe_urlopen(req, timeout=8)
                 data = json.loads(resp.read())
                 hits = data.get("query", {}).get("search", [])
 
@@ -2408,7 +2490,7 @@ class FactCheckSearcher:
                             f"&exintro=1&explaintext=1&format=json&exsentences=20"
                         )
                         req2 = urllib.request.Request(extract_url, headers=headers)
-                        resp2 = urllib.request.urlopen(req2, timeout=8)
+                        resp2 = _safe_urlopen(req2, timeout=8)
                         data2 = json.loads(resp2.read())
                         pages = data2.get("query", {}).get("pages", {})
 
@@ -2448,7 +2530,7 @@ class FactCheckSearcher:
                         f"&srlimit=2&srprop=snippet"
                     )
                     req_en = urllib.request.Request(search_url_en, headers=headers)
-                    resp_en = urllib.request.urlopen(req_en, timeout=8)
+                    resp_en = _safe_urlopen(req_en, timeout=8)
                     data_en = json.loads(resp_en.read())
                     hits_en = data_en.get("query", {}).get("search", [])
 
@@ -2463,7 +2545,7 @@ class FactCheckSearcher:
                                 f"&exintro=1&explaintext=1&format=json&exsentences=20"
                             )
                             req2_en = urllib.request.Request(extract_url_en, headers=headers)
-                            resp2_en = urllib.request.urlopen(req2_en, timeout=8)
+                            resp2_en = _safe_urlopen(req2_en, timeout=8)
                             data2_en = json.loads(resp2_en.read())
                             pages_en = data2_en.get("query", {}).get("pages", {})
 

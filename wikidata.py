@@ -36,6 +36,7 @@ PROPERTY_MAP = {
     # Организации
     "founder": "P112",          # основатель
     "founded_by": "P112",
+    "developer": "P178",        # V21: разработчик (для ПО, криптовалют, сетей)
     "inception": "P571",        # дата основания
     "headquarters": "P159",     # штаб-квартира
     # География
@@ -124,9 +125,16 @@ def _cache_set(key: str, data: Any) -> None:
     _save_cache(cache)
 
 
+# V21: reuse search.py's global rate-limiter + 429-aware retry so Wikidata /
+# SPARQL calls share the per-host budget with Wikipedia calls. Previously
+# this module retried only on URLError and never honored 429; an HTTPError
+# 429 fell straight through to the caller.
+from search import _safe_urlopen as _rl_safe_urlopen  # noqa: E402
+
+
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
     retry=retry_if_exception_type((
         urllib.error.URLError,
         TimeoutError,
@@ -135,9 +143,9 @@ def _cache_set(key: str, data: Any) -> None:
     reraise=True,
 )
 def _wikidata_api_call(url: str, headers: dict, timeout: int = 10) -> dict:
-    """Single API call with tenacity retry for Wikidata/SPARQL."""
+    """Single API call with tenacity retry + rate-limit for Wikidata/SPARQL."""
     req = urllib.request.Request(url, headers=headers)
-    resp = urllib.request.urlopen(req, timeout=timeout)
+    resp = _rl_safe_urlopen(req, timeout=timeout)
     return json.loads(resp.read())
 
 
@@ -231,13 +239,22 @@ def _filter_candidates_by_p31(candidates: list, name_lower: str) -> Optional[str
         # e.g., searching "гагарин" but getting a village
         return qid
 
-    # Multiple candidates: prefer the one with most relevant P31
+    # Multiple candidates: prefer the one with most relevant P31.
+    # V21: the wbsearchentities API ranks by relevance — rank-0 is the most
+    # common/prominent entity for that name. Previous logic ignored rank and
+    # only used description keywords, causing e.g. "биткоин" to resolve to
+    # "Bitcoin City" (Q124613662, rank 4, desc has "city") instead of the
+    # cryptocurrency Q131723 (rank 0, desc "digital cash system"). We now
+    # add a rank bonus so rank-0 wins unless it has disqualifying markers.
     best_qid = None
-    best_score = -1
-    for cand in candidates:
+    best_score = -1000
+    for idx, cand in enumerate(candidates):
         qid = cand.get("id")
         desc = (cand.get("description") or "").lower()
         score = 0
+
+        # Rank bonus — respect wbsearchentities relevance ordering.
+        score += max(0, 5 - idx)  # 5/4/3/2/1 for ranks 0..4
 
         # Boost for description containing relevant keywords
         if any(w in desc for w in ["человек", "person", "human", "космонавт", "astronaut",
@@ -250,8 +267,27 @@ def _filter_candidates_by_p31(candidates: list, name_lower: str) -> Optional[str
             score += 3
         if any(w in desc for w in ["организация", "organization", "компания", "company"]):
             score += 3
+        # V21: reward broader concept types that were missing — currencies,
+        # cryptocurrencies, languages, software, works of art. Without this
+        # "digital cash system" / "криптовалюта" descriptions scored zero and
+        # lost to less relevant city/organisation matches on the same name.
+        if any(w in desc for w in ["currency", "валют", "криптовалют", "cryptocurrency",
+                                     "язык", "language", "software", "программ",
+                                     "роман", "novel", "фильм", "film", "album", "альбом",
+                                     "песня", "song", "вид ", "species", "растени",
+                                     "элемент", "element", "химич", "chemical",
+                                     "компьютер", "computer", "система", "system",
+                                     "digital", "сеть", "network"]):
+            score += 3
         # Penalize for disambiguation pages
         if "disambig" in desc or "значения" in desc:
+            score -= 10
+        # V21: penalize "planned / proposed / fictional / legendary" entries —
+        # typically future or fictional projects that share a name with the
+        # real-world referent (e.g. "Bitcoin City", "planned rail line").
+        if any(w in desc for w in ["planned", "proposed", "fictional", "legendary",
+                                     "запланирован", "предполагаем", "вымышлен",
+                                     "мифическ", "легендарн", "прототип"]):
             score -= 5
         # Penalize for clearly wrong types (e.g., "Roman Empire" for "Гагарин")
         if any(w in desc for w in ["империя", "empire", "dynasty", "династия",
@@ -280,6 +316,11 @@ def resolve_entity(name: str, lang: str = "ru") -> Optional[str]:
 
     name_lower = name.lower().strip()
 
+    # V21: track whether any API call failed transiently (HTTP 4xx/5xx/timeout)
+    # vs. cleanly returned "no results". We only poison the cache with "" when
+    # we have a clean no-hit answer — never on transient failures like 429.
+    had_transient_error = False
+
     # Step 1: Search in target language (limit=5 for better coverage)
     q = urllib.parse.quote(name)
     url = (
@@ -297,6 +338,7 @@ def resolve_entity(name: str, lang: str = "ru") -> Optional[str]:
                 return qid
     except Exception as e:
         print(f"  [Wikidata] Entity resolution ошибка для '{name}' ({lang}): {e}")
+        had_transient_error = True
 
     # Step 2: EN fallback with translation (only from ru)
     if lang == "ru":
@@ -322,9 +364,14 @@ def resolve_entity(name: str, lang: str = "ru") -> Optional[str]:
                     return qid
         except Exception as e:
             print(f"  [Wikidata] EN fallback ошибка для '{en_name}': {e}")
+            had_transient_error = True
 
-    # Step 3: Nothing found → return None (NOT a random QID)
-    _cache_set(cache_key, "")
+    # Step 3: Nothing found. Only cache negative answer when we had a clean
+    # API response that simply had no matches — NEVER cache "" on transient
+    # rate-limit / network errors, because that would freeze a real entity
+    # as "unresolvable" for the 7-day TTL after a single 429.
+    if not had_transient_error:
+        _cache_set(cache_key, "")
     return None
 
 
@@ -409,10 +456,20 @@ def check_structured_facts(claim: str, entities: List[str],
     checks: List[tuple] = []  # (entity_name, property_id, property_label, expected_value)
 
     for entity in entities[:5]:
-        # Основатель / создатель
-        if any(w in claim_lower for w in ['основан', 'создан', 'учрежд', 'основал', 'создал']):
+        # Основатель / создатель / разработчик
+        if any(w in claim_lower for w in ['основан', 'создан', 'учрежд', 'основал', 'создал',
+                                            'разработан', 'разработал', 'придумал', 'изобрёл',
+                                            'изобрел', 'изобретён']):
             checks.append((entity, "P112", "основатель", None))
             checks.append((entity, "P571", "дата основания", None))
+            # V21: P178 (developer) covers software, cryptocurrencies, networks,
+            # protocols — e.g. Bitcoin → P178 = Сатоси Накамото. Bitcoin has
+            # no P112 but P178 is the canonical authorship field for such
+            # entities, and a creator-swap in the claim must be caught here.
+            checks.append((entity, "P178", "разработчик", None))
+            # V21: P170 (creator) covers works of art, fictional universes,
+            # some protocols; complementary to P112/P178.
+            checks.append((entity, "P170", "создатель", None))
 
         # Спутники / орбита
         if any(w in claim_lower for w in ['спутник', 'орбит', 'вращается вокруг']):

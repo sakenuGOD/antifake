@@ -1,0 +1,87 @@
+{
+  "accuracy": 0.75,
+  "correct": 6,
+  "total": 8,
+  "results": [
+    {
+      "claim": "Роман «Война и мир» написал Фёдор Достоевский",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 34,
+      "correct": true,
+      "category": "person_swap_literature",
+      "note": "Толстой написал Войну и мир, не Достоевский",
+      "latency": 163.19
+    },
+    {
+      "claim": "Теорию относительности сформулировал Исаак Ньютон",
+      "expected": "ЛОЖЬ",
+      "predicted": "НЕ УВЕРЕНА",
+      "score": 45,
+      "correct": false,
+      "category": "person_swap_science",
+      "note": "Эйнштейн, не Ньютон",
+      "latency": 186.96
+    },
+    {
+      "claim": "Столица Канады — Торонто",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 10,
+      "correct": true,
+      "category": "location_swap",
+      "note": "Оттава",
+      "latency": 335.99
+    },
+    {
+      "claim": "Река Амазонка протекает в Африке",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 34,
+      "correct": true,
+      "category": "location_continent_swap",
+      "note": "Южная Америка",
+      "latency": 212.66
+    },
+    {
+      "claim": "Москва является столицей России",
+      "expected": "ПРАВДА",
+      "predicted": "ПРАВДА",
+      "score": 85,
+      "correct": true,
+      "category": "basic_true",
+      "note": "",
+      "latency": 128.82
+    },
+    {
+      "claim": "Эверест — самая высокая гора планеты",
+      "expected": "ПРАВДА",
+      "predicted": "НЕ УВЕРЕНА",
+      "score": 45,
+      "correct": false,
+      "category": "superlative_true",
+      "note": "",
+      "latency": 124.78
+    },
+    {
+      "claim": "Берлинская стена пала в 1979 году",
+      "expected": "ЛОЖЬ",
+      "predicted": "ЛОЖЬ",
+      "score": 34,
+      "correct": true,
+      "category": "date_swap_event",
+      "note": "1989",
+      "latency": 155.44
+    },
+    {
+      "claim": "Скорость света в вакууме составляет примерно 300 000 километров в секунду",
+      "expected": "ПРАВДА",
+      "predicted": "ПРАВДА",
+      "score": 80,
+      "correct": true,
+      "category": "science_numerical_true",
+      "note": "",
+      "latency": 201.26
+    }
+  ]
+}
