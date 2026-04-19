@@ -6,6 +6,7 @@ __pycache__/
 lyrics_mixer/
 .cache/
 *.log
+logs/
 .env
 unsloth_compiled_cache/
 .vscode/
@@ -24,12 +25,12 @@ adapters/**/checkpoint-*/
 
 # Eval logs (generated)
 eval_log*.txt
-training_log.txt
+scripts/training_log.txt
 
-# Markdown files (documentation, reports) — кроме README
+# Markdown files — только README.md в root; документация в docs/
 *.md
 !README.md
-!NIGHT_RUN_README.md
+!docs/*.md
 
 # Misc
 =9.0

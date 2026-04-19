@@ -4,6 +4,37 @@
 
 ---
 
+## Результаты (V23m, ветка `night/2026-04-18`)
+
+| Suite | Описание | Accuracy |
+|---|---|---|
+| **hard10** | 10 canonical проверочных claim'ов (entity-swap, даты, структурные) | **~80%** |
+| **OOD probe** | 8 out-of-distribution claim'ов не из обучения | **~85%** |
+| **Manipulative** | 10 conspiracy / myth / pseudoscience claim'ов | **~80%** |
+
+### Ключевые механизмы
+
+- **V21 Structural WD entity-mismatch** — обобщение Person-mismatch на
+  single-value WD properties (P36 столица, P17 страна, P30 материк, P112
+  основатель, P178 разработчик, …). Ловит entity-swap без NLI.
+- **V22 Multi-word entity reorder** — priority for `«Война и мир»` / quoted
+  titles over single-word entities в Wikidata lookup.
+- **V22 NUM-veto consensus** — context-blind NUM signal уступает LLM+NLI.
+- **V23m LLM Myth Probe** — отдельный LLM-запрос «МИФ/ФАКТ» через
+  `peft.disable_adapter()` (SFT адаптер игнорировал промпт, base Mistral
+  следует формату). Ловит conspiracy-claim'ы где search не вернул debunk.
+- **V23b Doc-level CE NLI** — full-snippet cross-encoder fallback, когда
+  sentence-level NLI слаб или subject guard defers.
+- **V23c Wikipedia misconceptions frame** + **quoted-number query** —
+  дополнительные search-стратегии для мифов и числовых claim'ов.
+
+### Rate-limiter
+
+Global per-host token-bucket (0.35с/host) + 429-aware retry для
+Wikipedia/Wikidata. Устранил каскад HTTP 429 на batch-тестах.
+
+---
+
 ## Архитектура
 
 ```
@@ -74,24 +105,81 @@
 
 ```
 antifake/
-├── app.py                  # Streamlit веб-интерфейс
-├── pipeline.py             # LangChain LCEL цепочка (основной пайплайн)
-├── search.py               # DDG-поиск, роутер запросов, фильтрация источников
-├── nli_checker.py          # NLI анализ (mDeBERTa)
-├── embeddings.py           # SemanticRanker (bi-encoder) + ReRanker (CrossEncoder)
-├── claim_parser.py         # Извлечение чисел, дат, локаций, скам-паттернов
-├── source_credibility.py   # Бустинг по кредитности домена
-├── model.py                # Загрузка Mistral, LoRA адаптеров, LangChain wrapper
-├── prompts.py              # Шаблоны промптов (SFT / GRPO / аудиторский)
-├── wikidata.py             # Wikidata SPARQL — структурированная верификация фактов
-├── adversarial.py          # Adversarial debate (защитник vs обвинитель)
-├── satire_detector.py      # Детектор сатиры и юмора
-├── fact_cache.py           # Кэш проверенных фактов
-├── utils.py                # Стоп-слова, стемминг, транслитерация
-├── config.py               # Конфигурация (ModelConfig, PipelineConfig, ...)
-├── train_grpo.py           # Обучение с GRPO (reward-based)
-├── data/                   # Датасеты для обучения и оценки
-└── adapters/               # LoRA/GRPO адаптеры (локально)
+├── app.py                       # Streamlit веб-интерфейс (entry point)
+├── main.py                      # CLI entry point
+├── README.md
+├── requirements.txt
+│
+├── pipeline.py                  # Evidence-first fact-checking pipeline
+├── search.py                    # DDG + Wikipedia + Wikidata поиск + rate-limiter
+├── nli_checker.py               # NLI: mDeBERTa + cross-encoder (V23b doc-level)
+├── wikidata.py                  # Wikidata SPARQL + structural entity-mismatch
+├── counter_search.py            # Multi-frame counter/debunk queries
+├── model.py                     # Mistral 7B + LoRA loader
+├── prompts.py                   # LLM promts: knowledge probe + myth probe
+├── claim_parser.py              # Числа/даты/локации + скам-паттерны
+├── embeddings.py                # SemanticRanker + ReRanker
+├── source_credibility.py        # Бустинг по кредитности домена
+├── cache.py                     # SearchCache (disk, 24h TTL)
+├── fact_cache.py                # Верифицированные факты
+├── evidence_tiers.py            # T1-T3 authority weighting для NLI
+├── nlp_russian.py               # Natasha + pymorphy2 обёртки
+├── config.py                    # ModelConfig / PipelineConfig / DecisionThresholds
+├── utils.py                     # Stopwords, стемминг
+├── adversarial.py, satire_detector.py, minicheck_verifier.py
+│
+├── tests/                       # Тестовые прогоны (hard10, OOD, manip, ...)
+│   ├── _path.py                 # sys.path shim для импорта из корня
+│   ├── test_hard10.py           # 10 canonical hard claims
+│   ├── test_manipulative.py     # 10 myth/conspiracy claims
+│   ├── test_ood_probe.py        # 8 fresh OOD claims
+│   ├── test_*.py                # исторические тесты (архив)
+│   ├── fast_test.py             # быстрая проверка
+│   └── debug_single.py          # отладка одного claim'а
+│
+├── eval/                        # Оценочные скрипты
+│   ├── evaluate.py              # метрики на больших выборках
+│   ├── evaluate_universal.py    # universal oracle eval
+│   └── quick_eval.py            # быстрая оценка
+│
+├── scripts/                     # Training / data-gen / housekeeping
+│   ├── train.py                 # SFT обучение
+│   ├── train_grpo.py            # GRPO reward-based
+│   ├── train_meta.py            # мета-обучение
+│   ├── generate_*.py            # генерация обучающих данных
+│   ├── audit_training_data.py
+│   ├── merge_training_data.py
+│   ├── download_dataset.py
+│   ├── sanity_check.py, summarize_night.py
+│   ├── night_run.sh, night_run.ps1
+│   └── run_training.sh, setup_and_train.sh
+│
+├── data/                        # Датасеты + результаты тестов + кэши
+├── adapters/                    # LoRA/GRPO адаптеры
+├── docs/                        # NIGHT_REPORT.md, NIGHT_RUN_README.md
+└── logs/                        # Логи прогонов (gitignored)
+```
+
+### Импорты в tests/ и scripts/
+
+Каждый файл в `tests/`, `eval/`, `scripts/` в начале импортирует
+`_path` — небольшой shim, который подкидывает корень проекта в
+`sys.path`, чтобы `from pipeline import ...` работал из любой вложенной
+папки без установки проекта как пакета.
+
+### Запуск
+
+```bash
+# Веб-UI
+streamlit run app.py
+
+# Тесты
+python tests/test_hard10.py --adapter adapters/fact_checker_lora_v2
+python tests/test_manipulative.py --adapter adapters/fact_checker_lora_v2
+python tests/test_ood_probe.py --adapter adapters/fact_checker_lora_v2
+
+# Обучение
+python scripts/train.py --dataset data/train_v2_combined.jsonl --epochs 4
 ```
 
 ---

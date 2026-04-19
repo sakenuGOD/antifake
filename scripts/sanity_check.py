@@ -6,6 +6,7 @@ Usage:
     python scripts/sanity_check.py
     python scripts/sanity_check.py --adapter adapters/fact_checker_lora
 """
+import _path  # noqa: F401,E402 — inject project root into sys.path
 
 import argparse
 import json

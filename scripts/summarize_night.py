@@ -1,4 +1,5 @@
 """Aggregate all eval_*.json from night_run into a single markdown report."""
+import _path  # noqa: F401,E402 — inject project root into sys.path
 
 import argparse
 import glob
