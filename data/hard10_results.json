@@ -10,7 +10,7 @@
       "score": 85,
       "correct": true,
       "category": "well_known_fact",
-      "latency": 150.55
+      "latency": 164.26
     },
     {
       "claim": "Юрий Гагарин был первым человеком в космосе",
@@ -19,7 +19,7 @@
       "score": 75,
       "correct": true,
       "category": "well_known_fact",
-      "latency": 178.74
+      "latency": 197.98
     },
     {
       "claim": "Солнце вращается вокруг Земли",
@@ -28,7 +28,7 @@
       "score": 10,
       "correct": true,
       "category": "pseudo_authority_false",
-      "latency": 176.17
+      "latency": 181.95
     },
     {
       "claim": "Эйфелева башня находится в Париже",
@@ -37,7 +37,7 @@
       "score": 75,
       "correct": true,
       "category": "location_true",
-      "latency": 133.28
+      "latency": 146.25
     },
     {
       "claim": "Кислород составляет примерно 21% атмосферы Земли",
@@ -46,7 +46,7 @@
       "score": 15,
       "correct": false,
       "category": "numerical_true",
-      "latency": 195.06
+      "latency": 211.47
     },
     {
       "claim": "Вторая мировая война закончилась в 1943 году",
@@ -55,7 +55,7 @@
       "score": 80,
       "correct": false,
       "category": "date_swap",
-      "latency": 120.1
+      "latency": 131.2
     },
     {
       "claim": "ДНК содержит генетическую информацию живых организмов",
@@ -64,7 +64,7 @@
       "score": 75,
       "correct": true,
       "category": "science_fact",
-      "latency": 174.62
+      "latency": 184.45
     },
     {
       "claim": "Биткоин был создан Виталиком Бутериным",
@@ -73,7 +73,7 @@
       "score": 10,
       "correct": true,
       "category": "person_swap",
-      "latency": 198.37
+      "latency": 194.7
     },
     {
       "claim": "Столица Австралии — Сидней",
@@ -82,7 +82,7 @@
       "score": 10,
       "correct": true,
       "category": "location_trap",
-      "latency": 213.37
+      "latency": 224.09
     },
     {
       "claim": "Сахара является самой большой жаркой пустыней в мире",
@@ -91,7 +91,7 @@
       "score": 45,
       "correct": false,
       "category": "general_true",
-      "latency": 420.54
+      "latency": 201.85
     }
   ]
 }

@@ -590,18 +590,24 @@ class FactCheckPipeline:
         # V19: Multi-frame counter-search. Build explicit debunk / verify queries
         # so fact-check articles that frame the claim as myth/misconception land
         # in the source pool, not just sources that syntactically echo the claim.
+        # V22: batch all non-affirm frame queries into a single
+        # search_verification_queries call so DDG runs them in parallel
+        # (was 3-4 sequential 5-10s round-trips ≈ 20-40s wall-clock).
         try:
             from counter_search import build_query_frames
             frames = build_query_frames(claim, max_frames=4)
-            for frame in frames:
-                if frame.frame in ("affirm",):
-                    # Already covered by the main DDG pass.
-                    continue
-                framed_hits = self.searcher.search_verification_queries([frame.text])
+            non_affirm = [f for f in frames if f.frame != "affirm"]
+            if non_affirm:
+                framed_queries = [f.text for f in non_affirm]
+                framed_hits = self.searcher.search_verification_queries(framed_queries)
+                # All hits from this batch came from non-affirm frames; mark
+                # them with the frame whose query produced them when possible.
+                # Frame attribution within the batch is best-effort; downstream
+                # NLI/decide doesn't depend on which exact frame fired.
                 for hit in framed_hits:
                     url = hit.get("link", "")
                     if url and url not in existing_urls:
-                        hit["_frame"] = frame.frame
+                        hit.setdefault("_frame", "counter")
                         results.append(hit)
                         existing_urls.add(url)
         except Exception as e:
@@ -1139,6 +1145,13 @@ class FactCheckPipeline:
             # number appeared in wrong context (e.g., "1939" in WWII article for WWI claim)
             if (con - ent) > t.num_nli_override:
                 return "ЛОЖЬ", 72
+            # V23: also override on absolute strong contradiction. Gap-based
+            # threshold misses cases like COVID-bioweapon (con=0.91, ent=0.68,
+            # gap=0.23 < 0.40) where sources strongly contradict but also
+            # echo the claim text. Absolute con>=0.80 with con>ent is a
+            # robust myth signal that gap-only rule discards.
+            if con >= 0.80 and con > ent:
+                return "ЛОЖЬ", 68
             # V21: context-blind NUM=+1 also yields to LLM=-1 — symmetric to
             # the NUM=-1 yield-to-consensus rule. The number extractor matches
             # any same-type number within tolerance, so a false claim like
@@ -1158,6 +1171,21 @@ class FactCheckPipeline:
         # to contain "миф"/"на самом деле" in unrelated context (Гагарин → FALSE).
         if debunk_count >= 2 and gap < 0:
             return "ЛОЖЬ", 78
+
+        # V23: Stance-aware myth detection. Conspiracy/myth claims often have
+        # sources that LEXICALLY MATCH the claim (NLI entail high) but whose
+        # actual stance is debunking — NLI alone confuses "discusses topic" with
+        # "supports claim". Pattern: ent>0.5 AND con>0.4 AND debunk>=2 means
+        # sources both echo the claim verbatim AND contain refutation markers
+        # ("миф", "на самом деле", "опровергнуто"). Without this branch the
+        # claim falls through to strong/moderate-ent → confidently ПРАВДА.
+        # Research backing: conspiracy classifiers (RoBERTa, arXiv 2404.00141)
+        # acknowledge the same false-entailment problem and recommend
+        # stance-aware aggregation. Guard: LLM=+1 still wins (LLM parametric
+        # may know the topic is genuine, e.g. "smoking causes cancer" has
+        # debunk-ish historical sources but is true).
+        if debunk_count >= 2 and ent >= 0.50 and con >= 0.40 and llm_signal != +1:
+            return "ЛОЖЬ", 70
 
         # ── TIER 4: NLI (gap-based, 3 zones: strong / moderate / ambiguous) ──
 
