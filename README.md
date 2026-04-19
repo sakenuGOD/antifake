@@ -1,37 +1,12 @@
-# Antifake — Система определения достоверности новостей
+# Antifake
 
-Система автоматической проверки утверждений на русском языке. Принимает текстовое утверждение, выполняет многоэтапный анализ через поиск, NLI и LLM, возвращает вердикт с источниками.
+Система автоматической проверки русскоязычных утверждений. Принимает текст
+claim'а, собирает свидетельства из открытых источников (DuckDuckGo, Wikipedia,
+Wikidata), пропускает через NLI и LLM, возвращает вердикт с обоснованием
+и списком источников.
 
----
-
-## Результаты (V23m, ветка `night/2026-04-18`)
-
-| Suite | Описание | Accuracy |
-|---|---|---|
-| **hard10** | 10 canonical проверочных claim'ов (entity-swap, даты, структурные) | **~80%** |
-| **OOD probe** | 8 out-of-distribution claim'ов не из обучения | **~85%** |
-| **Manipulative** | 10 conspiracy / myth / pseudoscience claim'ов | **~80%** |
-
-### Ключевые механизмы
-
-- **V21 Structural WD entity-mismatch** — обобщение Person-mismatch на
-  single-value WD properties (P36 столица, P17 страна, P30 материк, P112
-  основатель, P178 разработчик, …). Ловит entity-swap без NLI.
-- **V22 Multi-word entity reorder** — priority for `«Война и мир»` / quoted
-  titles over single-word entities в Wikidata lookup.
-- **V22 NUM-veto consensus** — context-blind NUM signal уступает LLM+NLI.
-- **V23m LLM Myth Probe** — отдельный LLM-запрос «МИФ/ФАКТ» через
-  `peft.disable_adapter()` (SFT адаптер игнорировал промпт, base Mistral
-  следует формату). Ловит conspiracy-claim'ы где search не вернул debunk.
-- **V23b Doc-level CE NLI** — full-snippet cross-encoder fallback, когда
-  sentence-level NLI слаб или subject guard defers.
-- **V23c Wikipedia misconceptions frame** + **quoted-number query** —
-  дополнительные search-стратегии для мифов и числовых claim'ов.
-
-### Rate-limiter
-
-Global per-host token-bucket (0.35с/host) + 429-aware retry для
-Wikipedia/Wikidata. Устранил каскад HTTP 429 на batch-тестах.
+**Вердикты:** `ПРАВДА` · `ЛОЖЬ` · `МАНИПУЛЯЦИЯ` · `ЧАСТИЧНО ПОДТВЕРЖДЕНО`
+· `НЕ ПОДТВЕРЖДЕНО` · `СКАМ`.
 
 ---
 
@@ -41,63 +16,137 @@ Wikipedia/Wikidata. Устранил каскад HTTP 429 на batch-теста
 Утверждение
     │
     ▼
-[Декомпозиция]  ←  Mistral 7B разбивает составное на атомарные факты
+[PARSE]        классификация claim'а, извлечение чисел/дат, detect scam
     │
     ▼
-[QueryClassifier]  ←  Helsinki-NLP MarianMT (RU→EN) + rule-based роутер
-    │                    категории: science / politics / technology / general
-    ▼
-[DDG Search × 3]  ←  factcheckers | ru_sources | global_sources
-    │                 site: операторы по матрице доверенных источников
-    │   + Myth-buster:  "<claim> миф OR разоблачение OR debunk"
-    │   + Wikipedia API (direct entity lookup)
-    │   + Verification queries (целевые проверочные вопросы)
-    │   + Multi-hop counter-entity search (ловит подмену персон)
-    ▼
-[clean_results]  ←  URL-фильтр: blacklist → trusted TLD → TRUSTED_SOURCES → DROP
+[DECOMPOSE]    rule-based split по союзам (quote-aware); Mistral для сложных
     │
     ▼
-[SemanticRanker]  ←  intfloat/multilingual-e5-base (bi-encoder, CPU)
-    │
+[SEARCH]       DDG (параллельно 3 frame) + Wikipedia entity lookup
+    │          + verification queries + counter-search (debunk framing)
+    │          + Wikipedia «common misconceptions» frame
+    │          + quoted-number query (для claim'ов с числом+единицей)
+    │          + rate-limiter 0.35с/host + 429-aware retry
     ▼
-[CrossEncoder]  ←  cross-encoder/ms-marco-MiniLM-L-6-v2 (top-7)
-    │
-    ├── [boost_factcheck_scores]  ←  +2.0 к скору для snopes/provereno/debunk-текстов
-    │
-    └── [validate_context_entities]  ←  штраф за отсутствие сущностей факта в контексте
-            │                            фильтр при penalty > 0.35 (мин. 3 документа)
-            ▼
-[NLI Analysis]  ←  mDeBERTa-v3-base-xnli (entailment / contradiction, CPU)
-    │                 + NLI per sub-claim (отдельный анализ каждого подпункта)
-    │
+[RANK]         multilingual-e5-base (bi-encoder) + mmarco cross-encoder reranker
+    │          + boost фактчекеров + TRUSTED_SOURCES фильтр
     ▼
-[Wikidata SPARQL]  ←  Структурированные факты из Knowledge Graph
-    │                   основатель, столица, спутники, материк, дата основания
-    │
+[EVIDENCE]     4 параллельных сигнала:
+    │          • Wikidata SPARQL — структурированная KG проверка
+    │          •                   structural entity-mismatch для
+    │          •                   single-value props (столица, страна,
+    │          •                   материк, автор, основатель, разработчик)
+    │          • NUM comparison — deterministic числовая сверка
+    │          • NLI — mDeBERTa sentence-level +
+    │                  cross-encoder tiebreaker + doc-level CE fallback +
+    │                  subject-mention guard
+    │          • LLM knowledge probe (параметрическая память Mistral)
+    │          • LLM myth probe (через disable_adapter — base Mistral,
+    │                  не SFT — классифицирует как МИФ/ФАКТ)
     ▼
-[Числа / Даты / Локации]  ←  детерминистическая проверка claim vs sources
-    │
+[DECIDE]       priority-based tree по сигналам:
+    │          TIER 1: WD hard-mismatch → ЛОЖЬ 90
+    │          TIER 2: NUM ±1 (с LLM/myth consensus override)
+    │          TIER 3: debunk-aware stance gate (myth detection)
+    │          TIER 4: NLI gap zones (strong / moderate / ambiguous)
+    │                  + subject-verification gates
+    │                  + LLM coherence overrides
+    │          TIER 5: LLM parametric / myth fallback
     ▼
-[Mistral 7B Verdict]  ←  GRPO/SFT адаптер, Chain-of-Thought <reasoning>
-    │
+[EXPLAIN]      LLM генерирует объяснение вердикта (verdict уже определён,
+               модель только объясняет почему)
     ▼
-[Ensemble Vote]  ←  числа(±3) + NLI(±2) + Wikidata(±2) + детали(±2) + LLM(±2) + скам(−4)
-    │
-    ▼
-Вердикт + Скор + Источники
+Вердикт + credibility_score (0-100) + reasoning + sources
 ```
+
+LLM как объясняющий слой, а не как судья — все вердикты рассчитываются
+детерминированно из signal-сигналов. Это делает вердикты воспроизводимыми
+и debug'ным.
 
 ---
 
-## Вердикты
+## Стек
 
-| Вердикт | Описание |
-|---------|----------|
-| **ПРАВДА** | Утверждение подтверждено источниками |
-| **ЛОЖЬ / ФЕЙК** | Утверждение опровергнуто фактчекерами или противоречит источникам |
-| **МАНИПУЛЯЦИЯ / ПОЛУПРАВДА** | Часть фактов верна, часть — нет (составные утверждения) |
-| **ЧАСТИЧНО ПОДТВЕРЖДЕНО** | Некоторые пункты подтверждены, по остальным данных нет |
-| **НЕ ПОДТВЕРЖДЕНО** | Данных недостаточно для вердикта |
+| Компонент | Модель |
+|---|---|
+| Base LLM | `unsloth/mistral-7b-instruct-v0.3-bnb-4bit` |
+| SFT адаптер | `adapters/fact_checker_lora_v2` (custom QLoRA r=16) |
+| Bi-encoder ranker | `intfloat/multilingual-e5-base` |
+| Cross-encoder reranker | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` |
+| NLI (основной) | `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7` |
+| NLI (cross-encoder fallback) | `cross-encoder/nli-deberta-v3-base` |
+| Translator (RU→EN fallback) | `facebook/nllb-200-distilled-600M` |
+| NER + лемматизация | Natasha + pymorphy2 |
+| Knowledge graph | Wikidata SPARQL endpoint |
+| Поиск | DuckDuckGo (async) + MediaWiki API |
+
+GPU: 4-bit Mistral работает на ~5 GB VRAM, NLI/reranker — на CPU,
+embeddings — на CPU. Протестировано на RTX 5070 12 GB (Blackwell sm_120);
+`xformers` отключён — несовместим с sm_120.
+
+---
+
+## Установка
+
+```bash
+git clone https://github.com/sakenuGOD/antifake.git
+cd antifake
+python -m venv venv
+source venv/bin/activate          # Linux/Mac
+# или:
+venv\Scripts\activate             # Windows
+
+pip install -r requirements.txt
+```
+
+### Переменные окружения
+
+| Переменная | Обязательна | Назначение |
+|---|---|---|
+| `SERPAPI_API_KEY` | нет | Google Search fallback (без ключа — только DDG) |
+| `HF_TOKEN` | нет | higher rate limit для скачивания весов с HuggingFace |
+| `ANTIFAKE_DETERMINISTIC=1` | нет | strict-reproducibility режим (cuDNN deterministic) |
+
+Сохраняются в `.env` в корне проекта.
+
+---
+
+## Использование
+
+### Streamlit UI
+
+```bash
+streamlit run app.py
+```
+
+Интерфейс показывает 14 stage'ей pipeline'а в реальном времени: парсинг,
+декомпозиция, ключевые слова, найденные источники, Wikidata факты, NUM
+сравнения, NLI сигналы, debunk count, LLM probes, финальный вердикт,
+объяснение.
+
+### Python API
+
+```python
+from pipeline import FactCheckPipeline
+
+pipeline = FactCheckPipeline(adapter_path="adapters/fact_checker_lora_v2")
+
+result = pipeline.check("Роман «Война и мир» написал Фёдор Достоевский")
+
+print(result["verdict"])              # "ЛОЖЬ"
+print(result["credibility_score"])    # 10
+print(result["reasoning"])            # текст обоснования
+for src in result["sources"][:3]:
+    print(src["link"], src["title"])
+```
+
+Сигнатура результата — см. `pipeline.py::check()`.
+
+### CLI
+
+```bash
+python main.py "Москва — столица России"
+```
 
 ---
 
@@ -105,358 +154,145 @@ Wikipedia/Wikidata. Устранил каскад HTTP 429 на batch-теста
 
 ```
 antifake/
-├── app.py                       # Streamlit веб-интерфейс (entry point)
+├── app.py                       # Streamlit entry point
 ├── main.py                      # CLI entry point
-├── README.md
-├── requirements.txt
+├── pipeline.py                  # Основной evidence-first pipeline
+├── search.py                    # DDG/Wiki/Wikidata + rate-limiter + frames
+├── nli_checker.py               # mDeBERTa + cross-encoder + doc-level CE
+├── wikidata.py                  # SPARQL + structural entity-mismatch
+├── counter_search.py            # Multi-frame debunk/verify queries
+├── model.py                     # Mistral + LoRA loader
+├── prompts.py                   # Knowledge + myth probe templates
+├── claim_parser.py              # Числа/даты/локации + scam patterns
+├── embeddings.py                # Semantic ranker + CE reranker
+├── evidence_tiers.py            # T1-T3 authority weighting
+├── nlp_russian.py               # Natasha/pymorphy2 helpers
+├── source_credibility.py        # Domain trust boosting
+├── cache.py                     # Disk-based search cache (24h TTL)
+├── fact_cache.py                # Verified facts cache
+├── config.py                    # Все константы и пороги
+├── utils.py
 │
-├── pipeline.py                  # Evidence-first fact-checking pipeline
-├── search.py                    # DDG + Wikipedia + Wikidata поиск + rate-limiter
-├── nli_checker.py               # NLI: mDeBERTa + cross-encoder (V23b doc-level)
-├── wikidata.py                  # Wikidata SPARQL + structural entity-mismatch
-├── counter_search.py            # Multi-frame counter/debunk queries
-├── model.py                     # Mistral 7B + LoRA loader
-├── prompts.py                   # LLM promts: knowledge probe + myth probe
-├── claim_parser.py              # Числа/даты/локации + скам-паттерны
-├── embeddings.py                # SemanticRanker + ReRanker
-├── source_credibility.py        # Бустинг по кредитности домена
-├── cache.py                     # SearchCache (disk, 24h TTL)
-├── fact_cache.py                # Верифицированные факты
-├── evidence_tiers.py            # T1-T3 authority weighting для NLI
-├── nlp_russian.py               # Natasha + pymorphy2 обёртки
-├── config.py                    # ModelConfig / PipelineConfig / DecisionThresholds
-├── utils.py                     # Stopwords, стемминг
-├── adversarial.py, satire_detector.py, minicheck_verifier.py
+├── tests/                       # Regression suites
+│   ├── _path.py                 # sys.path shim
+│   ├── test_hard10.py           # 10 canonical claims
+│   ├── test_manipulative.py     # 10 conspiracy/myth claims
+│   ├── test_ood_probe.py        # 8 out-of-distribution claims
+│   └── test_*.py (архив)
 │
-├── tests/                       # Тестовые прогоны (hard10, OOD, manip, ...)
-│   ├── _path.py                 # sys.path shim для импорта из корня
-│   ├── test_hard10.py           # 10 canonical hard claims
-│   ├── test_manipulative.py     # 10 myth/conspiracy claims
-│   ├── test_ood_probe.py        # 8 fresh OOD claims
-│   ├── test_*.py                # исторические тесты (архив)
-│   ├── fast_test.py             # быстрая проверка
-│   └── debug_single.py          # отладка одного claim'а
-│
-├── eval/                        # Оценочные скрипты
-│   ├── evaluate.py              # метрики на больших выборках
-│   ├── evaluate_universal.py    # universal oracle eval
-│   └── quick_eval.py            # быстрая оценка
+├── eval/                        # Metrics on larger datasets
+│   ├── evaluate.py
+│   ├── evaluate_universal.py
+│   └── quick_eval.py
 │
 ├── scripts/                     # Training / data-gen / housekeeping
-│   ├── train.py                 # SFT обучение
-│   ├── train_grpo.py            # GRPO reward-based
-│   ├── train_meta.py            # мета-обучение
-│   ├── generate_*.py            # генерация обучающих данных
-│   ├── audit_training_data.py
+│   ├── train.py                 # SFT
+│   ├── train_grpo.py            # Reward-based
+│   ├── generate_*.py            # Обучающие данные
 │   ├── merge_training_data.py
+│   ├── audit_training_data.py
 │   ├── download_dataset.py
-│   ├── sanity_check.py, summarize_night.py
-│   ├── night_run.sh, night_run.ps1
-│   └── run_training.sh, setup_and_train.sh
+│   ├── sanity_check.py
+│   ├── summarize_night.py
+│   └── run_training.sh, setup_and_train.sh, night_run.{sh,ps1}
 │
-├── data/                        # Датасеты + результаты тестов + кэши
-├── adapters/                    # LoRA/GRPO адаптеры
-├── docs/                        # NIGHT_REPORT.md, NIGHT_RUN_README.md
-└── logs/                        # Логи прогонов (gitignored)
+├── data/                        # Датасеты + результаты + кэши
+│   ├── train_*.jsonl            # Обучающие выборки
+│   ├── hard10_results.json
+│   ├── manipulative_results.json
+│   ├── ood_probe_results.json
+│   └── wikidata_cache.json
+│
+├── adapters/                    # LoRA / GRPO адаптеры (weights ignored in git)
+├── docs/                        # Отчёты и документация
+├── logs/                        # Прогоны pipeline'а (gitignored)
+└── requirements.txt
 ```
 
-### Импорты в tests/ и scripts/
+### Импорты в подпапках
 
-Каждый файл в `tests/`, `eval/`, `scripts/` в начале импортирует
-`_path` — небольшой shim, который подкидывает корень проекта в
-`sys.path`, чтобы `from pipeline import ...` работал из любой вложенной
-папки без установки проекта как пакета.
+Файлы в `tests/`, `eval/`, `scripts/` начинаются с
+`import _path  # noqa: F401,E402`. Этот shim добавляет корень
+проекта в `sys.path`, чтобы `from pipeline import …` работал
+без установки проекта как пакета.
 
-### Запуск
+---
+
+## Обучение
+
+### SFT на собственных данных
 
 ```bash
-# Веб-UI
-streamlit run app.py
+python scripts/train.py \
+    --dataset data/train_v2_combined.jsonl \
+    --output adapters/fact_checker_lora_v3 \
+    --epochs 4 \
+    --learning-rate 2e-5 \
+    --resume adapters/fact_checker_lora_v2   # опционально
+```
 
-# Тесты
-python tests/test_hard10.py --adapter adapters/fact_checker_lora_v2
+### GRPO (reward-based)
+
+```bash
+python scripts/train_grpo.py \
+    --load-adapter adapters/fact_checker_lora_v2 \
+    --steps 200
+```
+
+### Генерация данных
+
+```bash
+python scripts/generate_russian_data.py --output data/train.jsonl
+python scripts/generate_failure_patterns.py --output data/failure_patterns.jsonl
+python scripts/merge_training_data.py \
+    data/train.jsonl data/failure_patterns.jsonl \
+    --output data/train_v2_combined.jsonl
+```
+
+---
+
+## Тесты
+
+```bash
+# Маленькие regression-suites (~15-25 минут на suite)
+python tests/test_hard10.py       --adapter adapters/fact_checker_lora_v2
 python tests/test_manipulative.py --adapter adapters/fact_checker_lora_v2
-python tests/test_ood_probe.py --adapter adapters/fact_checker_lora_v2
+python tests/test_ood_probe.py    --adapter adapters/fact_checker_lora_v2
 
-# Обучение
-python scripts/train.py --dataset data/train_v2_combined.jsonl --epochs 4
+# Отладка одного claim'а
+python tests/debug_single.py "Bitcoin создал Виталик Бутерин"
 ```
 
----
-
-## Требования
-
-- Python 3.10+
-- CUDA GPU рекомендован для LLM (оптимизировано под RTX 5070 12GB, Blackwell sm_120)
-- CPU достаточен для NLI, CrossEncoder, SemanticRanker
-
-```
-torch>=2.1.0
-transformers>=4.36.0
-unsloth[colab-new]>=2024.1
-peft>=0.7.0
-bitsandbytes>=0.41.0
-accelerate>=0.25.0
-trl>=0.15.0
-langchain-core>=0.1.0
-langchain-huggingface>=0.0.1
-sentence-transformers>=2.3.0
-ddgs>=9.0
-sacremoses>=0.0.53
-streamlit>=1.30.0
-datasets>=2.16.0
-```
-
-> **Важно:** `xformers` намеренно исключён — не поддерживает Blackwell sm_120 (вызывает segfault). Если установлен, выполните `pip uninstall xformers`.
-
----
-
-## Установка
-
-```bash
-git clone <repo>
-cd antifake
-pip install -r requirements.txt
-```
-
----
-
-## Запуск
-
-### Веб-интерфейс (Streamlit)
-
-```bash
-streamlit run app.py
-```
-
-Опционально — Google Search через SerpAPI (без ключа работает через DuckDuckGo):
-
-```bash
-export SERPAPI_API_KEY="ваш_ключ"
-streamlit run app.py
-```
-
-### Python API
-
-```python
-from pipeline import FactCheckPipeline
-
-pipeline = FactCheckPipeline()
-result = pipeline.check("Эйнштейн провалил экзамен по математике в школе")
-
-print(result["verdict"])           # ЛОЖЬ / ФЕЙК
-print(result["credibility_score"]) # 15
-print(result["reasoning"])         # обоснование
-for src in result["sources"]:
-    print(src["link"])             # источники
-```
-
-### Структура ответа
-
-```python
-{
-    "claim": str,                  # исходное утверждение
-    "sub_claims": list[str],       # атомарные факты (если декомпозиция)
-    "verdict": str,                # ПРАВДА / ЛОЖЬ / МАНИПУЛЯЦИЯ / ...
-    "credibility_score": int,      # 0–100
-    "confidence": int,             # уверенность модели, 0–100
-    "reasoning": str,              # обоснование вердикта
-    "chain_of_thought": str,       # <reasoning> блок (GRPO модель)
-    "sub_verdicts": list[dict],    # per-fact результаты (составные утверждения)
-    "sources": list[dict],         # список источников с URL
-    "keywords": list[str],         # извлечённые ключевые слова
-    "total_time": float,           # время выполнения, сек
-}
-```
-
----
-
-## Матрица доверенных источников
-
-Поиск работает только по верифицированным доменам. Все остальные домены отбрасываются на этапе `clean_results`.
-
-| Категория | Примеры |
-|-----------|---------|
-| Фактчекеры (global) | snopes.com, reuters.com, politifact.com, factcheck.org, fullfact.org |
-| Фактчекеры (RU) | provereno.media, stopfake.org, lapsha.media |
-| Новостные агентства (global) | reuters.com, apnews.com, bbc.com, bloomberg.com, ft.com |
-| Новостные агентства (RU) | tass.ru, interfax.ru, rbc.ru, kommersant.ru, vedomosti.ru |
-| Наука и медицина | nature.com, who.int, nih.gov, nplus1.ru, cyberleninka.ru |
-| Технологии / Крипто | techcrunch.com, wired.com, habr.com, coindesk.com |
-| Официальные источники | europa.eu, un.org, imf.org, nato.int |
-| Справочники | wikipedia.org, britannica.com |
-
-Дополнительно: домены с TLD `.gov`, `.edu`, `.mil` всегда принимаются.
-
----
-
-## Ensemble-вердикт: система голосования
-
-Итоговый вердикт определяется суммой взвешенных сигналов:
-
-| Сигнал | Вес | Условие |
-|--------|-----|---------|
-| Числа совпадают | +3.0 | claim-число = source-число (±10%) |
-| Числа расходятся | −3.0 | несовпадение при отсутствии match |
-| NLI entailment | до +2.0 | mDeBERTa entailment × count |
-| NLI contradiction | до −2.0 | mDeBERTa contradiction × count |
-| KEY_DETAIL_MISSING | −2.0 | уникальные слова claim отсутствуют в sources (stem matching) |
-| ENTITY_SATURATION | +1.0 | ≥3 из 7 sources содержат сущности claim |
-| WIKIDATA_CONFIRMED | до +2.0 | Wikidata подтверждает факты из claim |
-| WIKIDATA_CONTRADICTED | до −3.0 | Wikidata опровергает факты из claim |
-| LLM ПРАВДА | до +2.0 | пропорционально credibility_score |
-| LLM ЛОЖЬ | до −2.0 | пропорционально credibility_score |
-| SCAM_PATTERN | −4.0 | обнаружены мошеннические паттерны |
-| DATE_YEAR_MISMATCH | −2.0 | год в claim ≠ годам в источниках |
-| LOCATION_MISMATCH | −2.5 | все локации из claim отсутствуют в источниках |
-| LOCATION_CONFIRMED | +0.5 | все локации найдены в источниках |
-| HALF_TRUTH_ROLE | −1.0 | роль персоны искажена (со-основатель → основатель) |
-| PERSON_ENTITY_MISMATCH | −3.0 | персона подменена (Джобс вместо Гейтса) |
-
-`vote ≥ +1.0` → ПРАВДА · `vote ≤ −1.0` → ЛОЖЬ · иначе → adversarial debate → fallback на LLM
-
----
-
-## Обнаружение манипуляций в составных утверждениях
-
-Для составных утверждений (через «и», «а также», «однако», «кроме того») система:
-
-1. Декомпозирует на атомарные факты через LLM
-2. Проверяет каждый факт независимо
-3. Выносит аудиторский вердикт по матрице:
-
-| Результат | Вердикт |
-|-----------|---------|
-| Все факты ПРАВДА | ПРАВДА |
-| Есть ПРАВДА + есть ЛОЖЬ | МАНИПУЛЯЦИЯ / ПОЛУПРАВДА |
-| Только ЛОЖЬ | ЛОЖЬ |
-| Все НЕТ ДАННЫХ | НЕ ПОДТВЕРЖДЕНО |
-
-Пример: *«Эйнштейн получил Нобелевскую премию, однако в школе был двоечником и утверждал, что человек использует мозг на 10%»* → МАНИПУЛЯЦИЯ (3 ПРАВДА + 1 ЛОЖЬ из 4).
-
----
-
-## Wikidata SPARQL — структурированная верификация
-
-Для фактов с именованными сущностями система обращается к Wikidata Knowledge Graph через SPARQL endpoint (без API-ключа):
-
-| Свойство | Wikidata ID | Пример |
-|----------|-------------|--------|
-| Основатель | P112 | Microsoft → Билл Гейтс, Пол Аллен |
-| Дата основания | P571 | Microsoft → 1975-04-04 |
-| Столица | P36 | Россия → Москва |
-| Материк | P30 | Амазонка → Южная Америка |
-| Спутник / орбита | P397, P398 | Луна → обращается вокруг Земли |
-| Местоположение | P276 | Титаник → Атлантический океан |
-| Страна | P17 | Амазонка → Бразилия, Перу, Колумбия |
-
-Wikidata-факты используются двояко:
-1. Как текстовая подсказка для LLM в промпте
-2. Как **голос в ансамбле** (до +2.0 за подтверждение, до −3.0 за противоречие)
-
-Stem matching (4-char) учитывает русскую морфологию: «Земля» (Wikidata) → «земл» ≈ «Земли» (claim).
-
----
-
-## Расширенный поиск
-
-Помимо стандартного DDG Search × 3, система использует:
-
-- **Wikipedia entity lookup** — прямое обращение к Wikipedia API для каждой сущности из claim (до 2000 символов intro)
-- **Verification queries** — LLM генерирует целевые проверочные вопросы (напр. «кто основал Microsoft?»), по ним выполняется дополнительный поиск
-- **Multi-hop counter-entity search** — независимый поиск каждой сущности claim для обнаружения подмен (напр. «Стив Джобс основатель» → Apple, не Microsoft)
-
----
-
-## IR-слой: защита от Semantic Overgeneralization
-
-Проблема: CrossEncoder присваивает высокий скор общим новостным статьям из-за лексического перекрытия, задвигая специализированные разоблачения вниз. Пример — факт «провалил экзамен по **математике**», статья «провалил **вступительные экзамены**»: слово «математика» отсутствует, но CrossEncoder даёт 3.97 против 0.93 у provereno.media.
-
-Реализованные исправления в `search.py` + `pipeline.py`:
-
-### boost_factcheck_scores (post-CrossEncoder)
-
-Применяется сразу после `CrossEncoder.rerank()`. Добавляет `+2.0` к скору если:
-- Домен — специализированный фактчекер (snopes, provereno, politifact, …)
-- Текст содержит debunk-маркеры: «миф», «разоблачение», «debunk», «hoax», …
-- URL содержит паттерн `/fact-check/`, `/debunk/`, …
-
-Финальная пересортировка гарантирует вытеснение лайфстайл-новостей.
-
-### validate_context_entities (entity matching filter)
-
-Для каждого документа вычисляет покрытие значимых слов из проверяемого факта:
-
-```
-penalty = 1.0 − (кол-во покрытых слов / всего значимых слов)
-```
-
-Значимые слова: длина ≥ 4 символа, не стоп-слово. Матчинг по 5-символьному псевдо-стему (перекрывает русские падежные формы: «математик» → «матем»).
-
-- Применяется как штраф к `cross_encoder_score` (вес 1.5)
-- При `penalty > 0.35` документ фильтруется, если остаётся ≥ 3 альтернатив
-
-### Myth-buster резервирование слотов (Direction 3)
-
-В myth-buster запросах фактчекеры добавляются в пул первыми (до 3 слотов), не давая новостным сайтам вытеснить их на этапе первичного сбора.
-
----
-
-## Обучение модели
-
-### SFT (Supervised Fine-Tuning)
-
-```bash
-python train_meta.py
-```
-
-### GRPO (Group Relative Policy Optimization)
-
-```bash
-python train_grpo.py
-```
-
-GRPO модель использует формат `<reasoning>...</reasoning><answer>...</answer>` и активирует Chain-of-Thought рассуждения в финальном промпте.
-
-Адаптеры сохраняются в `adapters/`. При запуске `pipeline.py` автоматически выбирается лучший: GRPO > SFT > base.
+Результаты пишутся в `data/*_results.json` + детальный лог в `logs/`.
 
 ---
 
 ## Конфигурация
 
-Все параметры — в `config.py`:
+Все пороги и настройки в `config.py`:
 
-```python
-# Модель
-ModelConfig(
-    base_model_name="unsloth/mistral-7b-instruct-v0.3-bnb-4bit",
-    load_in_4bit=True,
-)
-
-# Пайплайн
-PipelineConfig(
-    enable_nli=True,
-    enable_cross_encoder=True,
-    enable_claim_decomposition=True,
-    nli_model_name="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
-    verdict_max_new_tokens=1500,
-)
-
-# Поиск
-SearchConfig(
-    num_results=8,      # результатов на DDG-запрос
-    hl="ru",            # язык
-)
-```
+| Класс | Что настраивает |
+|---|---|
+| `ModelConfig` | Base model path, max_seq_length, load_in_4bit |
+| `PipelineConfig` | NLI device, cross-encoder model, re-ranker on/off |
+| `SearchConfig` | DDG timeout, num_results, SerpAPI |
+| `DecisionThresholds` | strong_gap, moderate_gap, num_nli_override |
 
 ---
 
-## Загружаемые модели
+## Внешние API
 
-| Модель | Размер | Устройство | Назначение |
-|--------|--------|------------|------------|
-| Mistral-7B-Instruct-v0.3 (4-bit) | ~4 GB | GPU | Вердикт, ключевые слова, декомпозиция |
-| mDeBERTa-v3-base-xnli | ~280 MB | CPU | NLI entailment/contradiction |
-| multilingual-e5-base | ~278 MB | CPU | Семантическое ранжирование (bi-encoder) |
-| ms-marco-MiniLM-L-6-v2 | ~22 MB | CPU | CrossEncoder re-ranking |
-| NLLB-200-distilled-600M | ~600 MB | CPU | Перевод запросов RU→EN |
+| Сервис | Rate limit | Fallback |
+|---|---|---|
+| DuckDuckGo | нет формального, но 429 при burst | retry + async parallel |
+| Wikipedia / Wikidata | ~30 req/s anonymous | 0.35s/host token bucket + 429 retry |
+| SerpAPI | по плану ключа | DDG (основной канал) |
+
+Rate-limiter реализован в `search.py::_wiki_rate_limit` — глобальный
+token bucket per-host + tenacity retry с 2-30с exponential backoff.
+
+---
+
+## Лицензия
+
+См. `LICENSE` (если присутствует).
