@@ -725,7 +725,7 @@ class QueryClassifier:
             searcher._classifier.inject_model(lambda p: llm.invoke(p))
         """
         self._generate_fn = generate_fn
-        print("  [QueryClassifier] Mistral подключён для классификации ✓")
+        print("  [QueryClassifier] Mistral подключён для классификации [OK]")
 
     # ----------------------------------------------------------
     # Публичный метод

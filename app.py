@@ -4,7 +4,20 @@
 """
 
 import os
+import sys
 import time
+
+# Windows console is cp1251 by default; Streamlit-invoked prints with
+# Unicode glyphs (✓, arrows, emoji) crash under UnicodeEncodeError.
+# Force UTF-8 stdout/stderr early, before any module does its first print.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+os.environ.setdefault("PYTHONUTF8", "1")
+
 import streamlit as st
 
 st.set_page_config(
