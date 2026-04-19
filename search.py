@@ -2636,6 +2636,25 @@ class FactCheckSearcher:
             for ent in entities[:2]:
                 queries.append(f"{ent} точные данные характеристики")
 
+        # V23c: Quoted-number verification query. When claim states a
+        # specific numeric + unit ("21% атмосферы", "на 300 000 км/с"),
+        # the default search often returns topic-matched articles without
+        # the exact figure, causing our NUM extractor to mismatch against
+        # unrelated numbers from the snippet. Forcing the exact value into
+        # a quoted DDG query boosts recall of snippets that contain the
+        # number verbatim. Works for any claim with a number-unit combo —
+        # not specific to oxygen / any single claim.
+        num_unit = re.search(
+            r'(\d+(?:[.,]\d+)?\s*(?:%|процент\w*|миллион\w*|миллиард\w*|'
+            r'тысяч\w*|градус\w*|метр\w*|километр\w*|сантиметр\w*|секунд\w*|час\w*|лет|года?))',
+            claim, flags=re.IGNORECASE,
+        )
+        if num_unit:
+            exact = num_unit.group(1).strip()
+            for ent in entities[:2]:
+                if len(ent) >= 3:
+                    queries.append(f'"{exact}" {ent}')
+
         # Правило 3: LLM-генерация (если доступна) для сложных случаев
         if generate_fn and len(queries) < 3:
             try:

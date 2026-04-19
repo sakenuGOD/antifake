@@ -135,11 +135,21 @@ class NLIChecker:
         sources: list,
         snippet_key: str = "snippet",
         top_k: int = 3,
+        full_snippet: bool = False,
     ) -> dict:
         """V12: CrossEncoder NLI for top-K sources — catches entity-swap contradictions.
 
         Unlike bi-encoder (encodes claim and premise separately), cross-encoder
         tokenizes (premise, hypothesis) together, so it sees entity differences directly.
+
+        V23b: `full_snippet=True` skips sentence splitting and passes the
+        whole snippet as premise. This preserves cross-sentence stance
+        (e.g., 'Сахара — самая большая жаркая пустыня. Антарктида — самая
+        большая в целом') where per-sentence max-pool picks the Antarctica
+        line as contradiction and misses that the full context supports the
+        claim. CheckThat! 2025 (arXiv 2507.06195) finding: evidence quality
+        > tokenization / context window tricks; feeding full snippets to CE
+        is the minimal-cost quality boost.
 
         Returns: {"max_entailment": float, "max_contradiction": float, "ce_pairs": [...]}
         """
@@ -155,13 +165,17 @@ class NLIChecker:
             if not evidence or len(evidence) < 20:
                 continue
 
-            # Split into sentences for fine-grained scoring
-            sentences = self._split_sentences(evidence)
-            if not sentences:
-                sentences = [evidence]
+            # V23b: either full snippet (single premise, preserves document-
+            # level stance) or sentence-level (fine-grained, more sensitive).
+            if full_snippet:
+                # Truncate to CE model's safe token budget (~380 tokens ≈ 2k chars).
+                premises = [evidence[:2000]]
+            else:
+                sentences = self._split_sentences(evidence)
+                premises = sentences[:10] if sentences else [evidence]
 
             # Build pairs for batch prediction
-            pairs = [(sent, claim) for sent in sentences[:10]]  # cap at 10 sentences
+            pairs = [(p, claim) for p in premises]
             try:
                 scores = self._cross_encoder.predict(pairs, apply_softmax=True)
                 labels = ["contradiction", "entailment", "neutral"]

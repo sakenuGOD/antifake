@@ -959,6 +959,36 @@ class FactCheckPipeline:
                 except Exception:
                     pass
 
+        # V23b: Document-level CE NLI as fallback when sentence-level is weak
+        # OR subject guard flags both signals as non-verified. Per CheckThat!
+        # 2025 (arXiv 2507.06195) evidence quality dominates architecture
+        # choices — passing the whole snippet to CE preserves multi-sentence
+        # stance (e.g., 'Сахара — самая жаркая. Антарктида — самая большая
+        # в целом' supports 'Сахара самая жаркая' overall). Costs ~3-5s per
+        # claim but fires only when we need the extra signal.
+        _subj_e = nli_result.get("subject_verified_ent", True)
+        _subj_c = nli_result.get("subject_verified_con", True)
+        _weak_signal = max_ent < 0.50 and max_con < 0.50
+        _defensive = not _subj_e and not _subj_c
+        if (_weak_signal or _defensive) and self.nli_checker._cross_encoder is not None:
+            try:
+                doc_result = self.nli_checker.check_claim_cross(
+                    claim, sources[:3], snippet_key="snippet", full_snippet=True,
+                )
+                doc_ent = doc_result.get("max_entailment", 0.0)
+                doc_con = doc_result.get("max_contradiction", 0.0)
+                # Only upgrade if doc-level is decisive — avoid overriding a
+                # weak-but-directionally-correct sentence signal with noise.
+                if abs(doc_ent - doc_con) >= 0.25 and max(doc_ent, doc_con) >= 0.55:
+                    max_ent = doc_ent
+                    max_con = doc_con
+                    # Upgrade subject-verification too — doc CE saw full
+                    # context, so the stance is grounded in the whole snippet.
+                    nli_result["subject_verified_ent"] = True
+                    nli_result["subject_verified_con"] = True
+            except Exception as e:
+                logger.debug(f"doc-level CE NLI failed: {e}")
+
         scores = {
             "ent": max_ent,
             "con": max_con,

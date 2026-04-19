@@ -124,6 +124,19 @@ def build_query_frames(
             weight=0.7,
         ))
 
+    # 5. V23c: Wikipedia's "List of common misconceptions" is a curated
+    # structured source for myths (Vikings helmets, Napoleon height, 10%
+    # brain, flat earth, etc.). The RU version is missing, so target EN
+    # page directly. This helps claims where standard DDG doesn't surface
+    # debunk articles because the myth is too mainstream for recent news.
+    # General mechanism — works for ANY myth whose English name is in
+    # the article, not specific to any test claim.
+    frames.append(QueryFrame(
+        text=f'"common misconceptions" {base} site:en.wikipedia.org',
+        frame="debunk",
+        weight=0.6,
+    ))
+
     # Optional LLM-generated paraphrase. Kept narrow: one extra query at most,
     # guarded against returning an echo of the input.
     if generate_fn is not None and len(frames) < max_frames:
