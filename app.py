@@ -319,27 +319,32 @@ def main():
         st.error("Не удалось загрузить пайплайн.")
         st.stop()
 
-    # ── Input + examples ──
-    if "claim_input" not in st.session_state:
-        st.session_state["claim_input"] = ""
+    # ── Examples first (must be rendered BEFORE text_area so we can
+    # pre-populate its `value` from a separate state key without hitting
+    # Streamlit's "cannot modify widget key after instantiation" error) ──
+    if "prefill_claim" not in st.session_state:
+        st.session_state["prefill_claim"] = ""
 
     st.markdown("#### Введите утверждение")
+
+    st.markdown('<div class="chip-hint">Быстрые примеры:</div>', unsafe_allow_html=True)
+    cols = st.columns(len(_EXAMPLES))
+    for i, ex in enumerate(_EXAMPLES):
+        if cols[i].button(
+            ex[:34] + "…" if len(ex) > 34 else ex,
+            key=f"ex_{i}",
+            use_container_width=True,
+        ):
+            st.session_state["prefill_claim"] = ex
+            st.rerun()
+
     claim = st.text_area(
         "Введите утверждение для проверки:",
         height=90,
-        key="claim_input",
+        value=st.session_state.get("prefill_claim", ""),
         placeholder="Например: Менделеев изобрёл водку · Земля плоская · В Сахаре живут пингвины…",
         label_visibility="collapsed",
     )
-
-    # Example chips
-    st.markdown('<div class="chip-hint">Примеры:</div>', unsafe_allow_html=True)
-    cols = st.columns(len(_EXAMPLES))
-    for i, ex in enumerate(_EXAMPLES):
-        if cols[i].button(ex[:34] + "…" if len(ex) > 34 else ex, key=f"ex_{i}",
-                          use_container_width=True):
-            st.session_state["claim_input"] = ex
-            st.rerun()
 
     check_btn = st.button("🔍 Проверить", type="primary", use_container_width=True)
 
