@@ -415,15 +415,71 @@ def main():
     }
 
     def render_thinking(stage_key: str):
-        elapsed = int(time.time() - start_time)
+        """Render the sticky thinking strip with a JS-driven live counter.
+
+        Streamlit's Python layer only runs `on_progress` when a stage
+        completes — it can't tick a counter second-by-second while the
+        pipeline is blocked inside check(). Solution: embed a tiny HTML
+        component with a self-running setInterval that updates the time
+        text in-browser. Each stage render resets the counter.
+        """
+        from streamlit.components.v1 import html as _html
+        elapsed_start = int(time.time() - start_time)
         line = _STATUS_LINES.get(stage_key, stage_key)
-        thinking_slot.markdown(f"""
-        <div class="thinking-strip">
-            <div class="spinner"></div>
-            <div class="text">{line}<span class="dots"></span></div>
-            <div class="counter">{elapsed}s</div>
-        </div>
-        """, unsafe_allow_html=True)
+        step_num = len(stages_done) + 1
+        step_total = len(stage_keys)
+        with thinking_slot:
+            _html(f"""
+            <style>
+                body {{ margin: 0; padding: 0; background: transparent;
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                        color: #e2e8f0; }}
+                .ts {{
+                    display: flex; align-items: center; gap: 14px;
+                    padding: 16px 20px;
+                    background: linear-gradient(90deg, rgba(59,130,246,0.08), rgba(139,92,246,0.08));
+                    border: 1px solid rgba(139,92,246,0.2);
+                    border-radius: 12px;
+                }}
+                .sp {{
+                    width: 18px; height: 18px; flex-shrink: 0;
+                    border: 2.5px solid rgba(139,92,246,0.2);
+                    border-top-color: #a78bfa;
+                    border-radius: 50%;
+                    animation: sp 0.9s linear infinite;
+                }}
+                @keyframes sp {{ to {{ transform: rotate(360deg); }} }}
+                .tx {{ color: #e2e8f0; font-weight: 500; flex: 1; }}
+                .dt {{ display: inline-block; min-width: 16px; }}
+                .cr {{ color: #94a3b8; font-variant-numeric: tabular-nums;
+                       font-size: 0.85rem; }}
+                .step {{ color: #64748b; font-size: 0.78rem; margin-right: 4px; }}
+            </style>
+            <div class="ts">
+                <div class="sp"></div>
+                <div class="tx">{line}<span class="dt" id="dots"></span></div>
+                <div class="cr"><span class="step">{step_num}/{step_total}</span>
+                    <span id="timer">{elapsed_start}s</span>
+                </div>
+            </div>
+            <script>
+                (function() {{
+                    var elapsed = {elapsed_start};
+                    var timer = document.getElementById('timer');
+                    var dots = document.getElementById('dots');
+                    var dotSeq = ['', '·', '··', '···'];
+                    var di = 0;
+                    setInterval(function() {{
+                        elapsed += 1;
+                        if (timer) timer.textContent = elapsed + 's';
+                    }}, 1000);
+                    setInterval(function() {{
+                        di = (di + 1) % dotSeq.length;
+                        if (dots) dots.textContent = dotSeq[di];
+                    }}, 350);
+                }})();
+            </script>
+            """, height=60)
 
     def render_progress():
         frac = len(stages_done) / max(len(stage_keys), 1)
