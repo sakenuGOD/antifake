@@ -1459,91 +1459,126 @@ class FactCheckPipeline:
 
     def _explain(self, claim: str, verdict: str, sub_results: List[Dict],
                  sources: List[Dict]) -> str:
-        """Generate explanation using LLM. Verdict already decided."""
-        # Build evidence summary
-        evidence_lines = []
+        """V24: Deterministic explanation built from actual pipeline signals.
 
-        # Wikidata evidence
+        Previously this called the SFT LLM with an EXPLANATION_TEMPLATE that
+        included `Цитируй источники: "[Источник] сообщает: ..."`. The SFT
+        adapter was trained on reasoning-trace format and hallucinated fake
+        citations verbatim from its training data (observed: "Ёсида Такеши
+        писал...", "Космодром Байконур", "Китай экспорт..." — none of which
+        had anything to do with the claim being verified).
+
+        Deterministic generation eliminates hallucination risk, is faster
+        (no extra LLM call ≈ 10-20s saved), and is easier to debug: every
+        sentence is traceable to a specific signal.
+        """
+        # Scam first — overrides everything
+        if verdict == "СКАМ":
+            patterns = []
+            if self._ctx.claim_info:
+                patterns = self._ctx.claim_info.get("scam_patterns", [])
+            parts = [
+                "⚠️ Обнаружены признаки мошенничества.",
+                "Ни один банк или государственный орган не просит переводить деньги "
+                "на «безопасный счёт» по телефону или в интернете.",
+            ]
+            if patterns:
+                parts.insert(1, f"Найденные паттерны: {', '.join(patterns)}.")
+            return " ".join(parts)
+
+        lines: List[str] = []
+
+        # Wikidata contradictions / confirmations
         wd = self._ctx.wikidata_result
+        wd_confirm_lines: List[str] = []
+        wd_conflict_lines: List[str] = []
         if wd and wd.get("found"):
             for f in wd.get("facts", []):
-                prop = f.get("property_label", "")
+                prop = f.get("property_label") or f.get("property_id", "")
                 vals = f.get("wikidata_values", [])
+                if not vals:
+                    continue
+                vals_str = ", ".join(vals[:3])
                 match = f.get("match")
+                ent = f.get("entity", "")
                 if match is True:
-                    evidence_lines.append(f"Wikidata подтверждает: {prop} = {', '.join(vals)}")
+                    wd_confirm_lines.append(f"Wikidata: {ent} → {prop}: {vals_str} (совпадает с утверждением).")
                 elif match is False:
-                    evidence_lines.append(f"Wikidata противоречит: {prop} = {', '.join(vals)}")
+                    wd_conflict_lines.append(f"Wikidata говорит: {ent} → {prop}: {vals_str} — это противоречит утверждению.")
 
-        # Number comparisons
-        for nc in self._ctx.num_comparisons:
-            if nc.get("source_number"):
-                cn = nc["claim_number"]
-                sn = nc["source_number"]
-                if nc["match"]:
-                    evidence_lines.append(f"Число подтверждено: {cn['raw']} ≈ {sn['raw']}")
-                else:
-                    evidence_lines.append(f"Числовое расхождение: {cn['raw']} ≠ {sn['raw']}")
+        # Numeric comparisons
+        num_confirm: List[str] = []
+        num_conflict: List[str] = []
+        for nc in (self._ctx.num_comparisons or []):
+            sn = nc.get("source_number")
+            cn = nc.get("claim_number")
+            if not sn or not cn:
+                continue
+            c_raw = cn.get("raw") or cn.get("value", "?")
+            s_raw = sn.get("raw") or sn.get("value", "?")
+            if nc.get("match"):
+                num_confirm.append(f"Число в утверждении ({c_raw}) совпадает со значением в источниках ({s_raw}).")
+            else:
+                num_conflict.append(f"Число в утверждении ({c_raw}) не совпадает со значением в источниках ({s_raw}).")
 
-        # NLI evidence
-        nli = self._ctx.nli_result
-        if nli:
-            evidence_lines.append(
-                f"NLI анализ: подтверждение={nli.get('max_entailment', 0):.2f}, "
-                f"противоречие={nli.get('max_contradiction', 0):.2f}"
-            )
+        # NLI aggregate
+        nli = self._ctx.nli_result or {}
+        ent = nli.get("max_entailment", 0.0)
+        con = nli.get("max_contradiction", 0.0)
+        ent_cnt = nli.get("entailment_count", 0)
+        con_cnt = nli.get("contradiction_count", 0)
 
-        # Source summaries
-        for src in sources[:3]:
-            title = src.get("title", "")
-            snippet = src.get("snippet", "")[:200]
-            if title and snippet:
-                evidence_lines.append(f"[{title}]: {snippet}")
+        # Compose verdict-specific intro
+        v_lower = verdict.lower()
+        if verdict == "ПРАВДА":
+            lines.append(f"Утверждение признано **правдивым**.")
+        elif verdict == "ЛОЖЬ":
+            lines.append(f"Утверждение признано **ложным**.")
+        elif verdict == "СОСТАВНОЕ":
+            lines.append(f"Утверждение состоит из нескольких частей, которые проверены отдельно.")
+        else:
+            lines.append(f"Недостаточно данных для уверенного вердикта (**{verdict}**).")
 
-        evidence_summary = "\n".join(evidence_lines) if evidence_lines else "Источники не найдены."
+        # Primary reason — choose the strongest signal driving the verdict
+        if verdict == "ЛОЖЬ":
+            if wd_conflict_lines:
+                lines.extend(wd_conflict_lines[:2])
+            elif num_conflict:
+                lines.extend(num_conflict[:1])
+            elif con > 0.60:
+                lines.append(f"Источники противоречат утверждению (уровень противоречия {con:.0%}).")
+            elif ent_cnt == 0 and con_cnt > 0:
+                lines.append(f"Из найденных источников {con_cnt} противоречат утверждению, ни один не подтверждает.")
+        elif verdict == "ПРАВДА":
+            if wd_confirm_lines:
+                lines.extend(wd_confirm_lines[:2])
+            elif num_confirm:
+                lines.extend(num_confirm[:1])
+            elif ent > 0.60:
+                lines.append(f"Источники подтверждают утверждение (уровень подтверждения {ent:.0%}).")
+            elif ent_cnt > 0:
+                lines.append(f"{ent_cnt} из проверенных источников подтверждают утверждение.")
 
-        # Sub-results for composite
+        # Sub-claims for composites
         if len(sub_results) > 1:
+            lines.append("")  # blank separator
+            lines.append("Разбор по частям:")
             for sr in sub_results:
-                evidence_summary += f"\nПодфакт: {sr['claim'][:80]} → {sr['verdict']}"
+                sv = sr.get("verdict", "?")
+                sc = sr.get("claim", "")[:120]
+                marker = {"ПРАВДА": "✓", "ЛОЖЬ": "✗"}.get(sv, "?")
+                lines.append(f"{marker} {sc} — **{sv}**")
 
-        try:
-            # Для СКАМ — объясняем через ЛОЖЬ + добавляем предупреждение
-            explain_verdict = verdict
-            scam_prefix = ""
-            if verdict == "СКАМ":
-                explain_verdict = "ЛОЖЬ (мошенничество)"
-                scam_patterns = []
-                if self._ctx.claim_info:
-                    scam_patterns = self._ctx.claim_info.get("scam_patterns", [])
-                if scam_patterns:
-                    evidence_summary = (
-                        f"ОБНАРУЖЕНЫ ПРИЗНАКИ МОШЕННИЧЕСТВА: {', '.join(scam_patterns)}.\n"
-                        + evidence_summary
-                    )
-                scam_prefix = (
-                    "⚠️ Это мошенническая схема. "
-                    "Ни один банк или государственный орган не просит переводить деньги "
-                    "на «безопасный счёт» по телефону или в интернете. "
-                )
+        # Source count
+        n_sources = len(sources)
+        if n_sources:
+            lines.append(f"Всего проверено источников: {n_sources}.")
 
-            prompt = EXPLANATION_TEMPLATE.format(
-                claim=claim,
-                verdict=explain_verdict,
-                evidence_summary=evidence_summary,
-            )
-            raw = self.explain_llm.invoke(prompt)
-            explanation = StrOutputParser().invoke(raw)
-            return (scam_prefix + explanation).strip()[:1500]
-        except Exception as e:
-            logger.warning(f"Explanation failed: {e}")
-            if verdict == "СКАМ":
-                return (
-                    "⚠️ Обнаружены признаки мошенничества. "
-                    "Ни один банк или госорган не просит переводить деньги на «безопасный счёт». "
-                    "Это типичная схема телефонных мошенников."
-                )
-            return evidence_summary[:500]
+        # Fallback: if nothing concrete, say so
+        if len(lines) == 1:  # only intro
+            lines.append("Подробности см. в развёрнутом анализе ниже.")
+
+        return "\n".join(lines).strip()[:1500]
 
     # ======================================================================
     # CONFIDENCE → SCORE mapping
