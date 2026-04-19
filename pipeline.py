@@ -97,6 +97,43 @@ class PipelineContext:
     wikidata_result: Dict = field(default_factory=dict)
 
 
+def _set_deterministic_mode(seed: int = 42) -> None:
+    """V21: pin all RNGs and disable nondeterministic CUDA kernels.
+
+    Greedy decode is supposed to be reproducible (do_sample=False), but in
+    practice we observed run-to-run flips on the same claim (Эйфелева,
+    Эверест, Ньютон). Sources: cuDNN auto-tuner picking different algorithms
+    based on workload, bitsandbytes 4-bit edge-cases, and stray torch RNG
+    consumption inside transformers. Setting this at pipeline boot makes
+    repeat calls converge.
+
+    Trade-off: cuDNN deterministic mode disables some fast convolution
+    variants. Negligible cost for our LLM-bound workload, big win for
+    test reproducibility and demo predictability.
+    """
+    import os
+    import random
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except Exception:
+        pass
+    random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # Required by torch.use_deterministic_algorithms() on CUDA when
+        # using cuBLAS — without this, GEMM kernels can pick different
+        # algorithms run-to-run.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    except Exception:
+        pass
+
+
 class FactCheckPipeline:
     """V17: Evidence-first fact-checking pipeline."""
 
@@ -109,6 +146,15 @@ class FactCheckPipeline:
         pipeline_config: PipelineConfig = None,
         search_config: SearchConfig = None,
     ):
+        # V22: deterministic mode disabled by default. cuDNN.deterministic +
+        # benchmark=False shifts cross-encoder reranker kernel selection,
+        # causing top-K reordering on tied scores; observed regression on
+        # ВМВ-1943 (lost the Wikipedia snippet with "1945" → NLI flipped
+        # ent=0.21 → 0.99). Function `_set_deterministic_mode` kept for
+        # opt-in via env var if a future workload needs strict reproducibility.
+        if os.environ.get("ANTIFAKE_DETERMINISTIC") == "1":
+            _set_deterministic_mode(seed=42)
+
         if model_config is None:
             model_config = ModelConfig()
         if pipeline_config is None:
@@ -959,6 +1005,21 @@ class FactCheckPipeline:
         Returns: -1 (ЛОЖЬ), 0 (неизвестно), +1 (ПРАВДА)
         """
         try:
+            # V22: pin RNG immediately before the call so the same claim text
+            # gives the same answer across runs. Mistral greedy decode is
+            # *supposed* to be deterministic, but in practice 4-bit bitsandbytes
+            # quantisation + accumulator order can drift between sessions —
+            # observed Sahara/Эверест LLM flipping between +1 and 0 across
+            # nominally-identical runs. Local pin (vs global cuDNN) avoids
+            # interfering with the cross-encoder reranker, where deterministic
+            # kernels caused a different regression on ВМВ-1943.
+            try:
+                import torch as _torch
+                _torch.manual_seed(0)
+                if _torch.cuda.is_available():
+                    _torch.cuda.manual_seed_all(0)
+            except Exception:
+                pass
             prompt = LLM_KNOWLEDGE_TEMPLATE.format(claim=claim[:200])
             raw = self.keyword_llm.invoke(prompt)
             text = StrOutputParser().invoke(raw).strip().upper()
@@ -1067,6 +1128,11 @@ class FactCheckPipeline:
             if llm_signal == +1 and nli_signal == +1:
                 # Strong multi-signal consensus for truth; NUM likely spurious.
                 return "ПРАВДА", 62
+            if llm_signal == +1:
+                # LLM parametric agrees; NLI silent. NUM is context-blind so a
+                # single-signal disagreement shouldn't commit to a confident
+                # ЛОЖЬ — defer to the user as НЕ УВЕРЕНА.
+                return "НЕ УВЕРЕНА", 48
             return "ЛОЖЬ", 85
         if numbers_signal == +1:
             # Number matched in sources, but NLI strongly disagrees →

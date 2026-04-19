@@ -1,27 +1,27 @@
 {
-  "accuracy": 0.75,
-  "correct": 6,
+  "accuracy": 1.0,
+  "correct": 8,
   "total": 8,
   "results": [
     {
       "claim": "Роман «Война и мир» написал Фёдор Достоевский",
       "expected": "ЛОЖЬ",
       "predicted": "ЛОЖЬ",
-      "score": 34,
+      "score": 10,
       "correct": true,
       "category": "person_swap_literature",
       "note": "Толстой написал Войну и мир, не Достоевский",
-      "latency": 163.19
+      "latency": 171.5
     },
     {
       "claim": "Теорию относительности сформулировал Исаак Ньютон",
       "expected": "ЛОЖЬ",
-      "predicted": "НЕ УВЕРЕНА",
-      "score": 45,
-      "correct": false,
+      "predicted": "ЛОЖЬ",
+      "score": 34,
+      "correct": true,
       "category": "person_swap_science",
       "note": "Эйнштейн, не Ньютон",
-      "latency": 186.96
+      "latency": 127.76
     },
     {
       "claim": "Столица Канады — Торонто",
@@ -31,7 +31,7 @@
       "correct": true,
       "category": "location_swap",
       "note": "Оттава",
-      "latency": 335.99
+      "latency": 116.35
     },
     {
       "claim": "Река Амазонка протекает в Африке",
@@ -41,7 +41,7 @@
       "correct": true,
       "category": "location_continent_swap",
       "note": "Южная Америка",
-      "latency": 212.66
+      "latency": 81.53
     },
     {
       "claim": "Москва является столицей России",
@@ -51,17 +51,17 @@
       "correct": true,
       "category": "basic_true",
       "note": "",
-      "latency": 128.82
+      "latency": 88.95
     },
     {
       "claim": "Эверест — самая высокая гора планеты",
       "expected": "ПРАВДА",
-      "predicted": "НЕ УВЕРЕНА",
-      "score": 45,
-      "correct": false,
+      "predicted": "ПРАВДА",
+      "score": 60,
+      "correct": true,
       "category": "superlative_true",
       "note": "",
-      "latency": 124.78
+      "latency": 135.29
     },
     {
       "claim": "Берлинская стена пала в 1979 году",
@@ -71,7 +71,7 @@
       "correct": true,
       "category": "date_swap_event",
       "note": "1989",
-      "latency": 155.44
+      "latency": 169.99
     },
     {
       "claim": "Скорость света в вакууме составляет примерно 300 000 километров в секунду",
@@ -81,7 +81,7 @@
       "correct": true,
       "category": "science_numerical_true",
       "note": "",
-      "latency": 201.26
+      "latency": 245.69
     }
   ]
 }

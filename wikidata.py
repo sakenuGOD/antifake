@@ -443,11 +443,41 @@ def get_entity_properties(qid: str, properties: List[str],
     return result
 
 
+def _rank_entities_for_lookup(entities: List[str]) -> List[str]:
+    """V21: Reorder entities by specificity before WD lookup.
+
+    Multi-word phrases are dramatically more specific than their component
+    single words ('война и мир' → War and Peace novel; 'война' → war the
+    concept). Pulling them to the top prevents the per-claim lookup budget
+    from being burned on generic single-word entities while a quoted
+    title sits at index 5+.
+
+    Order:
+      1. Phrases with 2+ tokens (multi-word entities)
+      2. Single tokens of length ≥ 6 (likely proper nouns / domain terms)
+      3. Single tokens of length 4..5 (common nouns)
+      4. Anything shorter
+    Within each tier, original order is preserved (stable sort).
+    """
+    def tier(e: str) -> int:
+        e = e.strip()
+        if " " in e:
+            return 0
+        if len(e) >= 6:
+            return 1
+        if len(e) >= 4:
+            return 2
+        return 3
+    return sorted(entities, key=lambda e: (tier(e), entities.index(e)))
+
+
 def check_structured_facts(claim: str, entities: List[str],
                            lang: str = "ru") -> Dict[str, Any]:
     """Проверяет структурированные факты через Wikidata.
 
     V8: Расширенный набор проверок (~20 свойств).
+    V21: lookup-budget bumped 5→8 + entity reordering — multi-word /
+    long entities checked first so quoted titles aren't truncated out.
     """
     facts: List[Dict[str, Any]] = []
     claim_lower = claim.lower()
@@ -455,7 +485,8 @@ def check_structured_facts(claim: str, entities: List[str],
     # Определяем какие свойства проверять
     checks: List[tuple] = []  # (entity_name, property_id, property_label, expected_value)
 
-    for entity in entities[:5]:
+    ranked_entities = _rank_entities_for_lookup(entities)
+    for entity in ranked_entities[:8]:
         # Основатель / создатель / разработчик
         if any(w in claim_lower for w in ['основан', 'создан', 'учрежд', 'основал', 'создал',
                                             'разработан', 'разработал', 'придумал', 'изобрёл',
