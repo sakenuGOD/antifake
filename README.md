@@ -204,7 +204,6 @@ antifake/
 │   └── wikidata_cache.json
 │
 ├── adapters/                    # LoRA / GRPO адаптеры (weights ignored in git)
-├── docs/                        # Отчёты и документация
 ├── logs/                        # Прогоны pipeline'а (gitignored)
 └── requirements.txt
 ```

@@ -27,10 +27,10 @@ adapters/**/checkpoint-*/
 eval_log*.txt
 scripts/training_log.txt
 
-# Markdown files — только README.md в root; документация в docs/
+# Markdown files — только README.md
 *.md
 !README.md
-!docs/*.md
+docs/
 
 # Misc
 =9.0
