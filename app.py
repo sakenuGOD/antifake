@@ -337,6 +337,30 @@ def clean_reasoning(text: str) -> str:
     return cleaned
 
 
+def _md_to_html(text: str) -> str:
+    """Minimal markdown → HTML for reasoning card.
+
+    Handles **bold**, *italic*, line breaks. No external dependency.
+    Order matters: bold BEFORE italic (otherwise *foo* inside **bar**
+    gets consumed by italic regex).
+    """
+    if not text:
+        return ""
+    # Escape raw HTML characters first to prevent injection from pipeline data
+    html = (text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+    # **bold** — avoid greedy; min one char
+    html = re.sub(r'\*\*([^*\n]+?)\*\*', r'<strong>\1</strong>', html)
+    # *italic* — same
+    html = re.sub(r'(?<![\w*])\*([^*\n]+?)\*(?![\w*])', r'<em>\1</em>', html)
+    # Paragraph breaks: two newlines → paragraph split; single → <br>
+    paragraphs = re.split(r'\n\s*\n', html.strip())
+    paragraphs = [p.replace("\n", "<br>") for p in paragraphs if p.strip()]
+    return "".join(f"<p>{p}</p>" for p in paragraphs)
+
+
 # ══════════════════════════════════════════════════════════════════
 #  Example claims (chips)
 # ══════════════════════════════════════════════════════════════════
@@ -743,10 +767,10 @@ def main():
                 )
             st.markdown('<div class="sub-list">' + "".join(sub_items) + '</div>', unsafe_allow_html=True)
 
-        # Reasoning
+        # Reasoning — proper markdown → HTML rendering
         reasoning = clean_reasoning(result.get("reasoning", ""))
         if reasoning:
-            reasoning_html = reasoning.replace("\n", "<br>")
+            reasoning_html = _md_to_html(reasoning)
             st.markdown(f"""
             <div class="reasoning-card">
                 <h4>Обоснование</h4>

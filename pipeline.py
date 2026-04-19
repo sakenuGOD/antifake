@@ -1461,16 +1461,11 @@ class FactCheckPipeline:
                  sources: List[Dict]) -> str:
         """V24: Deterministic explanation built from actual pipeline signals.
 
-        Previously this called the SFT LLM with an EXPLANATION_TEMPLATE that
-        included `Цитируй источники: "[Источник] сообщает: ..."`. The SFT
-        adapter was trained on reasoning-trace format and hallucinated fake
-        citations verbatim from its training data (observed: "Ёсида Такеши
-        писал...", "Космодром Байконур", "Китай экспорт..." — none of which
-        had anything to do with the claim being verified).
-
-        Deterministic generation eliminates hallucination risk, is faster
-        (no extra LLM call ≈ 10-20s saved), and is easier to debug: every
-        sentence is traceable to a specific signal.
+        Rich, signal-by-signal narrative. Detects Wikidata structural /
+        Person mismatch and cites the exact canonical value vs claim
+        value. Mentions myth probe, debunk sources, NLI level, number
+        comparisons. Markdown: **bold**, *italic* are converted to HTML
+        on the UI side; keep them in the text for structure.
         """
         # Scam first — overrides everything
         if verdict == "СКАМ":
@@ -1478,35 +1473,128 @@ class FactCheckPipeline:
             if self._ctx.claim_info:
                 patterns = self._ctx.claim_info.get("scam_patterns", [])
             parts = [
-                "⚠️ Обнаружены признаки мошенничества.",
+                "⚠️ **Обнаружены признаки мошенничества.**",
                 "Ни один банк или государственный орган не просит переводить деньги "
                 "на «безопасный счёт» по телефону или в интернете.",
             ]
             if patterns:
-                parts.insert(1, f"Найденные паттерны: {', '.join(patterns)}.")
+                parts.insert(1, f"Найденные паттерны: *{', '.join(patterns)}*.")
             return " ".join(parts)
 
         lines: List[str] = []
 
-        # Wikidata contradictions / confirmations
-        wd = self._ctx.wikidata_result
+        # ── Collect per-signal narratives ──
+
+        # 1) Wikidata structural / Person mismatch (hard signal)
+        wd = self._ctx.wikidata_result or {}
+        wd_hard = bool(wd.get("hard_mismatch", False))
         wd_confirm_lines: List[str] = []
         wd_conflict_lines: List[str] = []
-        if wd and wd.get("found"):
+        wd_mismatch_lines: List[str] = []  # Person/structural — match=None but swap detected
+
+        # Свойства где mismatch — это реальный swap (не шум типа дат основания)
+        _SWAP_PROPS_PERSON = {"P50", "P112", "P170", "P175", "P57", "P86", "P178"}
+        _SWAP_PROPS_STRUCT = {"P36", "P17", "P30", "P159", "P403", "P276"}
+        _SWAP_PROPS = _SWAP_PROPS_PERSON | _SWAP_PROPS_STRUCT
+
+        # Natasha-based PER/LOC extraction для более точного "а не X"
+        per_entities: List[str] = []
+        loc_entities: List[str] = []
+        if _HAS_NATASHA:
+            try:
+                for ne in extract_entities(claim):
+                    t = ne.get("type", "")
+                    txt = ne.get("text", "").strip()
+                    if not txt:
+                        continue
+                    if t == "PER":
+                        per_entities.append(txt)
+                    elif t == "LOC":
+                        loc_entities.append(txt)
+            except Exception:
+                pass
+
+        # Fallback proper nouns (non-sentence-initial capitalised words ≥4 chars)
+        # Игнорируем первое слово (заглавная буква по правилам предложения)
+        _SENTENCE_STARTERS = {
+            "столица", "роман", "книга", "фильм", "когда", "что", "как", "где",
+            "почему", "некоторые", "многие", "каждый", "весь",
+        }
+        proper_nouns_mid: List[str] = []
+        for m in re.finditer(r'[А-ЯЁA-Z][а-яёa-zA-Z]{3,}', claim):
+            word = m.group(0)
+            if m.start() == 0:
+                continue
+            if word.lower() in _SENTENCE_STARTERS:
+                continue
+            proper_nouns_mid.append(word)
+
+        def _capitalize(s: str) -> str:
+            return s[:1].upper() + s[1:] if s else s
+
+        def _find_not_x(pid: str, ent_raw: str, vals_str: str) -> str:
+            """Найти "а не X" кандидат в claim'е — PER для person-props,
+            LOC для structural-props; fallback на proper nouns из середины."""
+            ent_lower = ent_raw.lower()
+            val_tokens = {w.lower() for w in re.findall(r'[А-ЯЁA-Zа-яёa-z]{3,}', vals_str)}
+            pool = per_entities if pid in _SWAP_PROPS_PERSON else loc_entities
+            # Primary: Natasha entities of matching type
+            for cand in pool:
+                cl = cand.lower()
+                if cl == ent_lower or cl.startswith(ent_lower[:5]):
+                    continue
+                if any(w in val_tokens for w in re.findall(r'[А-ЯЁA-Zа-яёa-z]{3,}', cl)):
+                    continue
+                return cand
+            # Fallback: non-initial proper nouns
+            for cand in proper_nouns_mid:
+                cl = cand.lower()
+                if cl == ent_lower or cl.startswith(ent_lower[:5]):
+                    continue
+                if any(w in val_tokens for w in re.findall(r'[А-ЯЁA-Zа-яёa-z]{3,}', cl)):
+                    continue
+                return cand
+            return ""
+
+        if wd.get("found"):
             for f in wd.get("facts", []):
-                prop = f.get("property_label") or f.get("property_id", "")
+                # Ключ может быть 'property' (новый) или 'property_label' (legacy)
+                prop = f.get("property") or f.get("property_label") or f.get("property_id", "")
+                pid = f.get("property_id", "")
                 vals = f.get("wikidata_values", [])
                 if not vals:
                     continue
                 vals_str = ", ".join(vals[:3])
                 match = f.get("match")
-                ent = f.get("entity", "")
+                ent_raw = f.get("entity", "")
+                ent = _capitalize(ent_raw)
                 if match is True:
-                    wd_confirm_lines.append(f"Wikidata: {ent} → {prop}: {vals_str} (совпадает с утверждением).")
+                    wd_confirm_lines.append(
+                        f"По данным Wikidata, **{prop}** для «{ent}» — *{vals_str}*, что соответствует утверждению."
+                    )
                 elif match is False:
-                    wd_conflict_lines.append(f"Wikidata говорит: {ent} → {prop}: {vals_str} — это противоречит утверждению.")
+                    wd_conflict_lines.append(
+                        f"По данным Wikidata, **{prop}** для «{ent}» — *{vals_str}*, что противоречит утверждению."
+                    )
+                else:
+                    # match=None: упоминаем только relevant swap property при hard_mismatch
+                    if not (wd_hard and verdict == "ЛОЖЬ"):
+                        continue
+                    if pid not in _SWAP_PROPS:
+                        continue
+                    not_x = _find_not_x(pid, ent_raw, vals_str)
+                    if not_x:
+                        wd_mismatch_lines.append(
+                            f"По данным Wikidata, **{prop}** для «{ent}» — *{vals_str}*, "
+                            f"а не *{not_x}*, как указано в утверждении."
+                        )
+                    else:
+                        wd_mismatch_lines.append(
+                            f"По данным Wikidata, **{prop}** для «{ent}» — *{vals_str}*. "
+                            f"Утверждение называет другое."
+                        )
 
-        # Numeric comparisons
+        # 2) Числовые сравнения
         num_confirm: List[str] = []
         num_conflict: List[str] = []
         for nc in (self._ctx.num_comparisons or []):
@@ -1517,68 +1605,107 @@ class FactCheckPipeline:
             c_raw = cn.get("raw") or cn.get("value", "?")
             s_raw = sn.get("raw") or sn.get("value", "?")
             if nc.get("match"):
-                num_confirm.append(f"Число в утверждении ({c_raw}) совпадает со значением в источниках ({s_raw}).")
+                num_confirm.append(
+                    f"Число в утверждении (**{c_raw}**) совпадает со значением в источниках (*{s_raw}*)."
+                )
             else:
-                num_conflict.append(f"Число в утверждении ({c_raw}) не совпадает со значением в источниках ({s_raw}).")
+                num_conflict.append(
+                    f"Число в утверждении (**{c_raw}**) не совпадает со значением в источниках (*{s_raw}*)."
+                )
 
-        # NLI aggregate
+        # 3) NLI aggregate
         nli = self._ctx.nli_result or {}
-        ent = nli.get("max_entailment", 0.0)
-        con = nli.get("max_contradiction", 0.0)
+        nli_ent = nli.get("max_entailment", 0.0)
+        nli_con = nli.get("max_contradiction", 0.0)
         ent_cnt = nli.get("entailment_count", 0)
         con_cnt = nli.get("contradiction_count", 0)
 
-        # Compose verdict-specific intro
-        v_lower = verdict.lower()
-        if verdict == "ПРАВДА":
-            lines.append(f"Утверждение признано **правдивым**.")
-        elif verdict == "ЛОЖЬ":
-            lines.append(f"Утверждение признано **ложным**.")
-        elif verdict == "СОСТАВНОЕ":
-            lines.append(f"Утверждение состоит из нескольких частей, которые проверены отдельно.")
-        else:
-            lines.append(f"Недостаточно данных для уверенного вердикта (**{verdict}**).")
+        # ── Build narrative ──
 
-        # Primary reason — choose the strongest signal driving the verdict
+        # Intro
+        if verdict == "ПРАВДА":
+            lines.append("Утверждение признано **правдивым**.")
+        elif verdict == "ЛОЖЬ":
+            lines.append("Утверждение признано **ложным**.")
+        elif verdict == "СОСТАВНОЕ":
+            lines.append("Утверждение **состоит из нескольких частей** — они проверены отдельно.")
+        elif verdict in ("НЕ УВЕРЕНА", "НЕ ПОДТВЕРЖДЕНО"):
+            lines.append(f"Недостаточно данных для уверенного вердикта — **{verdict}**.")
+        else:
+            lines.append(f"Вердикт: **{verdict}**.")
+
+        # Main reason — strongest signal comes first
+        reasons: List[str] = []
+
         if verdict == "ЛОЖЬ":
+            # Prefer structured contradiction evidence
             if wd_conflict_lines:
-                lines.extend(wd_conflict_lines[:2])
+                reasons.extend(wd_conflict_lines[:2])
+            elif wd_mismatch_lines:
+                reasons.extend(wd_mismatch_lines[:2])
             elif num_conflict:
-                lines.extend(num_conflict[:1])
-            elif con > 0.60:
-                lines.append(f"Источники противоречат утверждению (уровень противоречия {con:.0%}).")
-            elif ent_cnt == 0 and con_cnt > 0:
-                lines.append(f"Из найденных источников {con_cnt} противоречат утверждению, ни один не подтверждает.")
+                reasons.extend(num_conflict[:2])
+            if nli_con >= 0.60:
+                reasons.append(
+                    f"NLI-анализ показал **{nli_con:.0%} противоречия** между утверждением и "
+                    f"содержимым источников."
+                )
+            elif con_cnt > 0 and ent_cnt == 0:
+                reasons.append(
+                    f"Из {len(sources)} источников **{con_cnt}** опровергают утверждение, "
+                    f"ни один не подтверждает."
+                )
         elif verdict == "ПРАВДА":
             if wd_confirm_lines:
-                lines.extend(wd_confirm_lines[:2])
-            elif num_confirm:
-                lines.extend(num_confirm[:1])
-            elif ent > 0.60:
-                lines.append(f"Источники подтверждают утверждение (уровень подтверждения {ent:.0%}).")
-            elif ent_cnt > 0:
-                lines.append(f"{ent_cnt} из проверенных источников подтверждают утверждение.")
+                reasons.extend(wd_confirm_lines[:2])
+            if num_confirm:
+                reasons.extend(num_confirm[:1])
+            if nli_ent >= 0.60 and not reasons:
+                reasons.append(
+                    f"NLI-анализ показал **{nli_ent:.0%} подтверждения** в содержимом источников."
+                )
+            elif ent_cnt > 0 and not reasons:
+                reasons.append(
+                    f"Из {len(sources)} источников **{ent_cnt}** подтверждают утверждение."
+                )
+        else:
+            # НЕ УВЕРЕНА / СОСТАВНОЕ — give transparency about what we found
+            found_bits = []
+            if wd_confirm_lines or wd_conflict_lines or wd_mismatch_lines:
+                n = len(wd_confirm_lines) + len(wd_conflict_lines) + len(wd_mismatch_lines)
+                found_bits.append(f"{n} фактов из Wikidata")
+            if num_confirm or num_conflict:
+                found_bits.append("числовые сравнения")
+            if nli_ent >= 0.4 or nli_con >= 0.4:
+                found_bits.append(
+                    f"NLI сигналы (подтв={nli_ent:.2f}, противор={nli_con:.2f})"
+                )
+            if found_bits:
+                reasons.append("Сигналы противоречивы: " + ", ".join(found_bits) + ".")
+
+        lines.extend(reasons)
 
         # Sub-claims for composites
         if len(sub_results) > 1:
             lines.append("")  # blank separator
-            lines.append("Разбор по частям:")
+            lines.append("**Разбор по частям:**")
             for sr in sub_results:
                 sv = sr.get("verdict", "?")
                 sc = sr.get("claim", "")[:120]
                 marker = {"ПРАВДА": "✓", "ЛОЖЬ": "✗"}.get(sv, "?")
-                lines.append(f"{marker} {sc} — **{sv}**")
+                lines.append(f"{marker} *{sc}* — **{sv}**")
 
-        # Source count
+        # Source footnote
         n_sources = len(sources)
         if n_sources:
-            lines.append(f"Всего проверено источников: {n_sources}.")
+            lines.append("")
+            lines.append(f"*Всего проверено источников: {n_sources}.*")
 
-        # Fallback: if nothing concrete, say so
-        if len(lines) == 1:  # only intro
+        # Fallback: if only intro present
+        if len(lines) == 1:
             lines.append("Подробности см. в развёрнутом анализе ниже.")
 
-        return "\n".join(lines).strip()[:1500]
+        return "\n".join(lines).strip()[:1600]
 
     # ======================================================================
     # CONFIDENCE → SCORE mapping
