@@ -1,6 +1,6 @@
 {
-  "accuracy": 0.2,
-  "correct": 2,
+  "accuracy": 0.8,
+  "correct": 8,
   "total": 10,
   "results": [
     {
@@ -10,7 +10,7 @@
       "score": 34,
       "correct": true,
       "category": "conspiracy",
-      "latency": 136.73
+      "latency": 93.58
     },
     {
       "claim": "Мозг человека использует лишь 10 процентов своих возможностей",
@@ -19,7 +19,7 @@
       "score": 15,
       "correct": true,
       "category": "myth",
-      "latency": 153.81
+      "latency": 172.03
     },
     {
       "claim": "Викинги носили шлемы с рогами в боевых сражениях",
@@ -28,61 +28,61 @@
       "score": 45,
       "correct": false,
       "category": "myth",
-      "latency": 185.08
+      "latency": 199.45
     },
     {
       "claim": "Прививки вызывают у детей аутизм",
       "expected": "ЛОЖЬ",
-      "predicted": "ПРАВДА",
-      "score": 75,
-      "correct": false,
+      "predicted": "ЛОЖЬ",
+      "score": 34,
+      "correct": true,
       "category": "pseudoscience",
-      "latency": 198.57
+      "latency": 178.35
     },
     {
       "claim": "Излучение сетей 5G вызывает онкологические заболевания у людей",
       "expected": "ЛОЖЬ",
-      "predicted": "ПРАВДА",
-      "score": 80,
-      "correct": false,
+      "predicted": "ЛОЖЬ",
+      "score": 34,
+      "correct": true,
       "category": "conspiracy",
-      "latency": 221.6
+      "latency": 142.15
     },
     {
       "claim": "Земля имеет плоскую форму",
       "expected": "ЛОЖЬ",
-      "predicted": "ПРАВДА",
-      "score": 75,
-      "correct": false,
+      "predicted": "ЛОЖЬ",
+      "score": 34,
+      "correct": true,
       "category": "pseudoscience",
-      "latency": 203.76
+      "latency": 161.14
     },
     {
       "claim": "Великая Китайская стена является единственным рукотворным объектом, видимым с Луны невооружённым глазом",
       "expected": "ЛОЖЬ",
-      "predicted": "НЕ УВЕРЕНА",
-      "score": 45,
-      "correct": false,
+      "predicted": "ЛОЖЬ",
+      "score": 25,
+      "correct": true,
       "category": "myth",
-      "latency": 235.19
+      "latency": 201.04
     },
     {
       "claim": "COVID-19 был создан как биологическое оружие в лаборатории",
       "expected": "ЛОЖЬ",
-      "predicted": "ПРАВДА",
-      "score": 80,
-      "correct": false,
+      "predicted": "ЛОЖЬ",
+      "score": 32,
+      "correct": true,
       "category": "conspiracy",
-      "latency": 214.65
+      "latency": 155.46
     },
     {
       "claim": "Более 97 процентов климатологов согласны, что глобальное потепление вызвано деятельностью человека",
       "expected": "ПРАВДА",
-      "predicted": "ЛОЖЬ",
-      "score": 15,
-      "correct": false,
+      "predicted": "ПРАВДА",
+      "score": 62,
+      "correct": true,
       "category": "scientific_consensus",
-      "latency": 177.09
+      "latency": 158.61
     },
     {
       "claim": "Наполеон Бонапарт был человеком маленького роста по меркам своего времени",
@@ -91,7 +91,7 @@
       "score": 45,
       "correct": false,
       "category": "myth",
-      "latency": 221.64
+      "latency": 197.02
     }
   ]
 }

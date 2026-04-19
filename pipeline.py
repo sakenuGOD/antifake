@@ -17,7 +17,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
 
 from config import ModelConfig, PipelineConfig, SearchConfig, DecisionThresholds
-from prompts import KEYWORD_EXTRACTION_TEMPLATE, EXPLANATION_TEMPLATE, LLM_KNOWLEDGE_TEMPLATE
+from prompts import KEYWORD_EXTRACTION_TEMPLATE, EXPLANATION_TEMPLATE, LLM_KNOWLEDGE_TEMPLATE, LLM_MYTH_TEMPLATE
 from model import load_base_model, load_finetuned_model, build_langchain_llm, is_grpo_adapter
 from search import FactCheckSearcher, boost_factcheck_scores
 from claim_parser import (
@@ -1058,10 +1058,83 @@ class FactCheckPipeline:
             logger.debug(f"LLM knowledge check failed: {e}")
             return 0
 
+    def _check_myth_status(self, claim: str) -> int:
+        """V23: LLM Myth/Conspiracy probe — orthogonal to _check_llm_knowledge.
+
+        Asks Mistral specifically whether the claim is a known myth /
+        conspiracy / pseudoscience, NOT whether it's factually true. This
+        framing surfaces parametric knowledge of common misconceptions even
+        when the truthfulness probe returns 0 ("uncertain"). Used in _decide
+        as a stance signal that overrides moderate NLI false-entailment on
+        myth claims that the search layer fails to surface debunk sources for.
+
+        IMPORTANT: the SFT adapter (fact_checker_lora_v2) is trained heavily
+        on reasoning-trace format and ignores arbitrary one-shot prompts —
+        observed it returning '<reasoning>\\nШаг 1 …' instead of МИФ/ФАКТ.
+        We disable the adapter for this single call so the base Mistral 7B
+        Instruct follows the few-shot format. The base model's parametric
+        knowledge of common myths is exactly what we want here.
+
+        Returns: -1 (МИФ → claim is a known myth, treat as ЛОЖЬ),
+                 +1 (ФАКТ → claim is general knowledge, supports ПРАВДА),
+                  0 (НЕИЗВЕСТНО / parsing failed → no signal)
+        """
+        try:
+            try:
+                import torch as _torch
+                _torch.manual_seed(0)
+                if _torch.cuda.is_available():
+                    _torch.cuda.manual_seed_all(0)
+            except Exception:
+                pass
+            prompt = LLM_MYTH_TEMPLATE.format(claim=claim[:200])
+            # Disable LoRA adapter so the base instruction-tuned Mistral
+            # responds to the myth-classification prompt in the expected
+            # МИФ/ФАКТ/НЕИЗВЕСТНО format. PEFT's disable_adapter context is
+            # cheap (no weight reload) and safely re-enables on exit.
+            try:
+                _underlying = getattr(self.keyword_llm, "pipeline", None)
+                _model = getattr(_underlying, "model", None) if _underlying else None
+                if _model is not None and hasattr(_model, "disable_adapter"):
+                    with _model.disable_adapter():
+                        raw = self.keyword_llm.invoke(prompt)
+                else:
+                    raw = self.keyword_llm.invoke(prompt)
+            except Exception:
+                # Fallback: invoke with adapter still active (adapter format
+                # may swallow the prompt — output will likely parse as
+                # НЕИЗВЕСТНО, signal returns 0, decide unaffected).
+                raw = self.keyword_llm.invoke(prompt)
+            text = StrOutputParser().invoke(raw).strip().upper()
+            head = text[:120]
+            myth_tokens = ("МИФ", "ЗАБЛУЖДЕНИЕ", "КОНСПИРАЦИЯ", "ПСЕВДОНАУК",
+                           "MYTH", "CONSPIRACY")
+            fact_tokens = ("ФАКТ", "ПРАВДА", "ИСТИНА", "FACT", "TRUE")
+            unknown_tokens = ("НЕИЗВЕСТНО", "НЕ ЗНАЮ", "UNKNOWN")
+
+            def _first_hit(tokens):
+                hits = [head.find(t) for t in tokens]
+                hits = [h for h in hits if h >= 0]
+                return min(hits) if hits else 10**9
+
+            pos_myth = _first_hit(myth_tokens)
+            pos_fact = _first_hit(fact_tokens)
+            pos_unk = _first_hit(unknown_tokens)
+
+            best = min(pos_myth, pos_fact, pos_unk)
+            if best == 10**9:
+                return 0
+            if best == pos_unk:
+                return 0
+            return -1 if best == pos_myth else +1
+        except Exception as e:
+            logger.debug(f"LLM myth check failed: {e}")
+            return 0
+
     def _decide(self, wikidata_signal: int, numbers_signal: int,
                 nli_signal: int, nli_scores: Dict, is_scam: bool,
                 debunk_count: int = 0, llm_signal: int = 0,
-                claim: str = "") -> tuple:
+                claim: str = "", myth_signal: int = 0) -> tuple:
         """Universal priority-based verdict. Hard facts override soft signals.
 
         Principles (from fact-checking literature):
@@ -1139,6 +1212,14 @@ class FactCheckPipeline:
                 # single-signal disagreement shouldn't commit to a confident
                 # ЛОЖЬ — defer to the user as НЕ УВЕРЕНА.
                 return "НЕ УВЕРЕНА", 48
+            # V23: myth-stance positive signal also defends against NUM=-1
+            # default. Climate 97% claim: NUM extracts random % from sources,
+            # reports mismatch; LLM knowledge probe flaky (+0); but myth
+            # probe firmly says ФАКТ. Trust it in absence of counter signal.
+            if myth_signal == +1 and llm_signal != -1:
+                if nli_signal == +1:
+                    return "ПРАВДА", 62
+                return "НЕ УВЕРЕНА", 50
             return "ЛОЖЬ", 85
         if numbers_signal == +1:
             # Number matched in sources, but NLI strongly disagrees →
@@ -1159,6 +1240,14 @@ class FactCheckPipeline:
             # mention in sources (cold-war-era, unrelated). When LLM
             # parametric knowledge actively disagrees, prefer it.
             if llm_signal == -1:
+                return "ЛОЖЬ", 60
+            # V23: myth-stance signal also overrides NUM=+1 default. 5G-cancer
+            # claim has NUM=+1 from any unrelated number in sources, NLI silent
+            # (sources don't carry explicit refutation), LLM=0 — without this
+            # the myth gate in TIER 3 never gets a chance because TIER 2
+            # returns first. myth=-1 + llm != +1 means parametric model flags
+            # known myth and doesn't actively confirm.
+            if myth_signal == -1 and llm_signal != +1:
                 return "ЛОЖЬ", 60
             return "ПРАВДА", 80
 
@@ -1186,6 +1275,22 @@ class FactCheckPipeline:
         # debunk-ish historical sources but is true).
         if debunk_count >= 2 and ent >= 0.50 and con >= 0.40 and llm_signal != +1:
             return "ЛОЖЬ", 70
+
+        # V23: LLM Myth-stance signal — orthogonal to llm_signal (which asks
+        # for truthfulness). myth_signal = -1 means Mistral parametric flagged
+        # the claim as a known myth/conspiracy/pseudoscience; this catches
+        # claims like "Земля плоская" or "Викинги в рогатых шлемах" where
+        # search returns NLI-confusing topical sources but no debunk markers,
+        # AND the truthfulness probe returns 0 (model declines to commit).
+        # Guard: llm_signal == +1 wins — if the parametric model says ПРАВДА
+        # and ALSO classifies as myth, that's contradiction, defer.
+        if myth_signal == -1 and llm_signal != +1:
+            # Strong NLI ent here = false-entailment on myth content. Override.
+            if ent >= 0.50:
+                return "ЛОЖЬ", 65
+            # Otherwise weak signals + myth verdict still tilts ЛОЖЬ.
+            if con > ent or nli_signal == 0:
+                return "ЛОЖЬ", 58
 
         # ── TIER 4: NLI (gap-based, 3 zones: strong / moderate / ambiguous) ──
 
@@ -1216,7 +1321,11 @@ class FactCheckPipeline:
         # Strong NLI contradiction (sources clearly contradict)
         if gap < -t.strong_gap:
             # V20: subject-verification gate — see strong-ent branch.
-            if not subj_ok_con:
+            # V23: Override defer when contradiction is overwhelming
+            # (con >= 0.85). At that level the signal is too strong to be
+            # cross-topic noise — Великая Китайская стена с Луны (con=0.92,
+            # subj=nn) was deferring to НЕ УВЕРЕНА despite сильный NLI.
+            if not subj_ok_con and con < 0.85:
                 if llm_signal == -1:
                     return "ЛОЖЬ", 62
                 if llm_signal == +1:
@@ -1270,6 +1379,16 @@ class FactCheckPipeline:
         if llm_signal == +1:
             return "ПРАВДА", 58
         if llm_signal == -1:
+            return "ЛОЖЬ", 55
+
+        # V23: Last-chance myth-stance signal when nothing else fired.
+        # myth_signal=+1 ("ФАКТ") on a no-signal claim suggests common
+        # knowledge that search/Wikidata didn't surface; weak ПРАВДА is
+        # better than НЕ УВЕРЕНА when the parametric model recognises the
+        # topic. Symmetric ЛОЖЬ for myth_signal=-1 already handled in TIER 3.
+        if myth_signal == +1:
+            return "ПРАВДА", 55
+        if myth_signal == -1:
             return "ЛОЖЬ", 55
 
         # ── TIER 6: No signal ──
@@ -1562,6 +1681,18 @@ class FactCheckPipeline:
                 llm_signal = self._check_llm_knowledge(sc)
                 _report("llm_knowledge", {"claim": sc, "signal": llm_signal})
 
+                # V23: LLM Myth/Conspiracy probe — orthogonal stance signal.
+                # Skip when WD already gives a strong, hard verdict (saves ~7s);
+                # otherwise always call so we have a parametric stance read on
+                # claims that look like myths but lack debunk-source coverage.
+                _wd_hard = bool(self._ctx.wikidata_result.get("hard_mismatch", False)
+                                if self._ctx.wikidata_result else False)
+                if wd_signal != 0 and (_wd_hard or llm_signal == wd_signal):
+                    myth_signal = 0  # WD already decisive — don't burn an LLM call
+                else:
+                    myth_signal = self._check_myth_status(sc)
+                _report("myth", {"claim": sc, "signal": myth_signal})
+
                 # V18: Per-sub-claim scam detection for composites
                 # Global is_scam might be True for mixed claims (e.g., "Sberbank is big AND gives away money")
                 # but individual sub-claims may differ
@@ -1577,14 +1708,15 @@ class FactCheckPipeline:
                 print(f"  [{sc[:50]}] WD={wd_signal:+d} NUM={num_signal:+d} "
                       f"NLI={nli_signal:+d} (ent={nli_scores['ent']:.2f}, con={nli_scores['con']:.2f}, "
                       f"subj={_subj_e}{_subj_c}) "
-                      f"debunk={debunk_count} LLM={llm_signal:+d}"
+                      f"debunk={debunk_count} LLM={llm_signal:+d} "
+                      f"myth={myth_signal:+d}"
                       f"{' SCAM' if sc_is_scam else ''}")
 
                 # Decide
                 verdict, confidence = self._decide(
                     wd_signal, num_signal, nli_signal, nli_scores,
                     sc_is_scam, debunk_count, llm_signal,
-                    claim=sc)
+                    claim=sc, myth_signal=myth_signal)
                 _report("decide", {
                     "claim": sc, "verdict": verdict, "confidence": confidence,
                     "wd": wd_signal, "num": num_signal, "nli": nli_signal,

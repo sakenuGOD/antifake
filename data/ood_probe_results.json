@@ -1,6 +1,6 @@
 {
-  "accuracy": 1.0,
-  "correct": 8,
+  "accuracy": 0.875,
+  "correct": 7,
   "total": 8,
   "results": [
     {
@@ -11,7 +11,7 @@
       "correct": true,
       "category": "person_swap_literature",
       "note": "Толстой написал Войну и мир, не Достоевский",
-      "latency": 171.5
+      "latency": 166.16
     },
     {
       "claim": "Теорию относительности сформулировал Исаак Ньютон",
@@ -21,7 +21,7 @@
       "correct": true,
       "category": "person_swap_science",
       "note": "Эйнштейн, не Ньютон",
-      "latency": 127.76
+      "latency": 186.43
     },
     {
       "claim": "Столица Канады — Торонто",
@@ -31,7 +31,7 @@
       "correct": true,
       "category": "location_swap",
       "note": "Оттава",
-      "latency": 116.35
+      "latency": 125.31
     },
     {
       "claim": "Река Амазонка протекает в Африке",
@@ -41,7 +41,7 @@
       "correct": true,
       "category": "location_continent_swap",
       "note": "Южная Америка",
-      "latency": 81.53
+      "latency": 100.72
     },
     {
       "claim": "Москва является столицей России",
@@ -51,17 +51,17 @@
       "correct": true,
       "category": "basic_true",
       "note": "",
-      "latency": 88.95
+      "latency": 195.06
     },
     {
       "claim": "Эверест — самая высокая гора планеты",
       "expected": "ПРАВДА",
-      "predicted": "ПРАВДА",
-      "score": 60,
-      "correct": true,
+      "predicted": "НЕ УВЕРЕНА",
+      "score": 45,
+      "correct": false,
       "category": "superlative_true",
       "note": "",
-      "latency": 135.29
+      "latency": 181.69
     },
     {
       "claim": "Берлинская стена пала в 1979 году",
@@ -71,7 +71,7 @@
       "correct": true,
       "category": "date_swap_event",
       "note": "1989",
-      "latency": 169.99
+      "latency": 176.36
     },
     {
       "claim": "Скорость света в вакууме составляет примерно 300 000 километров в секунду",
@@ -81,7 +81,7 @@
       "correct": true,
       "category": "science_numerical_true",
       "note": "",
-      "latency": 245.69
+      "latency": 261.51
     }
   ]
 }
