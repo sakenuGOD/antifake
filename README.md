@@ -90,9 +90,9 @@ A separate **myth probe** runs here via `peft.disable_adapter()` against the bas
 
 **Search variability.** DuckDuckGo and Wikipedia can return different source sets across runs — within a single run the result is deterministic, but cross-session flips on borderline claims are possible.
 
-**LLM run-to-run flakiness.** The Mistral 7B parametric probe sometimes returns `НЕИЗВЕСТНО` on a claim it answered confidently in another run — an artefact of 4-bit bitsandbytes quantisation. Sample size (28 claims) means 1 flip ≈ ±3.5 % in the metric.
+**LLM run-to-run flakiness.** The Mistral 7B parametric probe sometimes returns `НЕИЗВЕСТНО` (unknown) on a claim it answered confidently in another run — an artefact of 4-bit bitsandbytes quantisation. Sample size (28 claims) means 1 flip ≈ ±3.5 % in the metric.
 
-**Myths without structural signal.** For niche myths the base Mistral doesn't know parametrically (horned Vikings, Napoleon's height), the system returns `НЕ УВЕРЕНА` — an honest defer rather than a confidently wrong verdict.
+**Myths without structural signal.** For niche myths the base Mistral doesn't know parametrically (horned Vikings, Napoleon's height), the system returns `НЕ УВЕРЕНА` (unsure) — an honest defer rather than a confidently wrong verdict.
 
 ---
 
@@ -128,10 +128,10 @@ Claim
     │                  subject-mention guard
     │          • LLM knowledge probe (Mistral parametric memory)
     │          • LLM myth probe (via disable_adapter — base Mistral,
-    │                            not SFT — classifies as МИФ/ФАКТ)
+    │                            not SFT — classifies as МИФ/ФАКТ — myth/fact)
     ▼
 [DECIDE]       priority-based tree over the signals:
-    │          TIER 1: WD hard-mismatch → ЛОЖЬ 90
+    │          TIER 1: WD hard-mismatch → ЛОЖЬ 90  (false, confidence 90)
     │          TIER 2: NUM ±1 (with LLM/myth consensus override)
     │          TIER 3: debunk-aware stance gate (myth detection)
     │          TIER 4: NLI gap zones (strong / moderate / ambiguous)
@@ -211,10 +211,11 @@ from pipeline import FactCheckPipeline
 pipeline = FactCheckPipeline(adapter_path="adapters/fact_checker_lora_v2")
 
 result = pipeline.check("Роман «Война и мир» написал Фёдор Достоевский")
+# (claim: "the novel War and Peace was written by Fyodor Dostoevsky")
 
-print(result["verdict"])              # "ЛОЖЬ"
+print(result["verdict"])              # "ЛОЖЬ"  (false)
 print(result["credibility_score"])    # 10
-print(result["reasoning"])            # reasoning text
+print(result["reasoning"])            # reasoning text (in Russian)
 for src in result["sources"][:3]:
     print(src["link"], src["title"])
 ```
@@ -225,6 +226,7 @@ Full result signature — see `pipeline.py::check()`.
 
 ```bash
 python main.py "Москва — столица России"
+# (claim: "Moscow is the capital of Russia")
 ```
 
 ---
@@ -336,6 +338,7 @@ python tests/test_ood_probe.py    --adapter adapters/fact_checker_lora_v2
 
 # Debug a single claim
 python tests/debug_single.py "Bitcoin создал Виталик Бутерин"
+# (claim: "Bitcoin was created by Vitalik Buterin")
 ```
 
 Results land in `data/*_results.json` with a detailed log in `logs/`.
